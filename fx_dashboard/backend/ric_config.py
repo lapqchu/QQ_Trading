@@ -31,6 +31,10 @@ from typing import List, Dict, Optional
 ALL_TENORS_M = [1, 2, 3, 6, 9, 12, 18, 24]   # outright anchors
 FULL_TENORS_M = [0, 1, 2, 3, 6, 9, 12, 18, 24]  # include spot (0)
 
+# Weekly tenors as month fractions: 1W≈0.25, 2W≈0.5, 3W≈0.75
+WEEKLY_TENORS = [0.25, 0.5, 0.75]  # 1W, 2W, 3W in month-fractions
+ALL_TENORS_INCL_WEEKLY = [0.25, 0.5, 0.75] + ALL_TENORS_M
+
 # NDF spread pack (relative-value traded interbank)
 NDF_SPREAD_PACK = [
     ("1Wx1M", 0, 1, "1W", "1M"),
@@ -64,8 +68,11 @@ DELIVERABLE_FWDFWD = [
 ]
 
 # Broker contributors — realtime-only snap RICs on LSEG
-# Actual suffixes in Workspace (confirm with user): =ICAP, =BGCP, =TRAD (Tradition), =TPTS (Tullett)
-BROKER_CONTRIBUTORS = ["ICAP", "BGCP", "TRAD", "TPTS"]
+# Actual suffixes in Workspace (confirm with user): =ICAP, =BGCP, =TRDS (Tradition), =TPTS (Tullett)
+BROKER_CONTRIBUTORS = ["ICAP", "BGCP", "TRDS", "TPTS"]
+
+# SOFR fields for price extraction
+SOFR_FIELDS = ["BID", "ASK", "PRIMACT_1", "SEC_ACT_1", "TRDPRC_1", "HST_CLOSE", "GEN_VAL1", "TIMACT"]
 
 
 @dataclass
@@ -80,6 +87,11 @@ class CurrencyConfig:
     spot_ric: str               # "TWD=" or "USDCNH="
     # Spread pack type: NDF uses NDF_SPREAD_PACK; deliverable uses straight tenors + fwd-fwds
     spread_pack: str            # "NDF" or "DELIVERABLE"
+
+    @property
+    def display_tenors(self):
+        """Tenors for display including weekly (interpolated from monthly)."""
+        return WEEKLY_TENORS + self.tenors_m
 
     def outright_ric(self, tenor_m: int) -> str:
         """Return composite RIC for a given tenor (months)."""
@@ -100,10 +112,18 @@ class CurrencyConfig:
             return f"{self.code}{tenor_str}={contributor}"
 
 
-def _tenor_str(m: int) -> str:
-    """Format tenor int (months) to RIC tenor code."""
+def _tenor_str(m) -> str:
+    """Format tenor int or float (months) to RIC tenor code."""
     if m == 0:
         return ""  # spot
+    if m == 0.25:
+        return "1W"
+    if m == 0.5:
+        return "2W"
+    if m == 0.75:
+        return "3W"
+    if isinstance(m, float):
+        m = int(m)
     if m < 12:
         return f"{m}M"
     if m == 12:

@@ -26,7 +26,7 @@ from ric_config import (
 
 log = logging.getLogger(__name__)
 
-FIELDS_QUOTE = ["BID", "ASK", "PRIMACT_1", "SEC_ACT_1", "TRDPRC_1", "TIMACT"]
+FIELDS_QUOTE = ["BID", "ASK", "PRIMACT_1", "SEC_ACT_1", "TRDPRC_1", "HST_CLOSE", "GEN_VAL1", "TIMACT"]
 THROTTLE_FORWARD_SEC = 15.0
 
 
@@ -76,7 +76,7 @@ class MarketService:
             q = Quote(
                 bid=_num(fields.get("BID")) or _num(fields.get("PRIMACT_1")),
                 ask=_num(fields.get("ASK")) or _num(fields.get("SEC_ACT_1")),
-                last=_num(fields.get("TRDPRC_1")),
+                last=_num(fields.get("TRDPRC_1")) or _num(fields.get("HST_CLOSE")) or _num(fields.get("GEN_VAL1")),
                 ts=now,
             )
             self._quotes[ric] = q
@@ -112,7 +112,7 @@ class MarketService:
 
         def _ser(ric, dk="T"):
             q = _q(ric, dk)
-            return {"bid": q.bid, "ask": q.ask, "mid": q.mid(), "ts": q.ts}
+            return {"bid": q.bid, "ask": q.ask, "mid": q.mid(), "last": q.last, "ts": q.ts}
 
         # Spot
         spot_t = _ser(cfg.spot_ric, "T")
@@ -128,6 +128,8 @@ class MarketService:
                 "ric": ric, "days": days_approx,
                 "T": _ser(ric, "T"), "T1": _ser(ric, "T1"),
             }
+            # For each tenor, check if we got meaningful data. If bid/ask/last are all None, mark as missing.
+            tenors[m]["hasData"] = bool(tenors[m]["T"]["bid"] is not None or tenors[m]["T"]["ask"] is not None or tenors[m]["T"]["last"] is not None)
 
         # SOFR curve
         sofr = {}
@@ -141,6 +143,8 @@ class MarketService:
             "ccy": cfg.code, "pair": cfg.pair, "kind": cfg.kind,
             "pipFactor": cfg.pip_factor, "outrightDp": cfg.outright_dp, "pipDp": cfg.pip_dp,
             "tenorsM": cfg.tenors_m, "spreadPack": cfg.spread_pack,
+            "weeklyTenors": [0.25, 0.5, 0.75],
+            "displayTenors": cfg.display_tenors,
             "spot": {"ric": cfg.spot_ric, "T": spot_t, "T1": spot_t1},
             "tenors": tenors, "sofr": sofr,
         }

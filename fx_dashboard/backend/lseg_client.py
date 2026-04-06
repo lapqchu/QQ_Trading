@@ -178,3 +178,48 @@ class LsegClient:
 
     def is_open(self) -> bool:
         return self._session is not None
+
+    # ────────────────── IPA (analytics) ──────────────────
+    def calc_fx_implied_yield(
+        self,
+        ccy_pair: str,
+        spot: float,
+        fwd_points: float,
+        tenor_days: int,
+        sofr_rate: float,
+    ) -> Optional[float]:
+        """
+        Attempt to use LSEG IPA (Instrument Pricing Analytics) to compute
+        implied yield for an FX forward.
+
+        Falls back to None if IPA is unavailable (caller should use local calc).
+        """
+        try:
+            import lseg.data as ld
+            resp = ld.content.ipa.financial_contracts.Definition(
+                instrument_type="FxCross",
+                instrument_definition={
+                    "instrumentCode": ccy_pair,
+                    "legs": [{
+                        "dealType": "FxForward",
+                        "fxForwardType": "FxOutright",
+                        "forwardTenor": f"{tenor_days}D",
+                        "forwardPoints": fwd_points,
+                    }],
+                },
+                pricing_parameters={
+                    "valuationDate": datetime.utcnow().strftime("%Y-%m-%dT00:00:00Z"),
+                },
+                fields=[
+                    "ImpliedYieldPercent",
+                    "ForwardRate",
+                    "ImpliedDiscountFactor",
+                ],
+            ).get_data()
+            if resp and hasattr(resp, "data") and resp.data:
+                iy = resp.data.df.get("ImpliedYieldPercent")
+                if iy is not None and len(iy) > 0:
+                    return float(iy.iloc[0])
+        except Exception as e:
+            log.debug("IPA calc_fx_implied_yield failed (expected if IPA not available): %s", e)
+        return None

@@ -12,16 +12,20 @@ function snapToRaw(snap) {
   for (const m of snap.tenorsM) {
     const t = snap.tenors[m] || snap.tenors[String(m)] || {};
     const tT = t.T || {}, tT1 = t.T1 || {};
+    // Use last as fallback if bid/ask missing
+    const bT = tT.bid ?? tT.last, aT = tT.ask ?? tT.last;
+    const bT1 = tT1.bid ?? tT1.last, aT1 = tT1.ask ?? tT1.last;
     RAW_NDF[m] = {
-      T: { b: tT.bid, a: tT.ask }, T1: { b: tT1.bid, a: tT1.ask },
+      T: { b: bT, a: aT }, T1: { b: bT1, a: aT1 },
       days: { T: t.days || m * 30, T1: t.days || m * 30 },
+      hasData: t.hasData !== false,
     };
   }
   // SOFR
   const RAW_SOFR = {};
   for (const [m, s] of Object.entries(snap.sofr || {})) {
     const sT2 = s.T || {}, sT12 = s.T1 || {};
-    RAW_SOFR[+m] = { T: sT2.mid ?? sT2.bid, T1: sT12.mid ?? sT12.bid };
+    RAW_SOFR[+m] = { T: sT2.mid ?? sT2.last ?? sT2.bid ?? 0, T1: sT12.mid ?? sT12.last ?? sT12.bid ?? 0 };
   }
   return { RAW_NDF, RAW_SOFR };
 }
@@ -59,6 +63,8 @@ export function buildAllData(snap, liveQuotes = {}) {
     knownM.forEach(m => {
       const k = m === 0 ? "spot" : m;
       const e = getE(k, dk);
+      // Skip tenors with no usable data (both bid and ask are null)
+      if (e.b == null && e.a == null) return;
       d.push(m === 0 ? 0 : RAW_NDF[m]?.days?.[dk] || m * 30);
       mi.push(mid(e.b, e.a)); bi.push(e.b); ai.push(e.a);
     });
@@ -72,6 +78,8 @@ export function buildAllData(snap, liveQuotes = {}) {
     knownMFull.forEach(m => {
       const k = m === 0 ? "spot" : m;
       const e = getE(k, dk);
+      // Skip tenors with no usable data (both bid and ask are null)
+      if (m > 0 && e.b == null && e.a == null) return;
       d.push(m === 0 ? 0 : RAW_NDF[m]?.days?.[dk] || m * 30);
       mi.push(mid(e.b, e.a)); bi.push(e.b); ai.push(e.a);
     });
@@ -115,7 +123,17 @@ export function buildAllData(snap, liveQuotes = {}) {
     };
   }
 
-  const rows = []; for (let m = 0; m <= maxT; m++) rows.push(getRow(m));
+  // Generate rows: 0 (spot), weekly (0.25, 0.5, 0.75), then 1..maxT monthly
+  const weekM = [0.25, 0.5, 0.75];
+  const weekLabels = ["1W", "2W", "3W"];
+  const rows = [getRow(0)]; // spot
+  for (let w = 0; w < weekM.length; w++) {
+    const wr = getRow(weekM[w], Math.round(weekM[w] * 30), weekLabels[w]);
+    wr.interp = true; // weekly are always interpolated
+    wr.isWeekly = true;
+    rows.push(wr);
+  }
+  for (let m = 1; m <= maxT; m++) rows.push(getRow(m));
   const immR = IMM_DATES.filter(im => im.days <= maxT * 31).map(im => getRow(im.days / 30.44, im.days, im.label, im.valDate));
 
   // Fwd-fwd chain
@@ -200,7 +218,7 @@ export function buildAllData(snap, liveQuotes = {}) {
   }
 
   const cfg = { pair: snap.pair, pipFactor: PF, dp, kind: snap.kind, spreadPack: snap.spreadPack };
-  return { rows, immR, anchors, qFF, spSpr, immSpr, sMT, sMT1, sBT, sAT, cfg, ccy: snap.ccy, maxT, SPOT_DATE, TENOR_DATES };
+  return { rows, immR, anchors, qFF, spSpr, immSpr, sMT, sMT1, sBT, sAT, cfg, ccy: snap.ccy, maxT, SPOT_DATE, TENOR_DATES, lastReloadTs: snap.lastReloadTs };
 }
 
 // Custom tenor calculator

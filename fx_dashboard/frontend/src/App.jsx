@@ -230,7 +230,10 @@ function ToolsPanel({ad,onDbl}){
 // ══════════════════════ BROKER MONITOR ══════════════════════
 function BrokerMon({ad}){
   const{rows,ccy,cfg}=ad;const maxT=ad.maxT||24;
+  const[selBrokers,setSelBrokers]=useState(["ICAP","BGCP","TRDS","TPTS"]);
+  const[avgBrokers,setAvgBrokers]=useState(false);
   const allT=NDF_BROKER_TENORS.filter(t=>{if(t.type==="outright")return true;return t.far<=maxT;});
+  const brokerList=["ICAP","BGCP","TRDS","TPTS"];
   function getSpreadVal(t){
     if(t.type==="outright"){const r=rows[t.m];return r?{bid:r.spB,mid:r.spM,ask:r.spA}:null;}
     const nr=rows[t.near],fr=rows[t.far];if(!nr||!fr)return null;
@@ -239,6 +242,12 @@ function BrokerMon({ad}){
   return(<div>
     <div style={{fontSize:10,fontWeight:800,color:"#60A5FA",marginBottom:6,letterSpacing:".05em"}}>MARKET-TRADED TENORS — {cfg.pair} ({ccy})</div>
     <div style={{background:"#131C2E",borderRadius:5,padding:6,marginBottom:6}}>
+      <div style={{marginBottom:6,display:"flex",gap:4,alignItems:"center",flexWrap:"wrap"}}>
+        {brokerList.map(b=>(<label key={b} style={{fontSize:8,color:"#E2E8F0",display:"flex",alignItems:"center",gap:2,cursor:"pointer"}}><input type="checkbox" checked={selBrokers.includes(b)} onChange={e=>e.target.checked?setSelBrokers([...selBrokers,b]):setSelBrokers(selBrokers.filter(x=>x!==b))} style={{accentColor:"#3B82F6",width:8,height:8}}/>{b}</label>))}
+        <div style={{borderLeft:"1px solid #334155",paddingLeft:8}}>
+          <label style={{fontSize:8,color:"#E2E8F0",display:"flex",alignItems:"center",gap:2,cursor:"pointer"}}><input type="checkbox" checked={avgBrokers} onChange={e=>setAvgBrokers(e.target.checked)} style={{accentColor:"#3B82F6",width:8,height:8}}/>Average</label>
+        </div>
+      </div>
       <table style={{borderCollapse:"collapse",width:"100%",fontSize:9}}><thead><tr>
         <th style={{...tS(),textAlign:"left"}}>Tenor</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#F87171")}>Ask</th><th style={tS()}>Width</th>
       </tr></thead><tbody>
@@ -251,7 +260,7 @@ function BrokerMon({ad}){
         </tr>);})}
       </tbody></table></div>
     <div style={{fontSize:8,color:"#F87171",background:"#1F1317",border:"1px solid #7F1D1D",borderRadius:4,padding:6,marginTop:4}}>
-      <b>Per-broker contributions stream when LIVE mode is ON.</b> Real broker RICs (=ICAP, =BGCP, =TRAD, =TPTS) are subscribed via WebSocket.
+      <b>Per-broker contributions stream when LIVE mode is ON.</b> Real broker RICs (=ICAP, =BGCP, =TRDS, =TPTS) are subscribed via WebSocket. Broker columns show "Live only" when not streaming.
     </div>
   </div>);
 }
@@ -266,12 +275,14 @@ export default function Dashboard(){
   const[hm,setHm]=useState(null);
   const[ccy,setCcy]=useState("TWD");
   const[err,setErr]=useState(null);
+  const[lastReload,setLastReload]=useState(null);
+  const[reloadMsg,setReloadMsg]=useState(null);
   const channelsRef=useRef([]);
 
   useEffect(()=>{getCurrencies().then(setMeta).catch(e=>setErr(e.message));},[]);
   useEffect(()=>{
     setErr(null);setSnap(null);setLiveQuotes({});
-    getSnapshot(ccy).then(setSnap).catch(e=>setErr(e.message));
+    getSnapshot(ccy).then(s=>{setSnap(s);setLastReload(new Date());}).catch(e=>setErr(e.message));
   },[ccy]);
 
   // Live streaming
@@ -283,8 +294,22 @@ export default function Dashboard(){
     return()=>{channelsRef.current.forEach(c=>c.close());channelsRef.current=[];liveStop(ccy).catch(()=>{});};
   },[liveOn,ccy,snap]);
 
+  // Live mode timestamp ticking
+  useEffect(()=>{
+    if(!liveOn)return;
+    const iv=setInterval(()=>setLastReload(new Date()),1000);
+    return()=>clearInterval(iv);
+  },[liveOn]);
+
   const ad=useMemo(()=>buildAllData(snap,liveQuotes),[snap,liveQuotes]);
-  const refreshSnap=useCallback(()=>{getSnapshot(ccy).then(setSnap).catch(e=>setErr(e.message));},[ccy]);
+  const refreshSnap=useCallback(()=>{
+    getSnapshot(ccy).then(s=>{
+      setSnap(s);
+      setLastReload(new Date());
+      setReloadMsg("Snap refreshed successfully");
+      setTimeout(()=>setReloadMsg(null),3000);
+    }).catch(e=>setErr(e.message));
+  },[ccy]);
 
   if(err)return <div style={{padding:20,color:"#F87171"}}>Backend error: {err}</div>;
   if(!meta||!snap||!ad)return <div style={{padding:20,color:"#64748B"}}>Loading…</div>;
@@ -329,10 +354,30 @@ export default function Dashboard(){
           </div>
           <button onClick={refreshSnap} title="Refresh snapshot" style={{fontSize:8,padding:"3px 8px",borderRadius:4,border:"none",cursor:"pointer",background:"#1E293B",color:"#E2E8F0"}}>↻ Snap</button>
           <button onClick={()=>setLiveOn(v=>!v)} title="Toggle live streaming" style={{fontSize:8,padding:"3px 8px",borderRadius:4,border:"none",cursor:"pointer",background:liveOn?"#059669":"#1E293B",color:"#E2E8F0",fontWeight:700}}>● {liveOn?"LIVE":"OFF"}</button>
+          {lastReload&&(
+            <div style={{fontSize:7.5,color:"#64748B",fontFamily:"monospace"}}>
+              Last: {lastReload.toLocaleTimeString()}
+            </div>
+          )}
+          {reloadMsg&&(
+            <div style={{fontSize:8,color:"#4ADE80",background:"#064E3B",padding:"2px 6px",borderRadius:3}}>
+              {reloadMsg}
+            </div>
+          )}
           <label style={{fontSize:7.5,color:"#94A3B8",display:"flex",alignItems:"center",gap:2,cursor:"pointer"}}><input type="checkbox" checked={showI} onChange={()=>setShowI(!showI)} style={{accentColor:"#3B82F6",width:9,height:9}}/>Interp</label>
           <div style={{background:"#1E293B",padding:"2px 6px",borderRadius:4,fontSize:9,fontFamily:"monospace"}}>
             <span style={{color:"#64748B"}}>Spot </span><span style={{color:"#4ADE80"}}>{F(rows[0].bT,dp)}</span><span style={{color:"#334155"}}>/</span><span style={{color:"#F87171"}}>{F(rows[0].aT,dp)}</span><span style={{color:"#334155"}}> | </span><span style={{color:"#FBBF24",fontWeight:700}}>{F(rows[0].mT,dp)}</span>
           </div>
+          {cfg.kind==="NDF"&&rows[1+3]&&(
+            <div style={{background:"#1E293B",padding:"2px 6px",borderRadius:4,fontSize:9,fontFamily:"monospace"}}>
+              <span style={{color:"#64748B"}}>1M </span>
+              <span style={{color:"#4ADE80"}}>{F(rows.find(r=>r.month===1)?.bT,dp)}</span>
+              <span style={{color:"#334155"}}>/</span>
+              <span style={{color:"#F87171"}}>{F(rows.find(r=>r.month===1)?.aT,dp)}</span>
+              <span style={{color:"#334155"}}> | </span>
+              <span style={{color:"#FBBF24",fontWeight:700}}>{F(rows.find(r=>r.month===1)?.mT,dp)}</span>
+            </div>
+          )}
         </div>
       </div>
       {/* Tabs */}
@@ -344,7 +389,7 @@ export default function Dashboard(){
       {/* MAIN TAB */}
       {tab==="main"&&(<>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:6}}>
-          <PChart traces={[{x:tenors,y:outPts,type:"scatter",mode:"lines+markers",name:"Outright SwPts",line:{color:"#F59E0B"},marker:{size:4}}]} layout={{title:{text:`${cfg.pair} Outright Swap Points (pips)`,font:{size:10}}}} height={175}/>
+          <PChart traces={[{x:tenors,y:outPts,type:"scatter",mode:"lines+markers",name:"Outright SwPts",line:{color:"#F59E0B"},marker:{size:4}}]} layout={{title:{text:`${cfg.pair} Outright Swap Points (pips)`,font:{size:10}},yaxis:{title:"Swap Points (pips)"}}} height={175}/>
           <PChart traces={[{x:tenors,y:ffPts,type:"bar",name:"1M Fwd-Fwd",marker:{color:ffPts.map(v=>v>=0?"#3B82F6":"#F472B6")}}]} layout={{title:{text:`${cfg.pair} 1M Forward-Forward (pips)`,font:{size:10}}}} height={175}/>
           <PChart traces={[{x:tenors,y:iyVals,type:"scatter",mode:"lines+markers",name:`${cfg.pair.slice(3)} Impl%`,line:{color:"#10B981"},marker:{size:3}},{x:tenors,y:sofrVals,type:"scatter",mode:"lines+markers",name:"SOFR%",line:{color:"#FB923C"},marker:{size:3}}]} layout={{title:{text:`${cfg.pair} Implied Yield vs SOFR (%)`,font:{size:10}},yaxis:{title:"%"}}} height={175}/>
           <PChart traces={[{x:tenors,y:basVals,type:"bar",name:"Basis bp",marker:{color:basVals.map(v=>v>=0?"#8B5CF6":"#F472B6")}}]} layout={{title:{text:`${cfg.pair} Basis (bp)`,font:{size:10}}}} height={175}/>
@@ -355,7 +400,7 @@ export default function Dashboard(){
           <table style={{borderCollapse:"collapse",width:"100%",minWidth:1700}}>
             <thead><tr>
               <td colSpan={4} style={sS("#64748B")}>TENOR</td><td colSpan={3} style={sS("#60A5FA")}>{cfg.kind} OUTRIGHT</td>
-              <td colSpan={4} style={sS("#FBBF24")}>SWAP POINTS</td><td colSpan={4} style={sS("#34D399")}>IMPLIED YIELD [CALC]</td>
+              <td colSpan={4} style={sS("#FBBF24")}>SWAP POINTS</td><td colSpan={4} style={sS("#34D399")}>IMPLIED YIELD*</td>
               <td colSpan={2} style={sS("#FB923C")}>SOFR [LSEG]</td><td colSpan={2} style={sS("#C084FC")}>BASIS</td>
               <td colSpan={2} style={sS("#38BDF8")}>CARRY PIP</td><td colSpan={2} style={sS("#F472B6")}>CARRY YLD</td>
             </tr><tr>
@@ -443,8 +488,8 @@ export default function Dashboard(){
       {tab==="broker"&&<BrokerMon ad={ad}/>}
 
       <div style={{marginTop:4,fontSize:6.5,color:"#334155",display:"flex",justifyContent:"space-between",flexWrap:"wrap",gap:2}}>
-        <div>[LSEG] = sourced &middot; [CALC] = computed &middot; ImplYld=((F/S)(1+SOFR*d/360)-1)*360/d &middot; FwdFwd Impl=compounded from outrights &middot; Spread bid=far_bid-near_ask</div>
-        <div>IMM=3rd Wed Mar/Jun/Sep/Dec &middot; Fix=T-2 biz &middot; Val/Fix dates need LSEG calendar for local holidays</div>
+        <div>* = Calculated: ImplYld=((F/S)(1+SOFR×d/360)-1)×360/d · FwdFwd Impl=compounded from outrights · Spread bid=far_bid−near_ask · Weekly tenors interpolated (Fritsch-Carlson monotone cubic)</div>
+        <div>[LSEG] = sourced from Workspace · IMM=3rd Wed Mar/Jun/Sep/Dec · Fix=T-2 biz</div>
       </div>
     </div>);
 }

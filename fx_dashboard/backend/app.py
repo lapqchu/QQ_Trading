@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from typing import Dict, Any
 
@@ -101,6 +102,7 @@ def get_snapshot(ccy: str) -> Dict[str, Any]:
     try:
         snap = market.build_snapshot(ccy)
         snap["spreadDefs"] = _spread_defs_for(ccy)
+        snap["lastReloadTs"] = time.time()
         return snap
     except Exception as e:
         log.exception("snapshot %s failed", ccy)
@@ -133,6 +135,23 @@ def live_start(ccy: str) -> Dict[str, Any]:
 def live_stop(ccy: str | None = None) -> Dict[str, Any]:
     market.stop_streams(ccy)
     return {"status": "stopped", "ccy": ccy}
+
+
+@app.get("/api/ipa/implied-yield")
+def ipa_implied_yield(
+    pair: str = Query(...),
+    spot: float = Query(...),
+    fwd_points: float = Query(...),
+    days: int = Query(...),
+    sofr: float = Query(0.0),
+) -> Dict[str, Any]:
+    """Try LSEG IPA for implied yield; returns null if unavailable (frontend falls back to local calc)."""
+    if not lseg or not lseg.is_open():
+        return {"iy": None, "source": "unavailable"}
+    iy = lseg.calc_fx_implied_yield(pair, spot, fwd_points, days, sofr)
+    if iy is not None:
+        return {"iy": iy, "source": "LSEG_IPA"}
+    return {"iy": None, "source": "unavailable"}
 
 
 @app.get("/api/status")
