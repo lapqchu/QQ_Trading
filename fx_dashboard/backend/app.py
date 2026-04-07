@@ -86,7 +86,7 @@ def list_currencies() -> Dict[str, Any]:
             code: {
                 "pair": cfg.pair, "kind": cfg.kind,
                 "pipFactor": cfg.pip_factor, "outrightDp": cfg.outright_dp,
-                "pipDp": cfg.pip_dp, "tenorsM": cfg.tenors_m,
+                "pipDp": cfg.pip_dp, "tenorsM": cfg.anchor_tenors_m, "maxDisplayM": cfg.max_display_m,
                 "spreadPack": cfg.spread_pack,
             } for code, cfg in CURRENCIES.items()
         },

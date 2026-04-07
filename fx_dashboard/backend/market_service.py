@@ -120,7 +120,7 @@ class MarketService:
 
         # NDF/Deliverable tenors
         tenors = {}
-        for m in cfg.tenors_m:
+        for m in cfg.anchor_tenors_m:
             ric = cfg.outright_ric(m)
             # Approximate days to tenor
             days_approx = {1:30, 2:61, 3:91, 6:182, 9:273, 12:365, 18:547, 24:730}.get(m, m*30)
@@ -142,7 +142,8 @@ class MarketService:
         return {
             "ccy": cfg.code, "pair": cfg.pair, "kind": cfg.kind,
             "pipFactor": cfg.pip_factor, "outrightDp": cfg.outright_dp, "pipDp": cfg.pip_dp,
-            "tenorsM": cfg.tenors_m, "spreadPack": cfg.spread_pack,
+            "tenorsM": cfg.anchor_tenors_m, "anchorTenorsM": cfg.anchor_tenors_m, "maxDisplayM": cfg.max_display_m,
+            "spreadPack": cfg.spread_pack,
             "weeklyTenors": [0.25, 0.5, 0.75],
             "displayTenors": cfg.display_tenors,
             "spot": {"ric": cfg.spot_ric, "T": spot_t, "T1": spot_t1},
@@ -163,7 +164,7 @@ class MarketService:
             on_update=lambda ric, f: self._on_spot_tick(ric, f),
         )
         # Forwards — tick subscription but throttled to 15s per RIC server-side
-        fwd_rics = [cfg.outright_ric(m) for m in cfg.tenors_m]
+        fwd_rics = [cfg.outright_ric(m) for m in cfg.anchor_tenors_m]
         self.lseg.subscribe(
             tag=f"fwd-{ccy}",
             rics=fwd_rics,

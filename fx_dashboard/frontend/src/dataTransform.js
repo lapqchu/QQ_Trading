@@ -37,7 +37,7 @@ export function buildAllData(snap, liveQuotes = {}) {
   const PF = snap.pipFactor || 1e3;
   const dp = snap.outrightDp || 3;
   const knownM = snap.tenorsM || [1, 2, 3, 6, 9, 12, 18, 24];
-  const maxT = knownM[knownM.length - 1] || 24;
+  const maxT = snap.maxDisplayM || knownM[knownM.length - 1] || 24;
   const sofrM = [1, 2, 3, 6, 9, 12, 18, 24].filter(m => m <= Math.max(maxT, 24));
 
   const SPOT_DATE = computeSpotDate();
@@ -173,7 +173,7 @@ export function buildAllData(snap, liveQuotes = {}) {
 
   // Spreads
   function mkSpr(nrM, frM, label) {
-    const nr = rows[nrM], fr = rows[frM];
+    const nr = rows.find(r => r.month === nrM), fr = rows.find(r => r.month === frM);
     if (!nr || !fr) return null;
     const pB = fr.spB - nr.spA, pM = fr.spM - nr.spM, pA = fr.spA - nr.spB;
     const pB1 = fr.spB1 - nr.spA1, pM1 = fr.spM1 - nr.spM1, pA1 = fr.spA1 - nr.spB1;
@@ -230,8 +230,8 @@ export function calcCustom(ad, nearM, farM, nearDate, farDate) {
   if (fM <= nM) return null;
   const nrI = Math.floor(nM), frI = Math.floor(fM);
   const mT = ad.maxT || 24;
-  const nr = nrI >= 0 && nrI <= mT ? rows[nrI] : null;
-  const fr = frI >= 0 && frI <= mT ? rows[frI] : null;
+  const nr = nrI >= 0 && nrI <= mT ? rows.find(r => r.month === nrI) : null;
+  const fr = frI >= 0 && frI <= mT ? rows.find(r => r.month === frI) : null;
   if (!nr || !fr) return null;
   const pM = fr.spM - nr.spM, pB = fr.spB - nr.spA, pA = fr.spA - nr.spB; const ds = fr.dT - nr.dT;
   const fIy = fwdFwdIy(nr.iyM, nr.dT, fr.iyM, fr.dT);

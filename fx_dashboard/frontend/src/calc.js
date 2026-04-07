@@ -35,8 +35,8 @@ export function fwdFwdIy(iyN, dN, iyF, dF) {
 }
 
 // ── Formatting ──
-export const F = (v, dp = 3) => v != null ? v.toFixed(dp) : "—";
-export const FP = (v, dp = 1) => { if (v == null) return "—"; const s = v.toFixed(dp); return v > 0.0001 ? `+${s}` : s; };
+export const F = (v, dp = 3) => (v != null && isFinite(v)) ? v.toFixed(dp) : "—";
+export const FP = (v, dp = 1) => { if (v == null || !isFinite(v)) return "—"; const s = v.toFixed(dp); return v > 0.0001 ? `+${s}` : s; };
 export const CC = v => { if (v == null || Math.abs(v) < 0.001) return "#64748B"; return v > 0 ? "#F87171" : "#4ADE80"; };
 export function HB(val, mx, pos = [59, 130, 246], neg = [244, 114, 182]) {
   if (val == null || Math.abs(val) < 0.0005) return "transparent";

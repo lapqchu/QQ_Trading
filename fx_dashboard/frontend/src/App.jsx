@@ -174,11 +174,11 @@ function ToolsPanel({ad,onDbl}){
       if(scTenorMode==="date"&&dtStr){
         const dt=new Date(dtStr);const days=daysBtwn(ad.SPOT_DATE,dt);if(days<0)return null;
         const mApprox=days/30.44;const i=Math.floor(mApprox);
-        if(i<0||i>=ad.rows.length-1)return ad.rows[Math.min(Math.max(i,0),ad.rows.length-1)]||null;
-        const r0=ad.rows[i],r1=ad.rows[i+1];const t=mApprox-i;
+        const r0=ad.rows.find(x=>x.month===i);if(!r0)return null;
+        const r1=ad.rows.find(x=>x.month===Math.ceil(mApprox))||r0;const t=mApprox-i;
         return{dT:r0.dT+(r1.dT-r0.dT)*t,iyM:r0.iyM+(r1.iyM-r0.iyM)*t,spM:r0.spM+(r1.spM-r0.spM)*t,sofT:r0.sofT+(r1.sofT-r0.sofT)*t,_lbl:fD(dt)};
       }
-      const r=ad.rows[mKey];if(!r)return null;return{...r,_lbl:mKey===0?"Spot":`${mKey}M`};
+      const r=ad.rows.find(x=>x.month===mKey);if(!r)return null;return{...r,_lbl:mKey===0?"Spot":`${mKey}M`};
     }
     const nr=resolveLeg(scN,scNDt),fr=resolveLeg(scF,scFDt);
     if(!nr||!fr)return null;const ds=fr.dT-nr.dT;if(ds<=0)return null;
@@ -235,8 +235,8 @@ function BrokerMon({ad}){
   const allT=NDF_BROKER_TENORS.filter(t=>{if(t.type==="outright")return true;return t.far<=maxT;});
   const brokerList=["ICAP","BGCP","TRDS","TPTS"];
   function getSpreadVal(t){
-    if(t.type==="outright"){const r=rows[t.m];return r?{bid:r.spB,mid:r.spM,ask:r.spA}:null;}
-    const nr=rows[t.near],fr=rows[t.far];if(!nr||!fr)return null;
+    if(t.type==="outright"){const r=rows.find(x=>x.month===t.m);return r?{bid:r.spB,mid:r.spM,ask:r.spA}:null;}
+    const nr=rows.find(x=>x.month===t.near),fr=rows.find(x=>x.month===t.far);if(!nr||!fr)return null;
     return{bid:fr.spB-nr.spA,mid:fr.spM-nr.spM,ask:fr.spA-nr.spB};
   }
   return(<div>
@@ -328,12 +328,13 @@ export default function Dashboard(){
   const dblR=(t,v,isSP=false)=>setHm({tenor:t,value:v,isSP});
   const dp=cfg.dp;
 
-  const tenors=filt.filter(r=>r.month>0).map(r=>r.tenor);
-  const outPts=filt.filter(r=>r.month>0).map(r=>r.spM);
-  const ffPts=filt.filter(r=>r.month>0).map(r=>r.ffM);
-  const iyVals=filt.filter(r=>r.month>0).map(r=>r.iyM);
-  const sofrVals=filt.filter(r=>r.month>0).map(r=>r.sofT);
-  const basVals=filt.filter(r=>r.month>0).map(r=>(r.basisT||0)*100);
+  const chartRows=filt.filter(r=>r.month>0&&!r.isWeekly);
+  const tenors=chartRows.map(r=>r.tenor);
+  const outPts=chartRows.map(r=>r.spM);
+  const ffPts=chartRows.map(r=>r.ffM);
+  const iyVals=chartRows.map(r=>r.iyM);
+  const sofrVals=chartRows.map(r=>r.sofT);
+  const basVals=chartRows.map(r=>(r.basisT||0)*100);
 
   const tabs=[{id:"main",label:"Full Curve"},{id:"spreads",label:"Spreads & Rolls"},{id:"imm",label:"IMM Dates"},{id:"tools",label:"Tools"},{id:"broker",label:"Broker Monitor"}];
 
@@ -343,7 +344,7 @@ export default function Dashboard(){
       {/* Header */}
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6,paddingBottom:4,borderBottom:"1px solid #1E293B",flexWrap:"wrap",gap:4}}>
         <div><h1 style={{fontSize:14,fontWeight:800,margin:0,color:"#F8FAFC"}}>{cfg.pair} {cfg.kind==="NDF"?"NDF":"FWD"} Dashboard</h1>
-          <span style={{fontSize:8.5,color:"#475569"}}>LSEG Workspace Python API &middot; {liveOn?<span style={{color:"#4ADE80"}}>LIVE</span>:"Snapshot"}</span></div>
+          <span style={{fontSize:8.5,color:"#475569"}}>Workspace API &middot; {liveOn?<span style={{color:"#4ADE80"}}>LIVE</span>:"Snapshot"}</span></div>
         <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
           <div style={{display:"flex",gap:3,alignItems:"center",background:"#1E293B",padding:"2px 6px",borderRadius:4}}>
             <span style={{fontSize:7.5,color:"#64748B",fontWeight:700}}>CCY:</span>
@@ -401,7 +402,7 @@ export default function Dashboard(){
             <thead><tr>
               <td colSpan={4} style={sS("#64748B")}>TENOR</td><td colSpan={3} style={sS("#60A5FA")}>{cfg.kind} OUTRIGHT</td>
               <td colSpan={4} style={sS("#FBBF24")}>SWAP POINTS</td><td colSpan={4} style={sS("#34D399")}>IMPLIED YIELD*</td>
-              <td colSpan={2} style={sS("#FB923C")}>SOFR [LSEG]</td><td colSpan={2} style={sS("#C084FC")}>BASIS</td>
+              <td colSpan={2} style={sS("#FB923C")}>SOFR</td><td colSpan={2} style={sS("#C084FC")}>BASIS</td>
               <td colSpan={2} style={sS("#38BDF8")}>CARRY PIP</td><td colSpan={2} style={sS("#F472B6")}>CARRY YLD</td>
             </tr><tr>
               <th style={{...tS(),textAlign:"left",minWidth:36}}>Tnr</th><th style={tS()}>Val</th><th style={tS()}>Fix</th><th style={{...tS(),borderRight:"1px solid #334155"}}>D</th>
@@ -489,7 +490,7 @@ export default function Dashboard(){
 
       <div style={{marginTop:4,fontSize:6.5,color:"#334155",display:"flex",justifyContent:"space-between",flexWrap:"wrap",gap:2}}>
         <div>* = Calculated: ImplYld=((F/S)(1+SOFR×d/360)-1)×360/d · FwdFwd Impl=compounded from outrights · Spread bid=far_bid−near_ask · Weekly tenors interpolated (Fritsch-Carlson monotone cubic)</div>
-        <div>[LSEG] = sourced from Workspace · IMM=3rd Wed Mar/Jun/Sep/Dec · Fix=T-2 biz</div>
+        <div>IMM=3rd Wed Mar/Jun/Sep/Dec · Fix=T-2 biz</div>
       </div>
     </div>);
 }
