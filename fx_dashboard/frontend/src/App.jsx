@@ -31,26 +31,66 @@ function PChart({traces,layout,height=190}){
   const mergedX={...PLOT_LAYOUT.xaxis,...(layout?.xaxis||{})};
   const mergedY={...PLOT_LAYOUT.yaxis,...(layout?.yaxis||{})};
   const mergedY2=layout?.yaxis2?{...PLOT_LAYOUT.yaxis,overlaying:"y",side:"right",gridcolor:"transparent",...layout.yaxis2}:undefined;
-  const l={...PLOT_LAYOUT,...layout,height,xaxis:mergedX,yaxis:mergedY};
+  const l={...PLOT_LAYOUT,...layout,height,xaxis:mergedX,yaxis:mergedY,uirevision:"preserve"};
   if(mergedY2)l.yaxis2=mergedY2;
   return <Plot data={traces} layout={l} config={PLOT_CFG} style={{width:"100%"}} useResizeHandler/>;
 }
 
+// ── Helper: parse historical data response for a specific tenor ──
+function parseHistoryForTenor(data,tenor,isSwapPts){
+  if(!data?.history)return null;
+  const rics=Object.keys(data.history);
+  let targetRic=null;
+  const tenorClean=tenor.replace(/\s/g,'');
+  for(const ric of rics){
+    if(tenorClean==='Spot'&&!ric.includes('M')&&!ric.includes('Y')){targetRic=ric;break;}
+    if(ric.includes(tenorClean)||ric.includes(tenorClean.replace('M','MNDF'))){targetRic=ric;break;}
+  }
+  if(!targetRic){targetRic=rics.find(r=>r.includes(tenorClean))||rics[0];}
+  const bars=data.history[targetRic];
+  if(!bars||!bars.length)return null;
+  return bars.map(bar=>({
+    date:new Date(bar.Date),
+    value:bar.TRDPRC_1??bar.BID??((bar.BID||0)+(bar.ASK||0))/2||0,
+  })).filter(p=>p.value&&!isNaN(p.value));
+}
+
 // ══════════════════════ HIST MODAL ══════════════════════
-function HistModal({tenor,val,isSwapPts,onClose,dpOverride}){
-  const hist=useMemo(()=>genHist(val,252),[val]);
+function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy}){
+  const[hist,setHist]=useState(null);
+  const[loading,setLoading]=useState(true);
   const[sigN,setSigN]=useState(20);
-  const stats=useMemo(()=>calcStats(hist,sigN),[hist,sigN]);
-  const rsiD=useMemo(()=>calcRSI(hist),[hist]);
-  const macdD=useMemo(()=>calcMACD(hist),[hist]);
-  const bb=useMemo(()=>calcBB(hist),[hist]);
-  const s20=useMemo(()=>calcSMA(hist,20),[hist]);
-  const s50=useMemo(()=>calcSMA(hist,50),[hist]);
-  const zDev=useMemo(()=>calcZDev(hist,sigN),[hist,sigN]);
+  useEffect(()=>{
+    let cancelled=false;
+    setLoading(true);
+    getHistory(ccy,252).then(data=>{
+      if(cancelled)return;
+      const parsed=parseHistoryForTenor(data,tenor,isSwapPts);
+      if(parsed&&parsed.length>10){
+        setHist(parsed);
+      }else{
+        setHist(genHist(val,252));
+      }
+      setLoading(false);
+    }).catch(()=>{
+      if(!cancelled){
+        setHist(genHist(val,252));
+        setLoading(false);
+      }
+    });
+    return()=>{cancelled=true;};
+  },[ccy,tenor,val,isSwapPts]);
+  const stats=useMemo(()=>hist?calcStats(hist,sigN):null,[hist,sigN]);
+  const rsiD=useMemo(()=>hist?calcRSI(hist):[],[hist]);
+  const macdD=useMemo(()=>hist?calcMACD(hist):{line:[],signal:[],hist:[]},[hist]);
+  const bb=useMemo(()=>hist?calcBB(hist):{upper:[],lower:[],mid:[]},[hist]);
+  const s20=useMemo(()=>hist?calcSMA(hist,20):[],[hist]);
+  const s50=useMemo(()=>hist?calcSMA(hist,50):[],[hist]);
+  const zDev=useMemo(()=>hist?calcZDev(hist,sigN):[],[hist,sigN]);
   const[btPeriod,setBtPeriod]=useState(252);
-  const btRes=useMemo(()=>backtest(hist,btPeriod),[hist,btPeriod]);
+  const btRes=useMemo(()=>hist?backtest(hist,btPeriod):[],[hist,btPeriod]);
   const[selSt,setSelSt]=useState(null);const[hovSt,setHovSt]=useState(null);
-  const dates=hist.map(h=>h.date);const vals=hist.map(h=>h.value);
+  const dates=hist?hist.map(h=>h.date):[];const vals=hist?hist.map(h=>h.value):[];
   const yLabel=isSwapPts?"Swap Points (pips)":"Level";
   const priceTraces=[
     {x:dates,y:vals,type:"scatter",mode:"lines",name:tenor,line:{color:"#10B981",width:1.8}},
@@ -67,6 +107,17 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride}){
   ];
   const SR=({l,v,dp=3})=>(<div style={{display:"flex",justifyContent:"space-between",padding:"1px 0",borderBottom:"1px solid #1E293B",fontSize:8.5}}><span style={{color:"#64748B"}}>{l}</span><span style={{color:"#E2E8F0",fontFamily:"monospace"}}>{typeof v==="number"?v.toFixed(dp):v}</span></div>);
   useEffect(()=>{const h=e=>{if(e.key==="Escape")onClose();};window.addEventListener("keydown",h);return()=>window.removeEventListener("keydown",h);},[onClose]);
+  if(loading||!hist){
+    return(
+      <div style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,.85)",zIndex:100,display:"flex",justifyContent:"center",alignItems:"center",padding:8}} onClick={onClose}>
+        <div style={{background:"#0F172A",border:"1px solid #334155",borderRadius:8,width:"96%",maxWidth:400,padding:24,textAlign:"center"}} onClick={e=>e.stopPropagation()}>
+          <div style={{fontSize:12,color:"#E2E8F0",marginBottom:8}}>Loading historical data...</div>
+          <div style={{fontSize:10,color:"#64748B"}}>Fetching LSEG data for {tenor}</div>
+          <button onClick={onClose} style={{marginTop:12,background:"#1E293B",border:"1px solid #334155",color:"#94A3B8",padding:"3px 10px",borderRadius:4,cursor:"pointer",fontSize:9}}>Close</button>
+        </div>
+      </div>
+    );
+  }
   return(
     <div style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,.85)",zIndex:100,display:"flex",justifyContent:"center",alignItems:"center",padding:8}} onClick={onClose}>
       <div style={{background:"#0F172A",border:"1px solid #334155",borderRadius:8,width:"96%",maxWidth:1300,maxHeight:"96vh",overflow:"auto",padding:12}} onClick={e=>e.stopPropagation()}>
@@ -139,10 +190,10 @@ function SprTbl({spreads,title,color,mx,onDbl}){
   return(<div style={{background:"#131C2E",borderRadius:5,padding:6,marginBottom:6}}>
     <div style={{fontSize:9.5,fontWeight:800,color,marginBottom:3,letterSpacing:".05em"}}>{title}</div>
     <div style={{overflowX:"auto"}}><table style={{borderCollapse:"collapse",width:"100%",minWidth:1000,fontSize:9}}>
-      <thead><tr><th style={{...tS(),textAlign:"left",minWidth:60}}>Spread</th><th style={tS()}>Near Val</th><th style={tS()}>Far Val</th><th style={tS()}>Days</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#F87171")}>Ask</th><th style={tS()}>D/D</th><th style={tS()}>Pts/D</th><th style={tS("#4ADE80")}>Iy Bid</th><th style={tS("#34D399")}>Iy Mid</th><th style={tS("#F87171")}>Iy Ask</th><th style={tS()}>Iy D/D</th><th style={tS()}>Iy bp/d</th><th style={tS("#FB923C")}>SOFR%</th><th style={tS("#C084FC")}>Basis</th></tr></thead>
+      <thead><tr><th style={{...tS(),textAlign:"left",minWidth:60}}>Spread</th><th style={tS()}>Near Val</th><th style={tS()}>Near Fix</th><th style={tS()}>Far Val</th><th style={tS()}>Far Fix</th><th style={tS()}>Days</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#F87171")}>Ask</th><th style={tS()}>D/D</th><th style={tS()}>Pts/D</th><th style={tS("#4ADE80")}>Iy Bid</th><th style={tS("#34D399")}>Iy Mid</th><th style={tS("#F87171")}>Iy Ask</th><th style={tS()}>Iy D/D</th><th style={tS()}>Iy bp/d</th><th style={tS("#FB923C")}>SOFR%</th><th style={tS("#C084FC")}>Basis</th></tr></thead>
       <tbody>{spreads.map((s,i)=>(<tr key={i} style={{background:i%2===0?"#0F172A":"#131C2E",cursor:"pointer"}} onDoubleClick={()=>onDbl&&onDbl(s.label,Math.abs(s.pM)||1,true)}>
         <td style={{...cS(color,true),textAlign:"left"}}>{s.label}</td>
-        <td style={cS("#475569")}>{fD(s.nrVD)}</td><td style={cS("#475569")}>{fD(s.frVD)}</td><td style={cS("#475569",false,true)}>{s.days}</td>
+        <td style={cS("#475569")}>{fD(s.nrVD)}</td><td style={cS("#475569")}>{fD(s.nrFxD)}</td><td style={cS("#475569")}>{fD(s.frVD)}</td><td style={cS("#475569")}>{fD(s.frFxD)}</td><td style={cS("#475569",false,true)}>{s.days}</td>
         <td style={cS("#4ADE80")}>{FP(s.pB,1)}</td><td style={cS("#FBBF24",true)}>{FP(s.pM,1)}</td><td style={cS("#F87171")}>{FP(s.pA,1)}</td>
         <td style={{...cS(CC(s.chg)),background:HB(s.chg,mx)}}>{FP(s.chg,1)}</td><td style={cS("#64748B",false,true)}>{F(s.ppd,2)}</td>
         <td style={cS("#4ADE80")}>{F(s.fIyB,2)}</td><td style={cS("#34D399",true)}>{F(s.fIy,2)}</td><td style={cS("#F87171")}>{F(s.fIyA,2)}</td>
@@ -203,7 +254,10 @@ function ToolsPanel({ad,onDbl}){
           <div><span style={{color:"#64748B"}}>Ask: </span><span style={{color:"#F87171",fontFamily:"monospace"}}>{FP(custom.pA,1)}</span></div>
           <div><span style={{color:"#64748B"}}>Days: </span><span style={{color:"#E2E8F0",fontFamily:"monospace"}}>{custom.days}</span></div>
           <div><span style={{color:"#64748B"}}>Fwd Impl: </span><span style={{color:"#10B981",fontFamily:"monospace"}}>{custom.fIy!=null?F(custom.fIy,2)+"%":"—"}</span></div>
-          <div><span style={{color:"#64748B"}}>Near: </span><span style={{color:"#E2E8F0",fontFamily:"monospace"}}>{fD(custom.nrVD)}</span></div>
+          <div><span style={{color:"#64748B"}}>Near Val: </span><span style={{color:"#E2E8F0",fontFamily:"monospace"}}>{fD(custom.nrVD)}</span></div>
+          <div><span style={{color:"#64748B"}}>Near Fix: </span><span style={{color:"#E2E8F0",fontFamily:"monospace"}}>{fD(custom.nrFxD)}</span></div>
+          <div><span style={{color:"#64748B"}}>Far Val: </span><span style={{color:"#E2E8F0",fontFamily:"monospace"}}>{fD(custom.frVD)}</span></div>
+          <div><span style={{color:"#64748B"}}>Far Fix: </span><span style={{color:"#E2E8F0",fontFamily:"monospace"}}>{fD(custom.frFxD)}</span></div>
         </div></div>)}
     </div>
     <div style={{background:"#131C2E",borderRadius:5,padding:8}}>
@@ -232,23 +286,29 @@ function BrokerMon({ad}){
   const{rows,ccy,cfg}=ad;const maxT=ad.maxT||24;
   const[selBrokers,setSelBrokers]=useState(["ICAP","BGCP","TRDS","TPTS"]);
   const[avgBrokers,setAvgBrokers]=useState(false);
-  const allT=NDF_BROKER_TENORS.filter(t=>{if(t.type==="outright")return true;return t.far<=maxT;});
+
+  // Adapt broker tenor list based on kind
+  const DELIVERABLE_BROKER_TENORS=[
+    {label:"SPx1M",type:"outright",m:1},
+    {label:"SPx2M",type:"spread",near:0,far:2},{label:"SPx3M",type:"spread",near:0,far:3},
+    {label:"SPx6M",type:"spread",near:0,far:6},{label:"SPx9M",type:"spread",near:0,far:9},
+    {label:"SPx12M",type:"spread",near:0,far:12},{label:"SPx18M",type:"spread",near:0,far:18},
+    {label:"SPx2Y",type:"spread",near:0,far:24},
+  ];
+  const brokerTenors=cfg.kind==="NDF"?NDF_BROKER_TENORS:DELIVERABLE_BROKER_TENORS;
+  const allT=brokerTenors.filter(t=>{if(t.type==="outright")return true;return t.far<=maxT;});
   const brokerList=["ICAP","BGCP","TRDS","TPTS"];
+
   function getSpreadVal(t){
     if(t.type==="outright"){const r=rows.find(x=>x.month===t.m);return r?{bid:r.spB,mid:r.spM,ask:r.spA}:null;}
     const nr=rows.find(x=>x.month===t.near),fr=rows.find(x=>x.month===t.far);if(!nr||!fr)return null;
     return{bid:fr.spB-nr.spA,mid:fr.spM-nr.spM,ask:fr.spA-nr.spB};
   }
+
   return(<div>
-    <div style={{fontSize:10,fontWeight:800,color:"#60A5FA",marginBottom:6,letterSpacing:".05em"}}>MARKET-TRADED TENORS — {cfg.pair} ({ccy})</div>
+    <div style={{fontSize:10,fontWeight:800,color:"#60A5FA",marginBottom:6,letterSpacing:".05em"}}>REUTERS DEFAULT (COMPOSITE) RUN — {cfg.pair} ({ccy})</div>
     <div style={{background:"#131C2E",borderRadius:5,padding:6,marginBottom:6}}>
-      <div style={{marginBottom:6,display:"flex",gap:4,alignItems:"center",flexWrap:"wrap"}}>
-        {brokerList.map(b=>(<label key={b} style={{fontSize:8,color:"#E2E8F0",display:"flex",alignItems:"center",gap:2,cursor:"pointer"}}><input type="checkbox" checked={selBrokers.includes(b)} onChange={e=>e.target.checked?setSelBrokers([...selBrokers,b]):setSelBrokers(selBrokers.filter(x=>x!==b))} style={{accentColor:"#3B82F6",width:8,height:8}}/>{b}</label>))}
-        <div style={{borderLeft:"1px solid #334155",paddingLeft:8}}>
-          <label style={{fontSize:8,color:"#E2E8F0",display:"flex",alignItems:"center",gap:2,cursor:"pointer"}}><input type="checkbox" checked={avgBrokers} onChange={e=>setAvgBrokers(e.target.checked)} style={{accentColor:"#3B82F6",width:8,height:8}}/>Average</label>
-        </div>
-      </div>
-      <table style={{borderCollapse:"collapse",width:"100%",fontSize:9}}><thead><tr>
+      <table style={{borderCollapse:"collapse",width:"100%",fontSize:9,marginBottom:4}}><thead><tr>
         <th style={{...tS(),textAlign:"left"}}>Tenor</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#F87171")}>Ask</th><th style={tS()}>Width</th>
       </tr></thead><tbody>
         {allT.map((t,idx)=>{const v=getSpreadVal(t);return(<tr key={idx} style={{background:idx%2===0?"#0F172A":"#131C2E"}}>
@@ -258,7 +318,36 @@ function BrokerMon({ad}){
           <td style={cS(v?"#F87171":"#475569")}>{v?FP(v.ask,1):"—"}</td>
           <td style={cS("#94A3B8")}>{v?FP(v.ask-v.bid,1)+"p":"—"}</td>
         </tr>);})}
-      </tbody></table></div>
+      </tbody></table>
+    </div>
+
+    <div style={{fontSize:10,fontWeight:800,color:"#60A5FA",marginBottom:6,letterSpacing:".05em"}}>PER-BROKER CONTRIBUTIONS — {cfg.pair} ({ccy})</div>
+    <div style={{background:"#131C2E",borderRadius:5,padding:6,marginBottom:6}}>
+      <div style={{marginBottom:6,display:"flex",gap:4,alignItems:"center",flexWrap:"wrap"}}>
+        {brokerList.map(b=>(<label key={b} style={{fontSize:8,color:"#E2E8F0",display:"flex",alignItems:"center",gap:2,cursor:"pointer"}}><input type="checkbox" checked={selBrokers.includes(b)} onChange={e=>e.target.checked?setSelBrokers([...selBrokers,b]):setSelBrokers(selBrokers.filter(x=>x!==b))} style={{accentColor:"#3B82F6",width:8,height:8}}/>{b}</label>))}
+        <div style={{borderLeft:"1px solid #334155",paddingLeft:8}}>
+          <label style={{fontSize:8,color:"#E2E8F0",display:"flex",alignItems:"center",gap:2,cursor:"pointer"}}><input type="checkbox" checked={avgBrokers} onChange={e=>setAvgBrokers(e.target.checked)} style={{accentColor:"#3B82F6",width:8,height:8}}/>Average</label>
+        </div>
+      </div>
+      <table style={{borderCollapse:"collapse",width:"100%",fontSize:9}}><thead><tr>
+        <th style={{...tS(),textAlign:"left"}}>Tenor</th>
+        {selBrokers.includes("ICAP")&&<><th style={tS("#4ADE80")}>ICAP B</th><th style={tS("#FBBF24")}>ICAP M</th><th style={tS("#F87171")}>ICAP A</th></>}
+        {selBrokers.includes("BGCP")&&<><th style={tS("#4ADE80")}>BGCP B</th><th style={tS("#FBBF24")}>BGCP M</th><th style={tS("#F87171")}>BGCP A</th></>}
+        {selBrokers.includes("TRDS")&&<><th style={tS("#4ADE80")}>TRDS B</th><th style={tS("#FBBF24")}>TRDS M</th><th style={tS("#F87171")}>TRDS A</th></>}
+        {selBrokers.includes("TPTS")&&<><th style={tS("#4ADE80")}>TPTS B</th><th style={tS("#FBBF24")}>TPTS M</th><th style={tS("#F87171")}>TPTS A</th></>}
+        {avgBrokers&&<><th style={tS("#10B981")}>Avg B</th><th style={tS("#34D399")}>Avg M</th><th style={tS("#A78BFA")}>Avg A</th></>}
+      </tr></thead><tbody>
+        {allT.map((t,idx)=>{const v=getSpreadVal(t);return(<tr key={idx} style={{background:idx%2===0?"#0F172A":"#131C2E"}}>
+          <td style={{...cS("#CBD5E1",true),textAlign:"left"}}>{t.label}</td>
+          {selBrokers.includes("ICAP")&&<><td style={cS("#4ADE80")}>Live only</td><td style={cS("#FBBF24")}>Live only</td><td style={cS("#F87171")}>Live only</td></>}
+          {selBrokers.includes("BGCP")&&<><td style={cS("#4ADE80")}>Live only</td><td style={cS("#FBBF24")}>Live only</td><td style={cS("#F87171")}>Live only</td></>}
+          {selBrokers.includes("TRDS")&&<><td style={cS("#4ADE80")}>Live only</td><td style={cS("#FBBF24")}>Live only</td><td style={cS("#F87171")}>Live only</td></>}
+          {selBrokers.includes("TPTS")&&<><td style={cS("#4ADE80")}>Live only</td><td style={cS("#FBBF24")}>Live only</td><td style={cS("#F87171")}>Live only</td></>}
+          {avgBrokers&&<><td style={cS("#10B981")}>—</td><td style={cS("#34D399")}>—</td><td style={cS("#A78BFA")}>—</td></>}
+        </tr>);})}
+      </tbody></table>
+    </div>
+
     <div style={{fontSize:8,color:"#F87171",background:"#1F1317",border:"1px solid #7F1D1D",borderRadius:4,padding:6,marginTop:4}}>
       <b>Per-broker contributions stream when LIVE mode is ON.</b> Real broker RICs (=ICAP, =BGCP, =TRDS, =TPTS) are subscribed via WebSocket. Broker columns show "Live only" when not streaming.
     </div>
@@ -277,6 +366,7 @@ export default function Dashboard(){
   const[err,setErr]=useState(null);
   const[lastReload,setLastReload]=useState(null);
   const[reloadMsg,setReloadMsg]=useState(null);
+  const[liveTick,setLiveTick]=useState(0);
   const channelsRef=useRef([]);
 
   useEffect(()=>{getCurrencies().then(setMeta).catch(e=>setErr(e.message));},[]);
@@ -294,14 +384,17 @@ export default function Dashboard(){
     return()=>{channelsRef.current.forEach(c=>c.close());channelsRef.current=[];liveStop(ccy).catch(()=>{});};
   },[liveOn,ccy,snap]);
 
-  // Live mode timestamp ticking
+  // Live mode — force re-render tick
   useEffect(()=>{
     if(!liveOn)return;
-    const iv=setInterval(()=>setLastReload(new Date()),1000);
+    const iv=setInterval(()=>{
+      setLastReload(new Date());
+      setLiveTick(t=>t+1);
+    },1000);
     return()=>clearInterval(iv);
   },[liveOn]);
 
-  const ad=useMemo(()=>buildAllData(snap,liveQuotes),[snap,liveQuotes]);
+  const ad=useMemo(()=>buildAllData(snap,liveQuotes),[snap,liveQuotes,liveTick]);
   const refreshSnap=useCallback(()=>{
     getSnapshot(ccy).then(s=>{
       setSnap(s);
@@ -340,7 +433,7 @@ export default function Dashboard(){
 
   return(
     <div style={{background:"#0F172A",color:"#E2E8F0",minHeight:"100vh",fontFamily:"'Inter',system-ui,sans-serif",padding:8}}>
-      {hm&&<HistModal tenor={hm.tenor} val={hm.value} isSwapPts={hm.isSP} dpOverride={dp} onClose={()=>setHm(null)}/>}
+      {hm&&<HistModal tenor={hm.tenor} val={hm.value} isSwapPts={hm.isSP} dpOverride={dp} onClose={()=>setHm(null)} ccy={ccy}/>}
       {/* Header */}
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6,paddingBottom:4,borderBottom:"1px solid #1E293B",flexWrap:"wrap",gap:4}}>
         <div><h1 style={{fontSize:14,fontWeight:800,margin:0,color:"#F8FAFC"}}>{cfg.pair} {cfg.kind==="NDF"?"NDF":"FWD"} Dashboard</h1>
@@ -404,6 +497,7 @@ export default function Dashboard(){
               <td colSpan={4} style={sS("#FBBF24")}>SWAP POINTS</td><td colSpan={4} style={sS("#34D399")}>IMPLIED YIELD*</td>
               <td colSpan={2} style={sS("#FB923C")}>SOFR</td><td colSpan={2} style={sS("#C084FC")}>BASIS</td>
               <td colSpan={2} style={sS("#38BDF8")}>CARRY PIP</td><td colSpan={2} style={sS("#F472B6")}>CARRY YLD</td>
+              <td colSpan={2} style={sS("#A78BFA")}>ROLL DOWN</td>
             </tr><tr>
               <th style={{...tS(),textAlign:"left",minWidth:36}}>Tnr</th><th style={tS()}>Val</th><th style={tS()}>Fix</th><th style={{...tS(),borderRight:"1px solid #334155"}}>D</th>
               <th style={tS("#4ADE80")}>Bid</th><th style={tS("#F87171")}>Ask</th><th style={{...tS("#FBBF24"),borderRight:"1px solid #334155"}}>Mid</th>
@@ -412,7 +506,8 @@ export default function Dashboard(){
               <th style={tS("#FB923C")}>%</th><th style={{...tS(),borderRight:"1px solid #334155"}}>D/D</th>
               <th style={tS("#C084FC")}>bp</th><th style={{...tS(),borderRight:"1px solid #334155"}}>D/D</th>
               <th style={tS("#38BDF8")}>Outr</th><th style={{...tS("#38BDF8"),borderRight:"1px solid #334155"}}>FF</th>
-              <th style={tS("#F472B6")}>Outr</th><th style={tS("#F472B6")}>FF</th>
+              <th style={tS("#F472B6")}>Outr</th><th style={{...tS("#F472B6"),borderRight:"1px solid #334155"}}>FF</th>
+              <th style={tS("#A78BFA")}>Pts</th><th style={tS("#A78BFA")}>IY</th>
             </tr></thead>
             <tbody>{filt.map((r,i)=>{const sp=r.month===0,mj=[0,1,2,3,6,9,12,24].includes(r.month);const bg=sp?"#1a2744":(i%2===0?"#0F172A":"#111827");const tc=r.interp?"#475569":(mj?"#F8FAFC":"#94A3B8");
               return(<tr key={r.tenor} style={{background:bg,borderBottom:[3,6,9,12].includes(r.month)?"1px solid #334155":"none",cursor:"pointer"}} onDoubleClick={()=>dblR(r.tenor,r.spM,true)}>
@@ -429,7 +524,9 @@ export default function Dashboard(){
                 <td style={{...cS(r.carryOutP>=0?"#38BDF8":"#F472B6"),background:sp?"transparent":HB(r.carryOutP,mCP)}}>{sp?"—":FP(r.carryOutP,1)}</td>
                 <td style={{...cS(r.carryFfP>=0?"#38BDF8":"#F472B6"),borderRight:"1px solid #334155",background:r.month<2?"transparent":HB(r.carryFfP,mCF)}}>{r.month<2?"—":FP(r.carryFfP,1)}</td>
                 <td style={{...cS(r.carryOutY>=0?"#F472B6":"#4ADE80"),background:sp?"transparent":HB(r.carryOutY,mCY)}}>{sp?"—":FP(r.carryOutY,2)}</td>
-                <td style={{...cS(r.carryFfY>=0?"#F472B6":"#4ADE80"),background:r.month<2?"transparent":HB(r.carryFfY||0,mCY)}}>{r.month<2?"—":FP(r.carryFfY,2)}</td>
+                <td style={{...cS(r.carryFfY>=0?"#F472B6":"#4ADE80"),borderRight:"1px solid #334155",background:r.month<2?"transparent":HB(r.carryFfY||0,mCY)}}>{r.month<2?"—":FP(r.carryFfY,2)}</td>
+                <td style={cS(r.rollPts>=0?"#A78BFA":"#F472B6")}>{r.month<2?"—":FP(r.rollPts,1)}</td>
+                <td style={cS(r.rollIy>=0?"#A78BFA":"#F472B6")}>{r.month<2?"—":FP(r.rollIy,2)}</td>
               </tr>);})}</tbody></table></div>
 
         <div style={{fontSize:8.5,fontWeight:700,color:"#F8FAFC",marginBottom:2}}>1M FORWARD-FORWARD CHAIN</div>

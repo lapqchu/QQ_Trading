@@ -32,7 +32,7 @@ from dotenv import load_dotenv
 
 from lseg_client import LsegClient
 from market_service import MarketService
-from ric_config import CURRENCIES, NDF_CURRENCIES, DELIVERABLE_CURRENCIES, get_spread_pack
+from ric_config import CURRENCIES, NDF_CURRENCIES, DELIVERABLE_CURRENCIES, get_spread_pack, FUNDING_TENORS
 
 load_dotenv()
 logging.basicConfig(

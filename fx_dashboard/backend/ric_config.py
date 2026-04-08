@@ -2,40 +2,51 @@
 RIC configuration for all FX currencies: NDFs + Deliverable pairs.
 
 RIC conventions on LSEG / Workspace:
-- NDF outrights:     {CCY}{tenor}NDFOR=   e.g. TWD1MNDFOR=, KRW3MNDFOR=
-  (composite; broker contributors appended as =ICAP, =BGCP, =TRAD, =TPTS — REALTIME ONLY)
-- Deliverable spot:  {PAIR}=               e.g. USDCNH=, USDSGD=
-- Deliverable fwd:   {PAIR}{tenor}=        e.g. USDSGD1M=, USDTHB3M=
-  (for forwards we typically use points RICs: {PAIR}{tenor}=  or the outright =D2 etc.
-   Here we use points quoting convention matching desk practice.)
 
-Pip factors (convert outright-diff to "pips"):
-  TWD: 1e3   (quoted to 3dp)
-  KRW: 1e2   (quoted to 2dp)
-  INR: 1e4   (quoted to 4dp)
-  IDR: 1e0   (quoted to 1dp — points already whole numbers)
-  PHP: 1e3
-  CNY: 1e4
-  MYR: 1e4
-  CNH: 1e4
-  SGD: 1e4
-  THB: 1e3
-  KZT: 1e2
-  RUB: 1e4
+NDF SWAP POINTS (primary — what the market trades):
+  {CCY}{tenor}NDF=        e.g. TWD1MNDF=, KRW3MNDF=   (composite)
+  {CCY}{tenor}NDF={broker} e.g. TWD1MNDF=BGCP           (broker-contributed)
+
+NDF OUTRIGHTS (derived — spot + points):
+  {CCY}{tenor}NDFOR=      e.g. TWD1MNDFOR=              (composite outright)
+
+Deliverable FWD POINTS (primary — what the market trades):
+  {CCY}{tenor}=           e.g. SGD1M=, THB3M=           (composite fwd points)
+  {CCY}{tenor}={broker}   e.g. SGD1M=BGCP               (broker-contributed)
+
+Spot:
+  {CCY}=                  e.g. TWD=, KRW=     (NDF reference spot)
+  USD{CCY}=               e.g. USDCNH=        (deliverable spot — some use {CCY}=)
+
+SOFR OIS:
+  USDSROIS{tenor}=        e.g. USDSROIS1M=, USDSROIS1Y=
+
+Pip factors (convert price-difference to market-convention "pips" / "points"):
+  The pip_factor is used to convert between outright price differences and
+  the swap points convention the market quotes. For most pairs:
+    swap_points = (outright - spot) * pip_factor
+    outright = spot + swap_points / pip_factor
 """
 
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional
 
 # Full tenor set — used for SOFR mapping. Per-currency anchor tenors live in CurrencyConfig.
-ALL_TENORS_M = [1, 2, 3, 6, 9, 12, 18, 24]   # outright anchors
+ALL_TENORS_M = [1, 2, 3, 6, 9, 12, 18, 24]
 FULL_TENORS_M = [0, 1, 2, 3, 6, 9, 12, 18, 24]  # include spot (0)
 
 # Weekly tenors as month fractions: 1W≈0.25, 2W≈0.5, 3W≈0.75
-WEEKLY_TENORS = [0.25, 0.5, 0.75]  # 1W, 2W, 3W in month-fractions
+WEEKLY_TENORS = [0.25, 0.5, 0.75]
 ALL_TENORS_INCL_WEEKLY = [0.25, 0.5, 0.75] + ALL_TENORS_M
 
-# NDF spread pack (relative-value traded interbank)
+# Funding tenors for deliverables (days): ON=overnight, TN=tomorrow-next, SN=spot-next
+FUNDING_TENORS = ["ON", "TN", "SN"]
+
+# ─────────────────────────────────────────────────────────────
+# SPREAD PACK DEFINITIONS
+# ─────────────────────────────────────────────────────────────
+
+# NDF spread pack (relative-value traded interbank — 1M forward-starting)
 NDF_SPREAD_PACK = [
     ("1Wx1M", 0, 1, "1W", "1M"),
     ("1Mx2M", 1, 2, "1M", "2M"),
@@ -50,8 +61,8 @@ NDF_SPREAD_PACK = [
     ("12Mx24M", 12, 24, "12M", "24M"),
 ]
 
-# Deliverable spread pack — straight tenors only + occasional fwd-fwds + IMMs
-DELIVERABLE_STRAIGHT_TENORS = [
+# Deliverable anchor spreads — SPOT-START (this is how deliverables trade interbank)
+DELIVERABLE_ANCHOR_SPREADS = [
     ("SPx1M", 0, 1, "Spot", "1M"),
     ("SPx2M", 0, 2, "Spot", "2M"),
     ("SPx3M", 0, 3, "Spot", "3M"),
@@ -62,17 +73,21 @@ DELIVERABLE_STRAIGHT_TENORS = [
     ("SPx24M", 0, 24, "Spot", "24M"),
 ]
 
+# Deliverable fwd-fwd rolls (occasionally traded)
 DELIVERABLE_FWDFWD = [
-    ("1M fwd-fwd", 1, 2, "1M", "2M"),   # interbank 1M fwd-fwd
-    ("3M fwd-fwd", 3, 6, "3M", "6M"),   # interbank 3M fwd-fwd
+    ("1Mx2M", 1, 2, "1M", "2M"),
+    ("2Mx3M", 2, 3, "2M", "3M"),
+    ("3Mx6M", 3, 6, "3M", "6M"),
+    ("6Mx9M", 6, 9, "6M", "9M"),
+    ("9Mx12M", 9, 12, "9M", "12M"),
+    ("12Mx18M", 12, 18, "12M", "18M"),
+    ("18Mx24M", 18, 24, "18M", "24M"),
 ]
 
-# Broker contributors — realtime-only snap RICs on LSEG
-# Actual suffixes in Workspace (confirm with user): =ICAP, =BGCP, =TRDS (Tradition), =TPTS (Tullett)
+# Broker contributors — realtime snap RICs on LSEG
 BROKER_CONTRIBUTORS = ["ICAP", "BGCP", "TRDS", "TPTS"]
 
 # NDF live spread composite RICs (market-traded spreads)
-# Pattern: {CCY}NDFSPRd=R (composite), individual: {CCY}NDFSPRd={contributor}
 NDF_SPREAD_RICS = {
     "TWD": "TWDNDFSPRd=R",
     "KRW": "KRWNDFSPRd=R",
@@ -81,6 +96,8 @@ NDF_SPREAD_RICS = {
     "PHP": "PHPNDFSPRd=R",
     "CNY": "CNYNDFSPRd=R",
     "MYR": "MYRNDFSPRd=R",
+    "NGN": "NGNNDFSPRd=R",
+    "EGP": "EGPNDFSPRd=R",
 }
 
 # SOFR fields for price extraction
@@ -92,13 +109,12 @@ class CurrencyConfig:
     code: str                   # "TWD"
     pair: str                   # "USDTWD"
     kind: str                   # "NDF" or "DELIVERABLE"
-    pip_factor: float           # conversion outright→pips
+    pip_factor: float           # conversion outright-diff → market-convention points
     outright_dp: int            # decimal places for outright display
-    pip_dp: int                 # decimal places for pip display
-    anchor_tenors_m: List[int]  # RENAMED from tenors_m — only tenors with real LSEG RICs
-    max_display_m: int          # NEW — max display range (for interpolation)
+    pip_dp: int                 # decimal places for swap points display
+    anchor_tenors_m: List[int]  # only tenors with real LSEG RICs
+    max_display_m: int          # max display range (for interpolation)
     spot_ric: str               # "TWD=" or "USDCNH="
-    # Spread pack type: NDF uses NDF_SPREAD_PACK; deliverable uses straight tenors + fwd-fwds
     spread_pack: str            # "NDF" or "DELIVERABLE"
 
     @property
@@ -106,23 +122,39 @@ class CurrencyConfig:
         """Tenors for display including weekly (interpolated from monthly)."""
         return WEEKLY_TENORS + self.anchor_tenors_m
 
+    def swap_points_ric(self, tenor_m: int) -> str:
+        """Return composite swap points RIC for a given tenor.
+        This is the PRIMARY data source — what the market actually trades."""
+        tenor_str = _tenor_str(tenor_m)
+        if self.kind == "NDF":
+            return f"{self.code}{tenor_str}NDF="
+        else:
+            # Deliverable forward points: {CCY}{tenor}= e.g. SGD1M=
+            return f"{self.code}{tenor_str}="
+
     def outright_ric(self, tenor_m: int) -> str:
-        """Return composite RIC for a given tenor (months)."""
+        """Return composite outright RIC (for reference / cross-check).
+        For NDFs: {CCY}{tenor}NDFOR=  For deliverables: not typically used."""
         tenor_str = _tenor_str(tenor_m)
         if self.kind == "NDF":
             return f"{self.code}{tenor_str}NDFOR="
         else:
-            # Deliverable forward points RIC — e.g. SGD1M= (base ccy prefix only, no USD)
-            # LSEG convention: points RIC uses the non-USD ccy code
             return f"{self.code}{tenor_str}="
 
     def broker_ric(self, tenor_m: int, contributor: str) -> str:
-        """Return broker-contributed RIC for realtime snap."""
+        """Return broker-contributed swap points RIC for realtime snap."""
         tenor_str = _tenor_str(tenor_m)
         if self.kind == "NDF":
-            return f"{self.code}{tenor_str}NDFOR={contributor}"
+            return f"{self.code}{tenor_str}NDF={contributor}"
         else:
             return f"{self.code}{tenor_str}={contributor}"
+
+    def funding_ric(self, tenor: str) -> str:
+        """Return funding tenor RIC (ON/TN/SN) — deliverables only."""
+        if self.kind == "NDF":
+            return None
+        # e.g. USDSGDON=, USDSGDTN=, USDSGDSN=
+        return f"{self.pair}{tenor}="
 
 
 def _tenor_str(m) -> str:
@@ -151,26 +183,53 @@ def _tenor_str(m) -> str:
 # ═════════════════════════════════════════════════════════════════════
 # CURRENCY UNIVERSE
 # ═════════════════════════════════════════════════════════════════════
-# All NDFs & deliverables share the full canonical tenor curve.
-# Per-currency differences live in pip_factor / dp / spot RIC.
+# pip_factor: converts outright price diff to market-convention points
+# outright_dp: decimal places for outright price display
+# pip_dp: decimal places for swap points display
+#
+# The pip_factor encodes the market quoting convention:
+#   TWD (spot ~32.xxx):  points quoted as 50.0 meaning +0.050 → PF=1e3
+#   KRW (spot ~1350.xx): points quoted as 3.50 meaning +3.50  → PF=1e0 (whole won)
+#                         BUT interbank quotes in 0.01 (jeon) → PF=1e2
+#   INR (spot ~83.xxxx): points quoted in paise (0.01) → PF=1e2
+#   IDR (spot ~15800):   points in whole rupiah → PF=1e0
+#   PHP (spot ~56.xxx):  points in centavos → PF=1e2
+#   CNY/CNH (spot ~7.xxxx): points in 0.0001 (pip) → PF=1e4
+#   SGD (spot ~1.3xxx):  points in 0.0001 (pip) → PF=1e4
+#   THB (spot ~35.xx):   points in satang (0.01) → PF=1e2
+#   MYR (spot ~4.xxxx):  points in 0.0001 → PF=1e4
 
 CURRENCIES: Dict[str, CurrencyConfig] = {
-    # ───── NDFs ─────
+    # ═══════ NDFs ═══════
     "TWD": CurrencyConfig("TWD", "USDTWD", "NDF", 1e3, 3, 1, [1,2,3,6,9,12,24], 24, "TWD=", "NDF"),
-    "KRW": CurrencyConfig("KRW", "USDKRW", "NDF", 1e2, 2, 1, [1,2,3,6,9,12,24], 24, "KRW=", "NDF"),
-    "INR": CurrencyConfig("INR", "USDINR", "NDF", 1e4, 4, 1, [1,3,6,12], 12, "INR=", "NDF"),
-    "IDR": CurrencyConfig("IDR", "USDIDR", "NDF", 1e0, 1, 1, [1,3,6,12], 12, "IDR=", "NDF"),
-    "PHP": CurrencyConfig("PHP", "USDPHP", "NDF", 1e3, 3, 1, [1,3,6,12], 12, "PHP=", "NDF"),
+    "KRW": CurrencyConfig("KRW", "USDKRW", "NDF", 1e2, 2, 2, [1,2,3,6,9,12,24], 24, "KRW=", "NDF"),
+    "INR": CurrencyConfig("INR", "USDINR", "NDF", 1e2, 4, 2, [1,3,6,12], 12, "INR=", "NDF"),
+    "IDR": CurrencyConfig("IDR", "USDIDR", "NDF", 1e0, 0, 0, [1,3,6,12], 12, "IDR=", "NDF"),
+    "PHP": CurrencyConfig("PHP", "USDPHP", "NDF", 1e2, 3, 2, [1,3,6,12], 12, "PHP=", "NDF"),
     "CNY": CurrencyConfig("CNY", "USDCNY", "NDF", 1e4, 4, 1, [1,2,3,6,9,12,18,24], 24, "CNY=", "NDF"),
     "MYR": CurrencyConfig("MYR", "USDMYR", "NDF", 1e4, 4, 1, [1,2,3,6,9,12,18,24], 24, "MYR=", "NDF"),
+    "NGN": CurrencyConfig("NGN", "USDNGN", "NDF", 1e0, 2, 0, [1,3,6,12], 12, "NGN=", "NDF"),
+    "EGP": CurrencyConfig("EGP", "USDEGP", "NDF", 1e2, 4, 2, [1,3,6,12], 12, "EGP=", "NDF"),
 
-    # ───── Deliverables ─────
-    # CNH = offshore RMB (deliverable onshore-reference). Points convention uses CNH prefix.
-    "CNH": CurrencyConfig("CNH", "USDCNH", "DELIVERABLE", 1e4, 4, 1, [1,2,3,6,9,12], 24, "CNH=", "DELIVERABLE"),
-    "SGD": CurrencyConfig("SGD", "USDSGD", "DELIVERABLE", 1e4, 4, 1, [1,2,3,6,9,12], 24, "SGD=", "DELIVERABLE"),
-    "THB": CurrencyConfig("THB", "USDTHB", "DELIVERABLE", 1e3, 3, 1, [1,2,3,6,9,12], 24, "THB=", "DELIVERABLE"),
-    "KZT": CurrencyConfig("KZT", "USDKZT", "DELIVERABLE", 1e2, 2, 1, [1,3,6,12], 12, "KZT=", "DELIVERABLE"),
+    # ═══════ Deliverables ═══════
+    "CNH": CurrencyConfig("CNH", "USDCNH", "DELIVERABLE", 1e4, 4, 1, [1,2,3,6,9,12,18,24], 24, "CNH=", "DELIVERABLE"),
+    "SGD": CurrencyConfig("SGD", "USDSGD", "DELIVERABLE", 1e4, 4, 1, [1,2,3,6,9,12,18,24], 24, "SGD=", "DELIVERABLE"),
+    "THB": CurrencyConfig("THB", "USDTHB", "DELIVERABLE", 1e2, 2, 2, [1,2,3,6,9,12], 12, "THB=", "DELIVERABLE"),
+    "KZT": CurrencyConfig("KZT", "USDKZT", "DELIVERABLE", 1e2, 2, 2, [1,3,6,12], 12, "KZT=", "DELIVERABLE"),
     "RUB": CurrencyConfig("RUB", "USDRUB", "DELIVERABLE", 1e4, 4, 1, [1,3,6,12], 12, "RUB=", "DELIVERABLE"),
+    "CZK": CurrencyConfig("CZK", "USDCZK", "DELIVERABLE", 1e3, 3, 1, [1,2,3,6,9,12], 12, "CZK=", "DELIVERABLE"),
+    "ILS": CurrencyConfig("ILS", "USDILS", "DELIVERABLE", 1e4, 4, 1, [1,2,3,6,9,12], 12, "ILS=", "DELIVERABLE"),
+    "RON": CurrencyConfig("RON", "USDRON", "DELIVERABLE", 1e4, 4, 1, [1,2,3,6,9,12], 12, "RON=", "DELIVERABLE"),
+    "PLN": CurrencyConfig("PLN", "USDPLN", "DELIVERABLE", 1e4, 4, 1, [1,2,3,6,9,12], 12, "PLN=", "DELIVERABLE"),
+    "HUF": CurrencyConfig("HUF", "USDHUF", "DELIVERABLE", 1e2, 2, 2, [1,2,3,6,9,12], 12, "HUF=", "DELIVERABLE"),
+    "UGX": CurrencyConfig("UGX", "USDUGX", "DELIVERABLE", 1e0, 0, 0, [1,3,6,12], 12, "UGX=", "DELIVERABLE"),
+    "MUR": CurrencyConfig("MUR", "USDMUR", "DELIVERABLE", 1e2, 2, 2, [1,3,6,12], 12, "MUR=", "DELIVERABLE"),
+    "BWP": CurrencyConfig("BWP", "USDBWP", "DELIVERABLE", 1e4, 4, 1, [1,3,6,12], 12, "BWP=", "DELIVERABLE"),
+    "SAR": CurrencyConfig("SAR", "USDSAR", "DELIVERABLE", 1e4, 4, 1, [1,3,6,12], 12, "SAR=", "DELIVERABLE"),
+    "AED": CurrencyConfig("AED", "USDAED", "DELIVERABLE", 1e4, 4, 1, [1,3,6,12], 12, "AED=", "DELIVERABLE"),
+    "MAD": CurrencyConfig("MAD", "USDMAD", "DELIVERABLE", 1e4, 4, 1, [1,3,6,12], 12, "MAD=", "DELIVERABLE"),
+    "TND": CurrencyConfig("TND", "USDTND", "DELIVERABLE", 1e3, 3, 1, [1,3,6,12], 12, "TND=", "DELIVERABLE"),
+    "QAR": CurrencyConfig("QAR", "USDQAR", "DELIVERABLE", 1e4, 4, 1, [1,3,6,12], 12, "QAR=", "DELIVERABLE"),
 }
 
 NDF_CURRENCIES = [c for c, cfg in CURRENCIES.items() if cfg.kind == "NDF"]
@@ -184,8 +243,20 @@ SOFR_RICS = {
 }
 
 
+# ═════════════════════════════════════════════════════════════════════
+# RIC GENERATORS
+# ═════════════════════════════════════════════════════════════════════
+
+def all_swap_points_rics(ccy: str) -> List[str]:
+    """Return list of swap points RICs for a currency (primary data source)."""
+    cfg = CURRENCIES[ccy]
+    rics = [cfg.spot_ric]
+    rics.extend(cfg.swap_points_ric(m) for m in cfg.anchor_tenors_m)
+    return rics
+
+
 def all_outright_rics(ccy: str) -> List[str]:
-    """Return list of outright RICs for a currency (all tenors incl spot)."""
+    """Return list of outright RICs for a currency (reference only for NDFs)."""
     cfg = CURRENCIES[ccy]
     rics = [cfg.spot_ric]
     rics.extend(cfg.outright_ric(m) for m in cfg.anchor_tenors_m)
@@ -193,12 +264,25 @@ def all_outright_rics(ccy: str) -> List[str]:
 
 
 def all_broker_rics(ccy: str) -> List[str]:
-    """Return all broker-contributor RICs for a currency (for realtime subscription)."""
+    """Return all broker-contributed swap points RICs for a currency."""
     cfg = CURRENCIES[ccy]
     rics = []
     for m in cfg.anchor_tenors_m:
         for contrib in BROKER_CONTRIBUTORS:
             rics.append(cfg.broker_ric(m, contrib))
+    return rics
+
+
+def all_funding_rics(ccy: str) -> List[str]:
+    """Return funding tenor RICs (ON/TN/SN) for deliverable currencies."""
+    cfg = CURRENCIES[ccy]
+    if cfg.kind != "DELIVERABLE":
+        return []
+    rics = []
+    for tenor in FUNDING_TENORS:
+        ric = cfg.funding_ric(tenor)
+        if ric:
+            rics.append(ric)
     return rics
 
 
@@ -208,5 +292,5 @@ def get_spread_pack(ccy: str):
     if cfg.spread_pack == "NDF":
         return NDF_SPREAD_PACK
     else:
-        # Deliverable: straight tenors + fwd-fwds (IMM rolls added dynamically per-date)
-        return DELIVERABLE_STRAIGHT_TENORS + DELIVERABLE_FWDFWD
+        # Deliverable: spot-start as anchor spreads + fwd-fwd rolls
+        return DELIVERABLE_ANCHOR_SPREADS + DELIVERABLE_FWDFWD
