@@ -209,6 +209,8 @@ class LsegClient:
                 },
                 pricing_parameters={
                     "valuationDate": datetime.utcnow().strftime("%Y-%m-%dT00:00:00Z"),
+                    "spotRate": spot,
+                    "riskFreeRatePercent": sofr_rate,
                 },
                 fields=[
                     "ImpliedYieldPercent",
@@ -223,3 +225,184 @@ class LsegClient:
         except Exception as e:
             log.debug("IPA calc_fx_implied_yield failed (expected if IPA not available): %s", e)
         return None
+
+    def calc_fx_forward(
+        self,
+        ccy_pair: str,
+        tenor: str,
+        valuation_date: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Use LSEG IPA to calculate forward points, outright, implied yield,
+        fix date, and value date for ANY tenor on ANY currency pair.
+
+        This is the PRIMARY source for non-anchor tenors. IPA uses Workspace's
+        internal curve construction, holiday calendars, and market conventions
+        — more accurate than manual interpolation.
+
+        Args:
+            ccy_pair:  e.g. "USDTWD", "USDSGD"
+            tenor:     e.g. "1M", "3M", "45D", "6M", "1Y", "18M"
+                       Accepts standard tenors or day-count tenors.
+            valuation_date: ISO date string, defaults to today.
+
+        Returns dict with keys:
+            fwdPoints, fwdRate, impliedYield, fixDate, valueDate, tenor, source
+        Or None if IPA is unavailable.
+        """
+        try:
+            import lseg.data as ld
+            val_date = valuation_date or datetime.utcnow().strftime("%Y-%m-%dT00:00:00Z")
+
+            # Do NOT pass forwardPoints — let IPA compute from its internal curve
+            resp = ld.content.ipa.financial_contracts.Definition(
+                instrument_type="FxCross",
+                instrument_definition={
+                    "instrumentCode": ccy_pair,
+                    "legs": [{
+                        "dealType": "FxForward",
+                        "fxForwardType": "FxOutright",
+                        "forwardTenor": tenor,
+                    }],
+                },
+                pricing_parameters={
+                    "valuationDate": val_date,
+                },
+                fields=[
+                    "ForwardPoints",
+                    "ForwardRate",
+                    "ImpliedYieldPercent",
+                    "FixingDate",
+                    "EndDate",
+                    "StartDate",
+                    "DaysToExpiry",
+                    "FxSpotRate",
+                ],
+            ).get_data()
+
+            if not resp or not hasattr(resp, "data") or not resp.data:
+                return None
+
+            df = resp.data.df
+            result = {}
+            for col in ["ForwardPoints", "ForwardRate", "ImpliedYieldPercent",
+                        "FixingDate", "EndDate", "StartDate", "DaysToExpiry", "FxSpotRate"]:
+                val = df.get(col)
+                if val is not None and len(val) > 0:
+                    v = val.iloc[0]
+                    # Convert pandas Timestamp to ISO string for dates
+                    if hasattr(v, 'isoformat'):
+                        result[col] = v.isoformat()
+                    elif v is not None and str(v) != 'nan':
+                        result[col] = float(v)
+                    else:
+                        result[col] = None
+                else:
+                    result[col] = None
+
+            # Only return if we got at least forward points or rate
+            if result.get("ForwardPoints") is None and result.get("ForwardRate") is None:
+                log.debug("IPA returned no ForwardPoints/ForwardRate for %s %s", ccy_pair, tenor)
+                return None
+
+            return {
+                "fwdPoints": result.get("ForwardPoints"),
+                "fwdRate": result.get("ForwardRate"),
+                "impliedYield": result.get("ImpliedYieldPercent"),
+                "fixDate": result.get("FixingDate"),
+                "valueDate": result.get("EndDate"),
+                "startDate": result.get("StartDate"),
+                "days": result.get("DaysToExpiry"),
+                "spotRate": result.get("FxSpotRate"),
+                "tenor": tenor,
+                "source": "IPA",
+            }
+        except Exception as e:
+            log.debug("IPA calc_fx_forward(%s, %s) failed: %s", ccy_pair, tenor, e)
+        return None
+
+    def calc_fx_forward_batch(
+        self,
+        ccy_pair: str,
+        tenors: List[str],
+        valuation_date: Optional[str] = None,
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
+        """
+        Batch IPA call for multiple tenors on one pair.
+        Returns {tenor: result_dict or None}.
+        """
+        results = {}
+        # Try batch via multiple legs in one call first
+        try:
+            import lseg.data as ld
+            val_date = valuation_date or datetime.utcnow().strftime("%Y-%m-%dT00:00:00Z")
+
+            legs = []
+            for t in tenors:
+                legs.append({
+                    "dealType": "FxForward",
+                    "fxForwardType": "FxOutright",
+                    "forwardTenor": t,
+                })
+
+            resp = ld.content.ipa.financial_contracts.Definition(
+                instrument_type="FxCross",
+                instrument_definition={
+                    "instrumentCode": ccy_pair,
+                    "legs": legs,
+                },
+                pricing_parameters={
+                    "valuationDate": val_date,
+                },
+                fields=[
+                    "ForwardPoints", "ForwardRate", "ImpliedYieldPercent",
+                    "FixingDate", "EndDate", "StartDate", "DaysToExpiry", "FxSpotRate",
+                ],
+            ).get_data()
+
+            if resp and hasattr(resp, "data") and resp.data:
+                df = resp.data.df
+                # Multi-leg response: each row corresponds to a leg
+                for i, t in enumerate(tenors):
+                    if i < len(df):
+                        row = df.iloc[i]
+                        entry = {}
+                        for col in ["ForwardPoints", "ForwardRate", "ImpliedYieldPercent",
+                                    "FixingDate", "EndDate", "StartDate", "DaysToExpiry", "FxSpotRate"]:
+                            v = row.get(col) if hasattr(row, 'get') else getattr(row, col, None)
+                            if v is not None and hasattr(v, 'isoformat'):
+                                entry[col] = v.isoformat()
+                            elif v is not None and str(v) != 'nan':
+                                try:
+                                    entry[col] = float(v)
+                                except (TypeError, ValueError):
+                                    entry[col] = str(v)
+                            else:
+                                entry[col] = None
+
+                        if entry.get("ForwardPoints") is not None or entry.get("ForwardRate") is not None:
+                            results[t] = {
+                                "fwdPoints": entry.get("ForwardPoints"),
+                                "fwdRate": entry.get("ForwardRate"),
+                                "impliedYield": entry.get("ImpliedYieldPercent"),
+                                "fixDate": entry.get("FixingDate"),
+                                "valueDate": entry.get("EndDate"),
+                                "startDate": entry.get("StartDate"),
+                                "days": entry.get("DaysToExpiry"),
+                                "spotRate": entry.get("FxSpotRate"),
+                                "tenor": t,
+                                "source": "IPA",
+                            }
+                        else:
+                            results[t] = None
+                    else:
+                        results[t] = None
+                return results
+
+        except Exception as e:
+            log.debug("IPA batch failed for %s, falling back to individual calls: %s", ccy_pair, e)
+
+        # Fallback: individual calls
+        for t in tenors:
+            results[t] = self.calc_fx_forward(ccy_pair, t, valuation_date)
+        return results

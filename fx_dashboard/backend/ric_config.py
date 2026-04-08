@@ -98,6 +98,8 @@ NDF_SPREAD_RICS = {
     "MYR": "MYRNDFSPRd=R",
     "NGN": "NGNNDFSPRd=R",
     "EGP": "EGPNDFSPRd=R",
+    "CLP": "CLPNDFSPRd=R",
+    "COP": "COPNDFSPRd=R",
 }
 
 # SOFR fields for price extraction
@@ -198,6 +200,12 @@ def _tenor_str(m) -> str:
 #   SGD (spot ~1.3xxx):  points in 0.0001 (pip) → PF=1e4
 #   THB (spot ~35.xx):   points in satang (0.01) → PF=1e2
 #   MYR (spot ~4.xxxx):  points in 0.0001 → PF=1e4
+#   HKD (spot ~7.78xx):  points in 0.0001 (pip) → PF=1e4
+#   MXN (spot ~17.xxxx): points in 0.0001 (pip) → PF=1e4
+#   ZAR (spot ~18.xxxx): points in centavos (0.01) → PF=1e2
+#   TRY (spot ~32.xxxx): points in kurus (0.01) → PF=1e2
+#   CLP (spot ~900.x):   points in whole peso → PF=1e0
+#   COP (spot ~4200):    points in whole peso → PF=1e0
 
 CURRENCIES: Dict[str, CurrencyConfig] = {
     # ═══════ NDFs ═══════
@@ -210,10 +218,16 @@ CURRENCIES: Dict[str, CurrencyConfig] = {
     "MYR": CurrencyConfig("MYR", "USDMYR", "NDF", 1e4, 4, 1, [1,2,3,6,9,12,18,24], 24, "MYR=", "NDF"),
     "NGN": CurrencyConfig("NGN", "USDNGN", "NDF", 1e0, 2, 0, [1,3,6,12], 12, "NGN=", "NDF"),
     "EGP": CurrencyConfig("EGP", "USDEGP", "NDF", 1e2, 4, 2, [1,3,6,12], 12, "EGP=", "NDF"),
+    "CLP": CurrencyConfig("CLP", "USDCLP", "NDF", 1e0, 2, 0, [1,3,6,12], 12, "CLP=", "NDF"),
+    "COP": CurrencyConfig("COP", "USDCOP", "NDF", 1e0, 0, 0, [1,3,6,12], 12, "COP=", "NDF"),
 
     # ═══════ Deliverables ═══════
     "CNH": CurrencyConfig("CNH", "USDCNH", "DELIVERABLE", 1e4, 4, 1, [1,2,3,6,9,12,18,24], 24, "CNH=", "DELIVERABLE"),
     "SGD": CurrencyConfig("SGD", "USDSGD", "DELIVERABLE", 1e4, 4, 1, [1,2,3,6,9,12,18,24], 24, "SGD=", "DELIVERABLE"),
+    "HKD": CurrencyConfig("HKD", "USDHKD", "DELIVERABLE", 1e4, 4, 1, [1,2,3,6,9,12,18,24], 24, "HKD=", "DELIVERABLE"),
+    "MXN": CurrencyConfig("MXN", "USDMXN", "DELIVERABLE", 1e4, 4, 1, [1,2,3,6,9,12], 12, "MXN=", "DELIVERABLE"),
+    "ZAR": CurrencyConfig("ZAR", "USDZAR", "DELIVERABLE", 1e2, 4, 2, [1,2,3,6,9,12], 12, "ZAR=", "DELIVERABLE"),
+    "TRY": CurrencyConfig("TRY", "USDTRY", "DELIVERABLE", 1e2, 4, 2, [1,2,3,6,9,12], 12, "TRY=", "DELIVERABLE"),
     "THB": CurrencyConfig("THB", "USDTHB", "DELIVERABLE", 1e2, 2, 2, [1,2,3,6,9,12], 12, "THB=", "DELIVERABLE"),
     "KZT": CurrencyConfig("KZT", "USDKZT", "DELIVERABLE", 1e2, 2, 2, [1,3,6,12], 12, "KZT=", "DELIVERABLE"),
     "RUB": CurrencyConfig("RUB", "USDRUB", "DELIVERABLE", 1e4, 4, 1, [1,3,6,12], 12, "RUB=", "DELIVERABLE"),

@@ -53,8 +53,8 @@ function snapToRaw(snap) {
   for (const [m, s] of Object.entries(snap.sofr || {})) {
     const sT2 = s.T || {}, sT12 = s.T1 || {};
     RAW_SOFR[+m] = {
-      T: sT2.mid ?? sT2.last ?? sT2.bid ?? 0,
-      T1: sT12.mid ?? sT12.last ?? sT12.bid ?? 0,
+      T: sT2.mid ?? sT2.last ?? sT2.bid ?? null,
+      T1: sT12.mid ?? sT12.last ?? sT12.bid ?? null,
     };
   }
 
@@ -72,6 +72,17 @@ function snapToRaw(snap) {
 }
 
 
+// Map IPA tenor string → month number for lookup
+function ipaTenorToMonth(t) {
+  if (!t) return null;
+  const m = t.match(/^(\d+)(M|Y|W)$/i);
+  if (!m) return null;
+  const n = parseInt(m[1]), u = m[2].toUpperCase();
+  if (u === 'Y') return n * 12;
+  if (u === 'W') return n / 4;
+  return n;
+}
+
 // Main build function
 export function buildAllData(snap, liveQuotes = {}) {
   if (!snap) return null;
@@ -81,6 +92,16 @@ export function buildAllData(snap, liveQuotes = {}) {
   const pipDp = snap.pipDp || 1;
   const knownM = snap.tenorsM || [1, 2, 3, 6, 9, 12, 18, 24];
   const maxT = snap.maxDisplayM || knownM[knownM.length - 1] || 24;
+
+  // IPA data: Workspace-computed values for non-anchor (and anchor) tenors
+  // Keys are tenor strings ("1W","2W","3W","4M","1Y",...), values have fwdPoints, impliedYield, days, fixDate, valueDate
+  const IPA = {};
+  if (snap.ipa) {
+    for (const [tenorStr, data] of Object.entries(snap.ipa)) {
+      const m = ipaTenorToMonth(tenorStr);
+      if (m != null && data) IPA[m] = data;
+    }
+  }
   const sofrM = [1, 2, 3, 6, 9, 12, 18, 24].filter(m => m <= Math.max(maxT, 24));
 
   const SPOT_DATE = computeSpotDate();
@@ -136,7 +157,8 @@ export function buildAllData(snap, liveQuotes = {}) {
   function anchorSOFR(dk) {
     const mo = [], va = [];
     sofrM.forEach(m => {
-      if (RAW_SOFR[m]) { mo.push(m); va.push(RAW_SOFR[m][dk] ?? 0); }
+      const v = RAW_SOFR[m]?.[dk];
+      if (v != null) { mo.push(m); va.push(v); }
     });
     return { mo, va };
   }
@@ -152,17 +174,43 @@ export function buildAllData(snap, liveQuotes = {}) {
 
   function getRow(month, daysOvr, label, immVD) {
     const isK = (month === 0 || knownM.includes(month)) && !daysOvr;
-    const dT = daysOvr || Math.round(iDT(month));
+    const ipaD = IPA[month]; // Workspace IPA data for this tenor (if available)
+
+    // Days: prefer IPA days if available, otherwise interpolate
+    const dT = daysOvr || (ipaD?.days != null ? Math.round(ipaD.days) : Math.round(iDT(month)));
     const dT1 = daysOvr ? Math.round(iDT1(month) + (daysOvr - iDT(month))) : Math.round(iDT1(month));
+
+    // Data source tracking
+    let dataSource = month === 0 ? "spot" : isK ? "RIC" : (ipaD ? "IPA" : "interp");
 
     let spB, spM, spA, spB1, spM1, spA1;
     if (month === 0) {
       spB = 0; spM = 0; spA = 0; spB1 = 0; spM1 = 0; spA1 = 0;
     } else if (isK) {
+      // Anchor tenor: direct RIC data (primary source)
       const p = getPts(month, "T"), p1 = getPts(month, "T1");
       spB = p.b; spM = p.m; spA = p.a;
       spB1 = p1.b; spM1 = p1.m; spA1 = p1.a;
+    } else if (ipaD && ipaD.fwdPoints != null) {
+      // Non-anchor: Workspace IPA (preferred over our interpolation)
+      // IPA returns mid forward points. We use it as mid; bid/ask from interpolation for width.
+      const ipaM = ipaD.fwdPoints;
+      // Get interpolated bid/ask for spread width, but center on IPA mid
+      const interpM = iPtMT(dT);
+      const interpB = iPtBT(dT);
+      const interpA = iPtAT(dT);
+      if (interpM != null && interpB != null && interpA != null) {
+        // Shift interpolated curve to IPA mid, keeping bid/ask width
+        const shift = ipaM - interpM;
+        spB = interpB + shift; spM = ipaM; spA = interpA + shift;
+      } else {
+        // No interpolation available — use IPA mid for all three
+        spB = ipaM; spM = ipaM; spA = ipaM;
+      }
+      // T1: use interpolation (IPA is T only)
+      spM1 = iPtMT1(dT1); spB1 = iPtBT1(dT1); spA1 = iPtAT1(dT1);
     } else {
+      // Fallback: our mcI interpolation (last resort)
       spM = iPtMT(dT); spB = iPtBT(dT); spA = iPtAT(dT);
       spM1 = iPtMT1(dT1); spB1 = iPtBT1(dT1); spA1 = iPtAT1(dT1);
     }
@@ -176,31 +224,45 @@ export function buildAllData(snap, liveQuotes = {}) {
     const aT1 = month === 0 ? spot1.a : (spot1.m != null && spA1 != null ? spot1.m + spA1 / PF : null);
     const mT1 = month === 0 ? spot1.m : (spot1.m != null && spM1 != null ? spot1.m + spM1 / PF : null);
 
-    const sofT = month > 0 ? iST(Math.min(month, 24)) : 0;
-    const sofT1 = month > 0 ? iST1(Math.min(month, 24)) : 0;
+    const sofTRaw = month > 0 && sT.mo.length > 0 ? iST(Math.min(month, 24)) : null;
+    const sofT1Raw = month > 0 && sT1.mo.length > 0 ? iST1(Math.min(month, 24)) : null;
+    const sofT = sofTRaw != null && isFinite(sofTRaw) ? sofTRaw : (month === 0 ? 0 : null);
+    const sofT1 = sofT1Raw != null && isFinite(sofT1Raw) ? sofT1Raw : (month === 0 ? 0 : null);
 
-    const iyB = dT > 0 ? implYld(bT, sAT, sofT, dT) : null;
-    const iyM = dT > 0 ? implYld(mT, sMT, sofT, dT) : null;
-    const iyA = dT > 0 ? implYld(aT, sBT, sofT, dT) : null;
-    const iyB1 = dT1 > 0 ? implYld(bT1, sAT1, sofT1, dT1) : null;
-    const iyM1 = dT1 > 0 ? implYld(mT1, sMT1, sofT1, dT1) : null;
-    const iyA1 = dT1 > 0 ? implYld(aT1, sBT1, sofT1, dT1) : null;
+    // Implied yield: prefer IPA if available, otherwise compute locally
+    let iyB, iyM, iyA, iyB1, iyM1, iyA1;
+    if (ipaD && ipaD.impliedYield != null && !isK && month > 0) {
+      // IPA implied yield is the authoritative mid value
+      iyM = ipaD.impliedYield;
+      // Compute bid/ask IY locally (IPA only gives mid)
+      iyB = dT > 0 ? implYld(bT, sAT, sofT, dT) : null;
+      iyA = dT > 0 ? implYld(aT, sBT, sofT, dT) : null;
+    } else {
+      iyB = dT > 0 ? implYld(bT, sAT, sofT, dT) : null;
+      iyM = dT > 0 ? implYld(mT, sMT, sofT, dT) : null;
+      iyA = dT > 0 ? implYld(aT, sBT, sofT, dT) : null;
+    }
+    iyB1 = dT1 > 0 ? implYld(bT1, sAT1, sofT1, dT1) : null;
+    iyM1 = dT1 > 0 ? implYld(mT1, sMT1, sofT1, dT1) : null;
+    iyA1 = dT1 > 0 ? implYld(aT1, sBT1, sofT1, dT1) : null;
 
-    const basisT = iyM != null ? iyM - sofT : null;
-    const basisT1 = iyM1 != null ? iyM1 - sofT1 : null;
+    const basisT = iyM != null && sofT != null ? iyM - sofT : null;
+    const basisT1 = iyM1 != null && sofT1 != null ? iyM1 - sofT1 : null;
     const iyBpD = iyM != null && dT > 0 ? iyM / 360 * 100 : null;
 
+    // Dates: prefer IPA dates (Workspace holiday calendars), fallback to local calc
     const td = TENOR_DATES[Math.round(month)] || {};
-    const valDate = immVD || td.valDate || (daysOvr ? dateFromSpot(SPOT_DATE, daysOvr) : null);
-    const fixDate = valDate ? bizBefore(valDate, 2) : td.fixDate;
+    const ipaValDate = ipaD?.valueDate ? new Date(ipaD.valueDate) : null;
+    const ipaFixDate = ipaD?.fixDate ? new Date(ipaD.fixDate) : null;
+    const valDate = immVD || ipaValDate || td.valDate || (daysOvr ? dateFromSpot(SPOT_DATE, daysOvr) : null);
+    const fixDate = ipaFixDate || (valDate ? bizBefore(valDate, 2) : td.fixDate);
 
     return {
       tenor: label || (month === 0 ? "Spot" : month <= 12 ? `${month}M` : month === 24 ? "2Y" : `${month}M`),
-      month, dT, dT1,
+      month, dT, dT1, dataSource,
       bT, aT, mT, bT1, aT1, mT1,
-      spB: spB ?? 0, spM: spM ?? 0, spA: spA ?? 0,
-      spB1: spB1 ?? 0, spM1: spM1 ?? 0, spA1: spA1 ?? 0,
-      ptsPerDay: dT > 0 ? (spM ?? 0) / dT : 0,
+      spB, spM, spA, spB1, spM1, spA1,
+      ptsPerDay: dT > 0 && spM != null ? spM / dT : null,
       sofT, sofT1, iyB, iyM, iyA, iyB1, iyM1, iyA1,
       basisT, basisT1, iyBpD,
       interp: !isK && month !== 0,
@@ -225,54 +287,58 @@ export function buildAllData(snap, liveQuotes = {}) {
   // Fwd-fwd chain + roll-down
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i], p = i > 0 ? rows[i - 1] : null;
-    r.ffB = i === 0 ? 0 : r.spB - (p?.spA || 0);
-    r.ffM = i === 0 ? 0 : r.spM - (p?.spM || 0);
-    r.ffA = i === 0 ? 0 : r.spA - (p?.spB || 0);
-    r.ffB1 = i === 0 ? 0 : r.spB1 - (p?.spA1 || 0);
-    r.ffM1 = i === 0 ? 0 : r.spM1 - (p?.spM1 || 0);
-    r.ffA1 = i === 0 ? 0 : r.spA1 - (p?.spB1 || 0);
+    // Forward-forward points: null if either leg has null points
+    r.ffB = i === 0 ? 0 : (r.spB != null && p?.spA != null ? r.spB - p.spA : null);
+    r.ffM = i === 0 ? 0 : (r.spM != null && p?.spM != null ? r.spM - p.spM : null);
+    r.ffA = i === 0 ? 0 : (r.spA != null && p?.spB != null ? r.spA - p.spB : null);
+    r.ffB1 = i === 0 ? 0 : (r.spB1 != null && p?.spA1 != null ? r.spB1 - p.spA1 : null);
+    r.ffM1 = i === 0 ? 0 : (r.spM1 != null && p?.spM1 != null ? r.spM1 - p.spM1 : null);
+    r.ffA1 = i === 0 ? 0 : (r.spA1 != null && p?.spB1 != null ? r.spA1 - p.spB1 : null);
     r.ffIyB = p ? fwdFwdIy(p.iyA, p.dT, r.iyB, r.dT) : null;
     r.ffIyM = p ? fwdFwdIy(p.iyM, p.dT, r.iyM, r.dT) : null;
     r.ffIyA = p ? fwdFwdIy(p.iyB, p.dT, r.iyA, r.dT) : null;
     r.ffIyM1 = p ? fwdFwdIy(p.iyM1, p.dT1, r.iyM1, r.dT1) : null;
     const fwdD = p ? r.dT - p.dT : 0;
-    r.ffSofr = fwdD > 0 ? ((1 + r.sofT / 100 * r.dT / 360) / (1 + (p?.sofT || 0) / 100 * (p?.dT || 0) / 360) - 1) * 360 / fwdD * 100 : null;
+    // Forward SOFR: null if either leg's SOFR is null
+    r.ffSofr = fwdD > 0 && r.sofT != null && p?.sofT != null ? ((1 + r.sofT / 100 * r.dT / 360) / (1 + p.sofT / 100 * p.dT / 360) - 1) * 360 / fwdD * 100 : null;
     r.ffBasis = r.ffIyM != null && r.ffSofr != null ? r.ffIyM - r.ffSofr : null;
     r.ffIyBpD = r.ffIyM != null && fwdD > 0 ? r.ffIyM / 360 * 100 : null;
-    r.pipChg = r.spM - r.spM1;
-    r.ffChg = r.ffM - r.ffM1;
-    r.iyChg = (r.iyM || 0) - (r.iyM1 || 0);
-    r.sofChg = r.sofT - r.sofT1;
-    r.basChg = (r.basisT || 0) - (r.basisT1 || 0);
-    r.ffIyChg = (r.ffIyM || 0) - (r.ffIyM1 || 0);
+    // D/D changes: null if either day's value is null
+    r.pipChg = r.spM != null && r.spM1 != null ? r.spM - r.spM1 : null;
+    r.ffChg = r.ffM != null && r.ffM1 != null ? r.ffM - r.ffM1 : null;
+    r.iyChg = r.iyM != null && r.iyM1 != null ? r.iyM - r.iyM1 : null;
+    r.sofChg = r.sofT != null && r.sofT1 != null ? r.sofT - r.sofT1 : null;
+    r.basChg = r.basisT != null && r.basisT1 != null ? r.basisT - r.basisT1 : null;
+    r.ffIyChg = r.ffIyM != null && r.ffIyM1 != null ? r.ffIyM - r.ffIyM1 : null;
+    // Carry: null if underlying is null
     r.carryOutP = r.ffM;
-    r.carryFfP = i >= 2 ? r.ffM - p.ffM : (i === 1 ? r.ffM : 0);
-    r.carryOutY = i > 0 ? (r.iyM || 0) - (p?.iyM || 0) : 0;
-    r.carryFfY = i >= 2 ? (r.ffIyM || 0) - (p?.ffIyM || 0) : (i === 1 ? (r.ffIyM || 0) : 0);
-    // Roll-down columns
-    r.rollPts = i >= 2 ? r.ffM - (p?.ffM || 0) : null;
-    r.rollIy = i >= 2 ? (r.ffIyM || 0) - (p?.ffIyM || 0) : null;
+    r.carryFfP = i >= 2 && r.ffM != null && p?.ffM != null ? r.ffM - p.ffM : (i === 1 ? r.ffM : null);
+    r.carryOutY = i > 0 && r.iyM != null && p?.iyM != null ? r.iyM - p.iyM : null;
+    r.carryFfY = i >= 2 && r.ffIyM != null && p?.ffIyM != null ? r.ffIyM - p.ffIyM : (i === 1 ? r.ffIyM : null);
+    // Roll-down: null if underlying is null
+    r.rollPts = i >= 2 && r.ffM != null && p?.ffM != null ? r.ffM - p.ffM : null;
+    r.rollIy = i >= 2 && r.ffIyM != null && p?.ffIyM != null ? r.ffIyM - p.ffIyM : null;
   }
 
   // IMM D/D
   for (let i = 0; i < immR.length; i++) {
     const r = immR[i], p = i > 0 ? immR[i - 1] : null;
-    r.pipChg = r.spM - r.spM1;
-    r.iyChg = (r.iyM || 0) - (r.iyM1 || 0);
-    r.sofChg = r.sofT - r.sofT1;
-    r.basChg = (r.basisT || 0) - (r.basisT1 || 0);
-    r.ptsPerDay = r.dT > 0 ? r.spM / r.dT : 0;
-    r.ffB = i === 0 ? r.spB : r.spB - (p?.spA || 0);
-    r.ffM = i === 0 ? r.spM : r.spM - (p?.spM || 0);
-    r.ffA = i === 0 ? r.spA : r.spA - (p?.spB || 0);
-    r.ffM1 = i === 0 ? r.spM1 : r.spM1 - (p?.spM1 || 0);
-    r.ffChg = r.ffM - r.ffM1;
+    r.pipChg = r.spM != null && r.spM1 != null ? r.spM - r.spM1 : null;
+    r.iyChg = r.iyM != null && r.iyM1 != null ? r.iyM - r.iyM1 : null;
+    r.sofChg = r.sofT != null && r.sofT1 != null ? r.sofT - r.sofT1 : null;
+    r.basChg = r.basisT != null && r.basisT1 != null ? r.basisT - r.basisT1 : null;
+    r.ptsPerDay = r.dT > 0 && r.spM != null ? r.spM / r.dT : null;
+    r.ffB = i === 0 ? r.spB : (r.spB != null && p?.spA != null ? r.spB - p.spA : null);
+    r.ffM = i === 0 ? r.spM : (r.spM != null && p?.spM != null ? r.spM - p.spM : null);
+    r.ffA = i === 0 ? r.spA : (r.spA != null && p?.spB != null ? r.spA - p.spB : null);
+    r.ffM1 = i === 0 ? r.spM1 : (r.spM1 != null && p?.spM1 != null ? r.spM1 - p.spM1 : null);
+    r.ffChg = r.ffM != null && r.ffM1 != null ? r.ffM - r.ffM1 : null;
     r.ffIyM = p ? fwdFwdIy(p.iyM, p.dT, r.iyM, r.dT) : null;
     r.ffIyM1 = p ? fwdFwdIy(p.iyM1, p.dT1, r.iyM1, r.dT1) : null;
-    r.ffIyChg = (r.ffIyM || 0) - (r.ffIyM1 || 0);
+    r.ffIyChg = r.ffIyM != null && r.ffIyM1 != null ? r.ffIyM - r.ffIyM1 : null;
     const fwdD = p ? r.dT - p.dT : r.dT;
-    r.ffSofr = p && fwdD > 0 ? ((1 + r.sofT / 100 * r.dT / 360) / (1 + (p.sofT / 100) * p.dT / 360) - 1) * 360 / fwdD * 100 : (r.sofT || 0);
-    r.ffBasis = r.ffIyM != null ? r.ffIyM - (r.ffSofr || 0) : null;
+    r.ffSofr = fwdD > 0 && r.sofT != null && (p ? p.sofT != null : true) ? (p ? ((1 + r.sofT / 100 * r.dT / 360) / (1 + p.sofT / 100 * p.dT / 360) - 1) * 360 / fwdD * 100 : r.sofT) : null;
+    r.ffBasis = r.ffIyM != null && r.ffSofr != null ? r.ffIyM - r.ffSofr : null;
   }
 
   // Spreads — find rows by month, NOT by index
@@ -280,25 +346,31 @@ export function buildAllData(snap, liveQuotes = {}) {
     const nr = rows.find(r => r.month === nrM);
     const fr = rows.find(r => r.month === frM);
     if (!nr || !fr) return null;
-    const pB = fr.spB - nr.spA, pM = fr.spM - nr.spM, pA = fr.spA - nr.spB;
-    const pB1 = fr.spB1 - nr.spA1, pM1 = fr.spM1 - nr.spM1, pA1 = fr.spA1 - nr.spB1;
+    // Null-safe: if either leg's points are null, spread is null (not zero)
+    const haveT = fr.spB != null && fr.spM != null && fr.spA != null && nr.spA != null && nr.spM != null && nr.spB != null;
+    const haveT1 = fr.spB1 != null && fr.spM1 != null && fr.spA1 != null && nr.spA1 != null && nr.spM1 != null && nr.spB1 != null;
+    const pB = haveT ? fr.spB - nr.spA : null, pM = haveT ? fr.spM - nr.spM : null, pA = haveT ? fr.spA - nr.spB : null;
+    const pB1 = haveT1 ? fr.spB1 - nr.spA1 : null, pM1 = haveT1 ? fr.spM1 - nr.spM1 : null, pA1 = haveT1 ? fr.spA1 - nr.spB1 : null;
     const ds = fr.dT - nr.dT;
     const fIyB = fwdFwdIy(nr.iyA, nr.dT, fr.iyB, fr.dT);
     const fIy = fwdFwdIy(nr.iyM, nr.dT, fr.iyM, fr.dT);
     const fIyA = fwdFwdIy(nr.iyB, nr.dT, fr.iyA, fr.dT);
     const fIy1 = fwdFwdIy(nr.iyM1, nr.dT1, fr.iyM1, fr.dT1);
-    const fSof = ds > 0 ? ((1 + fr.sofT / 100 * fr.dT / 360) / (1 + nr.sofT / 100 * nr.dT / 360) - 1) * 360 / ds * 100 : 0;
-    const fSof1 = ds > 0 ? ((1 + fr.sofT1 / 100 * fr.dT1 / 360) / (1 + nr.sofT1 / 100 * nr.dT1 / 360) - 1) * 360 / ds * 100 : 0;
-    const bas = fIy != null ? fIy - fSof : null;
+    // Null-safe: if SOFR is null for either leg, forward SOFR is null
+    const haveSof = ds > 0 && fr.sofT != null && nr.sofT != null;
+    const haveSof1 = ds > 0 && fr.sofT1 != null && nr.sofT1 != null;
+    const fSof = haveSof ? ((1 + fr.sofT / 100 * fr.dT / 360) / (1 + nr.sofT / 100 * nr.dT / 360) - 1) * 360 / ds * 100 : null;
+    const fSof1 = haveSof1 ? ((1 + fr.sofT1 / 100 * fr.dT1 / 360) / (1 + nr.sofT1 / 100 * nr.dT1 / 360) - 1) * 360 / ds * 100 : null;
+    const bas = fIy != null && fSof != null ? fIy - fSof : null;
     return {
-      label, pB, pM, pA, pB1, pM1, pA1, chg: pM - pM1, days: ds,
-      nrVD: nr.valDate, frVD: fr.valDate, nrFD: nr.fixDate, frFD: fr.fixDate,
+      label, pB, pM, pA, pB1, pM1, pA1, chg: pM != null && pM1 != null ? pM - pM1 : null, days: ds,
+      nrVD: nr.valDate, frVD: fr.valDate, nrFxD: nr.fixDate, frFxD: fr.fixDate,
       nrDT: nr.dT, frDT: fr.dT,
       fIyB, fIy, fIyA, fIy1,
-      iyChg: (fIy || 0) - (fIy1 || 0),
-      fSof, fSof1, sofChg: fSof - fSof1,
-      bas, basChg: (bas || 0) - ((fIy1 || 0) - (fSof1 || 0)),
-      ppd: ds > 0 ? pM / ds : 0,
+      iyChg: fIy != null && fIy1 != null ? fIy - fIy1 : null,
+      fSof, fSof1, sofChg: fSof != null && fSof1 != null ? fSof - fSof1 : null,
+      bas, basChg: bas != null && fIy1 != null && fSof1 != null ? bas - (fIy1 - fSof1) : null,
+      ppd: ds > 0 && pM != null ? pM / ds : null,
       iyBpD: fIy != null ? fIy / 360 * 100 : null,
     };
   }
@@ -324,26 +396,31 @@ export function buildAllData(snap, liveQuotes = {}) {
   }
   spSpr = [1,2,3,6,9,12,18,24].filter(f => f <= maxT).map(f => mkSpr(0, f, `SP×${f<=12?f+"M":"2Y"}`)).filter(Boolean);
 
-  // IMM spreads
+  // IMM spreads — null-safe: missing data → null output
   const immSpr = [];
   for (let i = 0; i < immR.length - 1; i++) {
     const nr = immR[i], fr = immR[i+1];
-    const pB = fr.spB - nr.spA, pM = fr.spM - nr.spM, pA = fr.spA - nr.spB;
-    const pM1 = fr.spM1 - nr.spM1;
+    const haveImm = fr.spB != null && fr.spM != null && fr.spA != null && nr.spA != null && nr.spM != null && nr.spB != null;
+    const pB = haveImm ? fr.spB - nr.spA : null, pM = haveImm ? fr.spM - nr.spM : null, pA = haveImm ? fr.spA - nr.spB : null;
+    const haveImm1 = fr.spM1 != null && nr.spM1 != null;
+    const pM1 = haveImm1 ? fr.spM1 - nr.spM1 : null;
     const ds = fr.dT - nr.dT;
     const fIy = fwdFwdIy(nr.iyM, nr.dT, fr.iyM, fr.dT);
     const fIy1 = fwdFwdIy(nr.iyM1, nr.dT1, fr.iyM1, fr.dT1);
-    const fSof = ds > 0 ? ((1 + fr.sofT / 100 * fr.dT / 360) / (1 + (nr.sofT / 100) * nr.dT / 360) - 1) * 360 / ds * 100 : 0;
+    const haveSofImm = ds > 0 && fr.sofT != null && nr.sofT != null;
+    const fSof = haveSofImm ? ((1 + fr.sofT / 100 * fr.dT / 360) / (1 + nr.sofT / 100 * nr.dT / 360) - 1) * 360 / ds * 100 : null;
+    const haveSofImm1 = ds > 0 && fr.sofT1 != null && nr.sofT1 != null;
+    const fSof1 = haveSofImm1 ? ((1 + fr.sofT1 / 100 * fr.dT1 / 360) / (1 + nr.sofT1 / 100 * nr.dT1 / 360) - 1) * 360 / ds * 100 : null;
     immSpr.push({
       label: `${nr.tenor.split(" ")[1] || nr.tenor}→${fr.tenor.split(" ")[1] || fr.tenor}`,
-      pB, pM, pA, pB1: 0, pM1, pA1: 0, chg: pM - pM1, days: ds,
-      nrVD: nr.valDate, frVD: fr.valDate, nrFD: nr.fixDate, frFD: fr.fixDate,
+      pB, pM, pA, pB1: null, pM1, pA1: null, chg: pM != null && pM1 != null ? pM - pM1 : null, days: ds,
+      nrVD: nr.valDate, frVD: fr.valDate, nrFxD: nr.fixDate, frFxD: fr.fixDate,
       nrDT: nr.dT, frDT: fr.dT,
       fIyB: null, fIy, fIyA: null, fIy1,
-      iyChg: (fIy || 0) - (fIy1 || 0),
-      fSof, sofChg: fSof - ((ds > 0 ? ((1 + fr.sofT1 / 100 * fr.dT1 / 360) / (1 + (nr.sofT1 / 100) * nr.dT1 / 360) - 1) * 360 / ds * 100 : 0)),
-      bas: fIy != null ? fIy - fSof : null, basChg: 0,
-      ppd: ds > 0 ? pM / ds : 0,
+      iyChg: fIy != null && fIy1 != null ? fIy - fIy1 : null,
+      fSof, fSof1, sofChg: fSof != null && fSof1 != null ? fSof - fSof1 : null,
+      bas: fIy != null && fSof != null ? fIy - fSof : null, basChg: null,
+      ppd: ds > 0 && pM != null ? pM / ds : null,
       iyBpD: fIy != null ? fIy / 360 * 100 : null,
     });
   }
@@ -360,25 +437,63 @@ export function buildAllData(snap, liveQuotes = {}) {
 
 
 // Custom tenor calculator
-export function calcCustom(ad, nearM, farM, nearDate, farDate) {
+export function calcCustom(ad, nearM, farM, nearDate, farDate, ipaCustom) {
   const { rows, SPOT_DATE } = ad;
   let nM = nearM, fM = farM, nVD = null, fVD = null;
   if (nearDate) { nM = daysBtwn(SPOT_DATE, nearDate) / 30.44; nVD = nearDate; }
   if (farDate) { fM = daysBtwn(SPOT_DATE, farDate) / 30.44; fVD = farDate; }
   if (fM <= nM) return null;
+
+  // --- IPA path: if Workspace IPA returned data for both legs, use it as primary ---
+  if (ipaCustom && ipaCustom.near && ipaCustom.far) {
+    const ipaN = ipaCustom.near, ipaF = ipaCustom.far;
+    const nPts = ipaN.fwdPoints, fPts = ipaF.fwdPoints;
+    const nDays = ipaN.days, fDays = ipaF.days;
+    if (nPts != null && fPts != null && nDays != null && fDays != null) {
+      const pM = fPts - nPts;
+      // IPA only gives mid — estimate bid/ask from interpolated spread width
+      const nrI = Math.floor(nM), frI = Math.floor(fM);
+      const mT = ad.maxT || 24;
+      const nrRow = nrI >= 0 && nrI <= mT ? rows.find(r => r.month === nrI) : null;
+      const frRow = frI >= 0 && frI <= mT ? rows.find(r => r.month === frI) : null;
+      const nrHalf = nrRow && nrRow.spB != null && nrRow.spA != null ? (nrRow.spA - nrRow.spB) / 2 : 0;
+      const frHalf = frRow && frRow.spB != null && frRow.spA != null ? (frRow.spA - frRow.spB) / 2 : 0;
+      // Spread bid = far_bid - near_ask; spread ask = far_ask - near_bid
+      const pB = (fPts - frHalf) - (nPts + nrHalf);
+      const pA = (fPts + frHalf) - (nPts - nrHalf);
+      const ds = fDays - nDays;
+      const nIy = ipaN.impliedYield, fIy_raw = ipaF.impliedYield;
+      const fIy = nIy != null && fIy_raw != null ? fwdFwdIy(nIy, nDays, fIy_raw, fDays) : null;
+      // Parse IPA dates (ISO strings → Date objects)
+      const parseD = (s) => s ? new Date(s) : null;
+      return {
+        label: `${nearDate ? fD(nearDate) : `${Math.floor(nM)}M`} × ${farDate ? fD(farDate) : `${Math.floor(fM)}M`}`,
+        pB, pM, pA, days: ds, fIy,
+        nrVD: parseD(ipaN.valueDate) || nVD, frVD: parseD(ipaF.valueDate) || fVD,
+        nrFxD: parseD(ipaN.fixDate), frFxD: parseD(ipaF.fixDate),
+        nrDT: nDays, frDT: fDays,
+        source: "IPA",
+      };
+    }
+  }
+
+  // --- Fallback: interpolation from anchor rows ---
   const nrI = Math.floor(nM), frI = Math.floor(fM);
   const mT = ad.maxT || 24;
   const nr = nrI >= 0 && nrI <= mT ? rows.find(r => r.month === nrI) : null;
   const fr = frI >= 0 && frI <= mT ? rows.find(r => r.month === frI) : null;
   if (!nr || !fr) return null;
-  const pM = fr.spM - nr.spM, pB = fr.spB - nr.spA, pA = fr.spA - nr.spB;
+  const pM = fr.spM != null && nr.spM != null ? fr.spM - nr.spM : null;
+  const pB = fr.spB != null && nr.spA != null ? fr.spB - nr.spA : null;
+  const pA = fr.spA != null && nr.spB != null ? fr.spA - nr.spB : null;
   const ds = fr.dT - nr.dT;
   const fIy = fwdFwdIy(nr.iyM, nr.dT, fr.iyM, fr.dT);
   return {
     label: `${nearDate ? fD(nearDate) : `${nrI}M`} × ${farDate ? fD(farDate) : `${frI}M`}`,
     pB, pM, pA, days: ds, fIy,
     nrVD: nVD || nr.valDate, frVD: fVD || fr.valDate,
-    nrFD: nr.fixDate, frFD: fr.fixDate,
+    nrFxD: nr.fixDate, frFxD: fr.fixDate,
     nrDT: nr.dT, frDT: fr.dT,
+    source: "interp",
   };
 }

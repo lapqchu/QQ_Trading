@@ -63,7 +63,7 @@ class MarketService:
     # ────────────────── snapshot ──────────────────
     def build_snapshot(self, ccy: str) -> Dict[str, Any]:
         """Pull a one-shot snapshot for a currency.
-        Fetches SWAP POINTS (primary) + spot + SOFR."""
+        Fetches SWAP POINTS (primary) + spot + SOFR + IPA for non-anchor tenors."""
         cfg = CURRENCIES[ccy]
 
         # Build RIC list: spot + swap points + SOFR + funding (deliverables)
@@ -102,16 +102,77 @@ class MarketService:
         except Exception as e:
             log.warning("T1 fetch failed: %s", e)
 
-        return self._serialize_snapshot(cfg, t1_quotes)
+        # IPA enrichment: get Workspace-computed values for non-anchor display tenors
+        # This covers weekly tenors and any month that isn't a direct RIC anchor
+        ipa_data = self._fetch_ipa_tenors(cfg)
 
-    def _serialize_snapshot(self, cfg: CurrencyConfig, t1_quotes: Optional[Dict[str, Quote]] = None) -> Dict[str, Any]:
+        return self._serialize_snapshot(cfg, t1_quotes, ipa_data)
+
+    def _fetch_ipa_tenors(self, cfg: CurrencyConfig) -> Dict[str, Any]:
+        """
+        Call Workspace IPA for non-anchor tenors.
+
+        Returns dict: { tenor_str: {fwdPoints, fwdRate, impliedYield, days, fixDate, valueDate, ...} }
+        """
+        anchor_set = set(cfg.anchor_tenors_m)
+        ipa_tenors = []
+
+        # Weekly tenors: 1W, 2W, 3W
+        ipa_tenors.extend(["1W", "2W", "3W"])
+
+        # Non-anchor monthly tenors up to max display
+        for m in range(1, cfg.max_display_m + 1):
+            if m not in anchor_set:
+                if m < 12:
+                    ipa_tenors.append(f"{m}M")
+                elif m == 12:
+                    ipa_tenors.append("1Y")
+                elif m == 18:
+                    ipa_tenors.append("18M")
+                elif m == 24:
+                    ipa_tenors.append("2Y")
+                else:
+                    ipa_tenors.append(f"{m}M")
+
+        # Also get IPA for anchor tenors — for fix/value dates and cross-check
+        for m in cfg.anchor_tenors_m:
+            if m < 12:
+                ipa_tenors.append(f"{m}M")
+            elif m == 12:
+                ipa_tenors.append("1Y")
+            elif m == 18:
+                ipa_tenors.append("18M")
+            elif m == 24:
+                ipa_tenors.append("2Y")
+
+        if not ipa_tenors:
+            return {}
+
+        try:
+            log.info("IPA batch for %s: %s", cfg.pair, ipa_tenors)
+            results = self.lseg.calc_fx_forward_batch(cfg.pair, ipa_tenors)
+            ipa_out = {}
+            for tenor, data in results.items():
+                if data:
+                    ipa_out[tenor] = data
+            log.info("IPA returned data for %d/%d tenors on %s", len(ipa_out), len(ipa_tenors), cfg.pair)
+            return ipa_out
+        except Exception as e:
+            log.warning("IPA batch for %s failed (non-anchor tenors will use interpolation): %s", cfg.pair, e)
+            return {}
+
+    def _serialize_snapshot(self, cfg: CurrencyConfig, t1_quotes: Optional[Dict[str, Quote]] = None, ipa_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Package cached quotes into a dashboard-friendly structure.
 
         KEY: For each tenor, we send swap points bid/ask directly from the RIC.
         The frontend uses these as the primary anchor for all calculations.
         Outrights are computed: outright = spot + points / pip_factor.
+
+        IPA data is included for non-anchor tenors and for fix/value dates on all tenors.
+        The frontend should prefer IPA values over its own interpolation.
         """
         t1 = t1_quotes or {}
+        ipa = ipa_data or {}
 
         def _q(ric, dk="T"):
             if dk == "T1":
@@ -176,6 +237,10 @@ class MarketService:
             "tenors": tenors,
             "sofr": sofr,
             "funding": funding,
+            # IPA-computed values for non-anchor tenors and dates for all tenors.
+            # Frontend should prefer these over its own interpolation.
+            # Keys are tenor strings: "1W", "2W", "3W", "4M", "5M", etc.
+            "ipa": ipa,
         }
 
     # ────────────────── live streaming ──────────────────

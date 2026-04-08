@@ -154,6 +154,40 @@ def ipa_implied_yield(
     return {"iy": None, "source": "unavailable"}
 
 
+@app.get("/api/ipa/forward")
+def ipa_forward(
+    pair: str = Query(..., description="Currency pair, e.g. USDTWD"),
+    tenor: str = Query(..., description="Tenor, e.g. 1M, 45D, 3M, 1Y"),
+) -> Dict[str, Any]:
+    """
+    Ask Workspace IPA to calculate forward points, outright, implied yield,
+    fix/value dates for any arbitrary tenor on any pair.
+    This is the PRIMARY source for non-anchor tenor values.
+    """
+    if not lseg or not lseg.is_open():
+        return {"data": None, "source": "unavailable", "reason": "LSEG session not open"}
+    result = lseg.calc_fx_forward(pair, tenor)
+    if result:
+        return {"data": result, "source": "IPA"}
+    return {"data": None, "source": "unavailable", "reason": "IPA returned no data for this pair/tenor"}
+
+
+@app.get("/api/ipa/forward-batch")
+def ipa_forward_batch(
+    pair: str = Query(..., description="Currency pair, e.g. USDTWD"),
+    tenors: str = Query(..., description="Comma-separated tenors, e.g. 1W,2W,3W,45D"),
+) -> Dict[str, Any]:
+    """
+    Batch IPA call — calculate forward data for multiple tenors at once.
+    Used by snapshot pipeline and frontend tools.
+    """
+    if not lseg or not lseg.is_open():
+        return {"data": {}, "source": "unavailable"}
+    tenor_list = [t.strip() for t in tenors.split(",") if t.strip()]
+    results = lseg.calc_fx_forward_batch(pair, tenor_list)
+    return {"data": results, "source": "IPA"}
+
+
 @app.get("/api/status")
 def status() -> Dict[str, Any]:
     return {

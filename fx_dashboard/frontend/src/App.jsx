@@ -1,9 +1,9 @@
 // FX Dashboard — full port from v1, backend-driven
 import { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import Plot from "react-plotly.js";
-import { getCurrencies, getHistory, getSnapshot, liveStart, liveStop, openChannel } from "./api.js";
+import { getCurrencies, getHistory, getSnapshot, liveStart, liveStop, openChannel, getIpaForward } from "./api.js";
 import { buildAllData, calcCustom } from "./dataTransform.js";
-import { F, FP, CC, HB, cS, tS, sS, mid, implYld, fwdFwdIy, genHist, calcSMA, calcEMA, calcRSI, calcBB, calcMACD, calcStats, calcZDev, backtest, STRAT_DESCS } from "./calc.js";
+import { F, FP, CC, HB, cS, tS, sS, mid, implYld, fwdFwdIy, mcI, calcSMA, calcEMA, calcRSI, calcBB, calcMACD, calcStats, calcZDev, backtest, STRAT_DESCS } from "./calc.js";
 import { fD, daysBtwn } from "./dates.js";
 
 // ── NDF / Deliverable spread templates ──
@@ -36,50 +36,141 @@ function PChart({traces,layout,height=190}){
   return <Plot data={traces} layout={l} config={PLOT_CFG} style={{width:"100%"}} useResizeHandler/>;
 }
 
-// ── Helper: parse historical data response for a specific tenor ──
-function parseHistoryForTenor(data,tenor,isSwapPts){
-  if(!data?.history)return null;
+// ── Helper: extract mid value from a history bar (no fabrication) ──
+function barMid(bar){
+  if(bar.TRDPRC_1!=null&&isFinite(bar.TRDPRC_1))return bar.TRDPRC_1;
+  if(bar.BID!=null&&bar.ASK!=null)return(bar.BID+bar.ASK)/2;
+  if(bar.BID!=null)return bar.BID;
+  if(bar.ASK!=null)return bar.ASK;
+  return null;
+}
+
+// ── Map a RIC to its approximate month value for interpolation ──
+function ricToMonth(ric){
+  const m=ric.match(/(\d+)(M|Y|W)/i);
+  if(!m)return 0; // spot
+  const n=parseInt(m[1]),u=m[2].toUpperCase();
+  if(u==='Y')return n*12;
+  if(u==='W')return n/4;
+  return n;
+}
+
+// ── Parse a tenor label to its month value ──
+function tenorToMonth(tenor){
+  if(!tenor||tenor==='Spot')return 0;
+  // "IMM Jun25" style — can't map to fixed month, caller passes monthHint
+  const m=tenor.match(/^(\d+)(M|Y|W)$/i);
+  if(!m)return null;
+  const n=parseInt(m[1]),u=m[2].toUpperCase();
+  if(u==='Y')return n*12;
+  if(u==='W')return n/4;
+  return n;
+}
+
+// ── Build historical timeseries for any tenor ──
+// Strategy: 1) try direct RIC match, 2) if not found, interpolate from all anchor histories
+function buildHistoryForTenor(data,tenor,isSwapPts,monthHint){
+  if(!data?.history)return{pts:null,source:null};
   const rics=Object.keys(data.history);
-  let targetRic=null;
+  if(!rics.length)return{pts:null,source:null};
+
+  // Step 1: try direct match
   const tenorClean=tenor.replace(/\s/g,'');
+  let targetRic=null;
   for(const ric of rics){
-    if(tenorClean==='Spot'&&!ric.includes('M')&&!ric.includes('Y')){targetRic=ric;break;}
+    if(tenorClean==='Spot'&&!ric.match(/\d+(M|Y|W)/i)){targetRic=ric;break;}
     if(ric.includes(tenorClean)||ric.includes(tenorClean.replace('M','MNDF'))){targetRic=ric;break;}
   }
-  if(!targetRic){targetRic=rics.find(r=>r.includes(tenorClean))||rics[0];}
-  const bars=data.history[targetRic];
-  if(!bars||!bars.length)return null;
-  return bars.map(bar=>({
-    date:new Date(bar.Date),
-    value:bar.TRDPRC_1??bar.BID??((bar.BID||0)+(bar.ASK||0))/2||0,
-  })).filter(p=>p.value&&!isNaN(p.value));
+  if(targetRic){
+    const bars=data.history[targetRic];
+    if(bars&&bars.length>0){
+      const pts=bars.map(bar=>({date:new Date(bar.Date),value:barMid(bar)})).filter(p=>p.value!=null&&!isNaN(p.value));
+      if(pts.length>10)return{pts,source:'direct'};
+    }
+  }
+
+  // Step 2: interpolate from all available anchor tenor histories
+  const targetM=monthHint??tenorToMonth(tenor);
+  if(targetM==null||targetM===0)return{pts:null,source:null};
+
+  // Build per-RIC: {month, bars[]}
+  const anchorData=[];
+  for(const ric of rics){
+    const m=ricToMonth(ric);
+    if(m<=0)continue; // skip spot for swap points interpolation
+    const bars=data.history[ric];
+    if(!bars||!bars.length)continue;
+    anchorData.push({month:m,bars});
+  }
+  if(anchorData.length<2)return{pts:null,source:null};
+  anchorData.sort((a,b)=>a.month-b.month);
+
+  // Build date-indexed map: date → {month: value, ...}
+  const dateMap=new Map();
+  for(const{month,bars}of anchorData){
+    for(const bar of bars){
+      const d=bar.Date;
+      if(!d)continue;
+      const v=barMid(bar);
+      if(v==null)continue;
+      if(!dateMap.has(d))dateMap.set(d,{});
+      dateMap.get(d)[month]=v;
+    }
+  }
+
+  // For each date, if we have at least 2 anchor points, interpolate to targetM
+  const months=anchorData.map(a=>a.month);
+  const sortedDates=[...dateMap.keys()].sort();
+  const pts=[];
+  for(const d of sortedDates){
+    const vals=dateMap.get(d);
+    const xs=[],ys=[];
+    for(const m of months){if(vals[m]!=null){xs.push(m);ys.push(vals[m]);}}
+    if(xs.length<2)continue;
+    // Only interpolate within the range of available anchors (no extrapolation)
+    if(targetM<xs[0]||targetM>xs[xs.length-1])continue;
+    const interp=mcI(xs,ys);
+    const v=interp(targetM);
+    if(v!=null&&isFinite(v))pts.push({date:new Date(d),value:v});
+  }
+  if(pts.length>10)return{pts,source:'interpolated'};
+  return{pts:pts.length>0?pts:null,source:pts.length>0?'interpolated':null};
 }
 
 // ══════════════════════ HIST MODAL ══════════════════════
-function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy}){
+function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint}){
   const[hist,setHist]=useState(null);
+  const[histSource,setHistSource]=useState(null);
   const[loading,setLoading]=useState(true);
+  const[unavailReason,setUnavailReason]=useState(null);
   const[sigN,setSigN]=useState(20);
   useEffect(()=>{
     let cancelled=false;
     setLoading(true);
+    setUnavailReason(null);
+    setHistSource(null);
     getHistory(ccy,252).then(data=>{
       if(cancelled)return;
-      const parsed=parseHistoryForTenor(data,tenor,isSwapPts);
-      if(parsed&&parsed.length>10){
-        setHist(parsed);
+      const{pts,source}=buildHistoryForTenor(data,tenor,isSwapPts,monthHint);
+      if(pts&&pts.length>10){
+        setHist(pts);
+        setHistSource(source);
       }else{
-        setHist(genHist(val,252));
+        setHist(null);
+        setUnavailReason(pts&&pts.length>0
+          ?`Only ${pts.length} data points available (minimum 10 required)`
+          :"No anchor data available from LSEG to build history for this tenor");
       }
       setLoading(false);
-    }).catch(()=>{
+    }).catch((err)=>{
       if(!cancelled){
-        setHist(genHist(val,252));
+        setHist(null);
+        setUnavailReason(`LSEG history API error: ${err?.message||"connection failed"}`);
         setLoading(false);
       }
     });
     return()=>{cancelled=true;};
-  },[ccy,tenor,val,isSwapPts]);
+  },[ccy,tenor,val,isSwapPts,monthHint]);
   const stats=useMemo(()=>hist?calcStats(hist,sigN):null,[hist,sigN]);
   const rsiD=useMemo(()=>hist?calcRSI(hist):[],[hist]);
   const macdD=useMemo(()=>hist?calcMACD(hist):{line:[],signal:[],hist:[]},[hist]);
@@ -107,7 +198,7 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy}){
   ];
   const SR=({l,v,dp=3})=>(<div style={{display:"flex",justifyContent:"space-between",padding:"1px 0",borderBottom:"1px solid #1E293B",fontSize:8.5}}><span style={{color:"#64748B"}}>{l}</span><span style={{color:"#E2E8F0",fontFamily:"monospace"}}>{typeof v==="number"?v.toFixed(dp):v}</span></div>);
   useEffect(()=>{const h=e=>{if(e.key==="Escape")onClose();};window.addEventListener("keydown",h);return()=>window.removeEventListener("keydown",h);},[onClose]);
-  if(loading||!hist){
+  if(loading){
     return(
       <div style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,.85)",zIndex:100,display:"flex",justifyContent:"center",alignItems:"center",padding:8}} onClick={onClose}>
         <div style={{background:"#0F172A",border:"1px solid #334155",borderRadius:8,width:"96%",maxWidth:400,padding:24,textAlign:"center"}} onClick={e=>e.stopPropagation()}>
@@ -118,11 +209,24 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy}){
       </div>
     );
   }
+  if(!hist){
+    return(
+      <div style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,.85)",zIndex:100,display:"flex",justifyContent:"center",alignItems:"center",padding:8}} onClick={onClose}>
+        <div style={{background:"#0F172A",border:"1px solid #334155",borderRadius:8,width:"96%",maxWidth:500,padding:24,textAlign:"center"}} onClick={e=>e.stopPropagation()}>
+          <div style={{fontSize:13,color:"#EF4444",fontWeight:700,marginBottom:8}}>Historical Data Unavailable</div>
+          <div style={{fontSize:10,color:"#94A3B8",marginBottom:4}}>{tenor} — {ccy}</div>
+          <div style={{fontSize:10,color:"#F59E0B",marginBottom:12,padding:"8px 12px",background:"#1E293B",borderRadius:4,textAlign:"left"}}>{unavailReason||"No data returned by LSEG for this RIC/tenor combination."}</div>
+          <div style={{fontSize:9,color:"#64748B",marginBottom:12}}>Check that the RIC exists in Workspace and the LSEG session is active.</div>
+          <button onClick={onClose} style={{background:"#1E293B",border:"1px solid #334155",color:"#94A3B8",padding:"3px 10px",borderRadius:4,cursor:"pointer",fontSize:9}}>Close (ESC)</button>
+        </div>
+      </div>
+    );
+  }
   return(
     <div style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,.85)",zIndex:100,display:"flex",justifyContent:"center",alignItems:"center",padding:8}} onClick={onClose}>
       <div style={{background:"#0F172A",border:"1px solid #334155",borderRadius:8,width:"96%",maxWidth:1300,maxHeight:"96vh",overflow:"auto",padding:12}} onClick={e=>e.stopPropagation()}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
-          <h2 style={{fontSize:13,fontWeight:800,color:"#F8FAFC",margin:0}}>{tenor} — Historical {isSwapPts?"(Swap Points)":""}</h2>
+          <h2 style={{fontSize:13,fontWeight:800,color:"#F8FAFC",margin:0}}>{tenor} — Historical {isSwapPts?"(Swap Points)":""}{histSource==='interpolated'&&<span style={{color:"#60A5FA",fontWeight:400,fontSize:9,marginLeft:8}}>Interpolated from anchor data</span>}</h2>
           <button onClick={onClose} style={{background:"#1E293B",border:"1px solid #334155",color:"#94A3B8",padding:"3px 10px",borderRadius:4,cursor:"pointer",fontSize:9}}>Close (ESC)</button>
         </div>
         <div style={{display:"grid",gridTemplateColumns:"1fr 220px",gap:8}}>
@@ -198,19 +302,41 @@ function SprTbl({spreads,title,color,mx,onDbl}){
         <td style={{...cS(CC(s.chg)),background:HB(s.chg,mx)}}>{FP(s.chg,1)}</td><td style={cS("#64748B",false,true)}>{F(s.ppd,2)}</td>
         <td style={cS("#4ADE80")}>{F(s.fIyB,2)}</td><td style={cS("#34D399",true)}>{F(s.fIy,2)}</td><td style={cS("#F87171")}>{F(s.fIyA,2)}</td>
         <td style={{...cS(CC(s.iyChg)),background:HB(s.iyChg,.1)}}>{FP(s.iyChg,2)}</td><td style={cS("#64748B")}>{s.iyBpD!=null?F(s.iyBpD,2):"—"}</td>
-        <td style={cS("#FB923C")}>{F(s.fSof,2)}</td><td style={cS((s.bas||0)>=0?"#C084FC":"#F472B6",true)}>{FP((s.bas||0)*100,1)}</td>
+        <td style={cS("#FB923C")}>{F(s.fSof,2)}</td><td style={cS(s.bas!=null&&s.bas>=0?"#C084FC":"#F472B6",true)}>{s.bas!=null?FP(s.bas*100,1):"—"}</td>
       </tr>))}</tbody></table></div></div>);
 }
 
 // ══════════════════════ TOOLS ══════════════════════
-function ToolsPanel({ad,onDbl}){
+function ToolsPanel({ad,onDbl,ccy}){
   const[mode,setMode]=useState("month");
   const[nearM,setNearM]=useState(1);const[farM,setFarM]=useState(6);
   const[nearDt,setNearDt]=useState("");const[farDt,setFarDt]=useState("");
+  const[ipaCustom,setIpaCustom]=useState(null);
+
+  // When in date mode, try IPA first for custom date forward points
+  useEffect(()=>{
+    if(mode!=="date"||!nearDt||!farDt||!ad?.cfg?.pair)return;
+    setIpaCustom(null);
+    const pair=ad.cfg.pair;
+    // Compute day-based tenors from spot date
+    const spotDate=ad.SPOT_DATE;
+    const nrDays=Math.round((new Date(nearDt)-spotDate)/(1000*60*60*24));
+    const frDays=Math.round((new Date(farDt)-spotDate)/(1000*60*60*24));
+    if(nrDays<=0||frDays<=0)return;
+    Promise.all([
+      getIpaForward(pair,`${nrDays}D`),
+      getIpaForward(pair,`${frDays}D`),
+    ]).then(([nrRes,frRes])=>{
+      if(nrRes.data&&frRes.data){
+        setIpaCustom({near:nrRes.data,far:frRes.data});
+      }
+    }).catch(()=>{});
+  },[mode,nearDt,farDt,ad?.cfg?.pair,ad?.SPOT_DATE]);
+
   const custom=useMemo(()=>{
-    if(mode==="date"&&nearDt&&farDt)return calcCustom(ad,0,0,new Date(nearDt),new Date(farDt));
-    return calcCustom(ad,nearM,farM,null,null);
-  },[ad,mode,nearM,farM,nearDt,farDt]);
+    if(mode==="date"&&nearDt&&farDt)return calcCustom(ad,0,0,new Date(nearDt),new Date(farDt),ipaCustom);
+    return calcCustom(ad,nearM,farM,null,null,null);
+  },[ad,mode,nearM,farM,nearDt,farDt,ipaCustom]);
   const[scMode,setScMode]=useState("pips");const[scIn,setScIn]=useState("");
   const[scTenorMode,setScTenorMode]=useState("month");
   const[scN,setScN]=useState(1);const[scF,setScF]=useState(3);
@@ -418,7 +544,7 @@ export default function Dashboard(){
   const mCF=Math.max(...mr.filter(r=>r.month>1).map(r=>Math.abs(r.carryFfP||0)),1);
   const mCY=Math.max(...mr.map(r=>Math.abs(r.carryOutY||0)),.01);
   const mSC=Math.max(...[...anchors,...qFF,...spSpr,...immSpr].map(s=>Math.abs(s.chg||0)),1);
-  const dblR=(t,v,isSP=false)=>setHm({tenor:t,value:v,isSP});
+  const dblR=(t,v,isSP=false,month=null)=>setHm({tenor:t,value:v,isSP,month});
   const dp=cfg.dp;
 
   const chartRows=filt.filter(r=>r.month>0&&!r.isWeekly);
@@ -427,13 +553,13 @@ export default function Dashboard(){
   const ffPts=chartRows.map(r=>r.ffM);
   const iyVals=chartRows.map(r=>r.iyM);
   const sofrVals=chartRows.map(r=>r.sofT);
-  const basVals=chartRows.map(r=>(r.basisT||0)*100);
+  const basVals=chartRows.map(r=>r.basisT!=null?r.basisT*100:null);
 
   const tabs=[{id:"main",label:"Full Curve"},{id:"spreads",label:"Spreads & Rolls"},{id:"imm",label:"IMM Dates"},{id:"tools",label:"Tools"},{id:"broker",label:"Broker Monitor"}];
 
   return(
     <div style={{background:"#0F172A",color:"#E2E8F0",minHeight:"100vh",fontFamily:"'Inter',system-ui,sans-serif",padding:8}}>
-      {hm&&<HistModal tenor={hm.tenor} val={hm.value} isSwapPts={hm.isSP} dpOverride={dp} onClose={()=>setHm(null)} ccy={ccy}/>}
+      {hm&&<HistModal tenor={hm.tenor} val={hm.value} isSwapPts={hm.isSP} dpOverride={dp} onClose={()=>setHm(null)} ccy={ccy} monthHint={hm.month}/>}
       {/* Header */}
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6,paddingBottom:4,borderBottom:"1px solid #1E293B",flexWrap:"wrap",gap:4}}>
         <div><h1 style={{fontSize:14,fontWeight:800,margin:0,color:"#F8FAFC"}}>{cfg.pair} {cfg.kind==="NDF"?"NDF":"FWD"} Dashboard</h1>
@@ -510,7 +636,7 @@ export default function Dashboard(){
               <th style={tS("#A78BFA")}>Pts</th><th style={tS("#A78BFA")}>IY</th>
             </tr></thead>
             <tbody>{filt.map((r,i)=>{const sp=r.month===0,mj=[0,1,2,3,6,9,12,24].includes(r.month);const bg=sp?"#1a2744":(i%2===0?"#0F172A":"#111827");const tc=r.interp?"#475569":(mj?"#F8FAFC":"#94A3B8");
-              return(<tr key={r.tenor} style={{background:bg,borderBottom:[3,6,9,12].includes(r.month)?"1px solid #334155":"none",cursor:"pointer"}} onDoubleClick={()=>dblR(r.tenor,r.spM,true)}>
+              return(<tr key={r.tenor} style={{background:bg,borderBottom:[3,6,9,12].includes(r.month)?"1px solid #334155":"none",cursor:"pointer"}} onDoubleClick={()=>dblR(r.tenor,r.spM,true,r.month)}>
                 <td style={{...cS(tc,mj),textAlign:"left",borderRight:"1px solid #1E293B"}}>{r.tenor}{r.interp?"*":""}</td>
                 <td style={cS("#475569")}>{fD(r.valDate)}</td><td style={cS("#475569")}>{fD(r.fixDate)}</td><td style={{...cS("#475569"),borderRight:"1px solid #334155"}}>{r.dT||"—"}</td>
                 <td style={cS("#4ADE80")}>{F(r.bT,dp)}</td><td style={cS("#F87171")}>{F(r.aT,dp)}</td><td style={{...cS("#FBBF24",true),borderRight:"1px solid #334155"}}>{F(r.mT,dp)}</td>
@@ -519,7 +645,7 @@ export default function Dashboard(){
                 <td style={cS("#4ADE80")}>{sp?"—":F(r.iyB,2)}</td><td style={cS("#34D399",true)}>{sp?"—":F(r.iyM,2)}</td><td style={cS("#F87171")}>{sp?"—":F(r.iyA,2)}</td>
                 <td style={{...cS(CC(r.iyChg)),borderRight:"1px solid #334155",background:sp?"transparent":HB(r.iyChg,mIC)}}>{sp?"—":FP(r.iyChg,2)}</td>
                 <td style={cS("#FB923C")}>{sp?"—":F(r.sofT,2)}</td><td style={{...cS(CC(r.sofChg)),borderRight:"1px solid #334155",background:sp?"transparent":HB(r.sofChg,.005)}}>{sp?"—":FP(r.sofChg*100,1)}</td>
-                <td style={cS((r.basisT||0)>=0?"#C084FC":"#F472B6",true)}>{sp?"—":FP((r.basisT||0)*100,1)}</td>
+                <td style={cS(r.basisT!=null&&r.basisT>=0?"#C084FC":"#F472B6",true)}>{sp||r.basisT==null?"—":FP(r.basisT*100,1)}</td>
                 <td style={{...cS(CC(r.basChg)),borderRight:"1px solid #334155",background:sp?"transparent":HB(r.basChg,mBC)}}>{sp?"—":FP(r.basChg*100,1)}</td>
                 <td style={{...cS(r.carryOutP>=0?"#38BDF8":"#F472B6"),background:sp?"transparent":HB(r.carryOutP,mCP)}}>{sp?"—":FP(r.carryOutP,1)}</td>
                 <td style={{...cS(r.carryFfP>=0?"#38BDF8":"#F472B6"),borderRight:"1px solid #334155",background:r.month<2?"transparent":HB(r.carryFfP,mCF)}}>{r.month<2?"—":FP(r.carryFfP,1)}</td>
@@ -534,14 +660,14 @@ export default function Dashboard(){
           <table style={{borderCollapse:"collapse",width:"100%",minWidth:1200}}>
             <thead><tr><th style={{...tS(),textAlign:"left",minWidth:55}}>Period</th><th style={tS()}>Near Val</th><th style={tS()}>Far Val</th><th style={tS()}>Days</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#F87171")}>Ask</th><th style={tS()}>D/D</th><th style={tS()}>Pts/D</th><th style={tS("#4ADE80")}>Iy Bid</th><th style={tS("#34D399")}>Iy Mid</th><th style={tS("#F87171")}>Iy Ask</th><th style={tS()}>Iy D/D</th><th style={tS()}>Iy bp/d</th><th style={tS("#FB923C")}>Fwd SOFR</th><th style={tS("#C084FC")}>Basis</th></tr></thead>
             <tbody>{filt.filter(r=>r.month>0).map((r,i)=>{const p=i>0?filt.filter(x=>x.month>0)[i-1]:null;const label=r.month===1?"SP×1M":p?`${p.tenor}×${r.tenor}`:`SP×${r.tenor}`;const fwdD=p?r.dT-p.dT:r.dT;const ppd=fwdD>0?r.ffM/fwdD:0;const mj=[1,2,3,6,9,12,24].includes(r.month);
-              return(<tr key={r.tenor} style={{background:i%2===0?"#0F172A":"#111827",borderBottom:[3,6,9,12].includes(r.month)?"1px solid #334155":"none",cursor:"pointer"}} onDoubleClick={()=>dblR(label,r.ffM,true)}>
+              return(<tr key={r.tenor} style={{background:i%2===0?"#0F172A":"#111827",borderBottom:[3,6,9,12].includes(r.month)?"1px solid #334155":"none",cursor:"pointer"}} onDoubleClick={()=>dblR(label,r.ffM,true,r.month)}>
                 <td style={{...cS(r.interp?"#475569":(mj?"#F8FAFC":"#94A3B8"),mj),textAlign:"left"}}>{label}{r.interp?"*":""}</td>
                 <td style={cS("#475569")}>{fD(p?p.valDate:ad.TENOR_DATES[0]?.valDate)}</td><td style={cS("#475569")}>{fD(r.valDate)}</td><td style={cS("#475569",false,true)}>{fwdD}</td>
                 <td style={cS("#4ADE80")}>{FP(r.ffB,1)}</td><td style={cS("#FBBF24",true)}>{FP(r.ffM,1)}</td><td style={cS("#F87171")}>{FP(r.ffA,1)}</td>
                 <td style={{...cS(CC(r.ffChg)),background:HB(r.ffChg,mFC)}}>{FP(r.ffChg,1)}</td><td style={cS("#64748B",false,true)}>{F(ppd,2)}</td>
                 <td style={cS("#4ADE80")}>{F(r.ffIyB,2)}</td><td style={cS("#34D399",true)}>{F(r.ffIyM,2)}</td><td style={cS("#F87171")}>{F(r.ffIyA,2)}</td>
                 <td style={{...cS(CC(r.ffIyChg)),background:HB(r.ffIyChg,.1)}}>{FP(r.ffIyChg,2)}</td><td style={cS("#64748B")}>{r.ffIyBpD!=null?F(r.ffIyBpD,2):"—"}</td>
-                <td style={cS("#FB923C")}>{r.ffSofr!=null?F(r.ffSofr,2):"—"}</td><td style={cS((r.ffBasis||0)>=0?"#C084FC":"#F472B6")}>{r.ffBasis!=null?FP(r.ffBasis*100,1):"—"}</td>
+                <td style={cS("#FB923C")}>{r.ffSofr!=null?F(r.ffSofr,2):"—"}</td><td style={cS(r.ffBasis!=null&&r.ffBasis>=0?"#C084FC":"#F472B6")}>{r.ffBasis!=null?FP(r.ffBasis*100,1):"—"}</td>
               </tr>);})}</tbody></table></div>
       </>)}
 
@@ -570,19 +696,19 @@ export default function Dashboard(){
           <div style={{fontSize:9.5,fontWeight:800,color:"#FB923C",marginBottom:3}}>{cfg.pair} IMM OUTRIGHTS</div>
           <div style={{overflowX:"auto"}}><table style={{borderCollapse:"collapse",width:"100%",minWidth:1200,fontSize:9}}>
             <thead><tr><th style={{...tS(),textAlign:"left"}}>IMM</th><th style={tS()}>Val Date</th><th style={tS()}>Fix Date</th><th style={tS()}>Days</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#F87171")}>Ask</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#FBBF24")}>Pips</th><th style={tS()}>D/D</th><th style={tS("#34D399")}>Iy Mid</th><th style={tS()}>Iy D/D</th><th style={tS("#FB923C")}>SOFR</th><th style={tS("#C084FC")}>Basis</th><th style={tS("#A78BFA")}>FF</th><th style={tS()}>FF D/D</th><th style={tS("#34D399")}>FF Iy</th></tr></thead>
-            <tbody>{immR.map((r,i)=>(<tr key={i} style={{background:i%2===0?"#0F172A":"#131C2E",cursor:"pointer"}} onDoubleClick={()=>dblR(r.tenor,r.spM,true)}>
+            <tbody>{immR.map((r,i)=>(<tr key={i} style={{background:i%2===0?"#0F172A":"#131C2E",cursor:"pointer"}} onDoubleClick={()=>dblR(r.tenor,r.spM,true,r.month)}>
               <td style={{...cS("#FB923C",true),textAlign:"left"}}>{r.tenor}</td><td style={cS("#475569")}>{fD(r.valDate)}</td><td style={cS("#475569")}>{fD(r.fixDate)}</td><td style={cS("#475569")}>{r.dT}</td>
               <td style={cS("#4ADE80")}>{F(r.bT,dp)}</td><td style={cS("#F87171")}>{F(r.aT,dp)}</td><td style={cS("#FBBF24",true)}>{F(r.mT,dp)}</td>
               <td style={cS("#FBBF24",true)}>{FP(r.spM,1)}</td><td style={{...cS(CC(r.pipChg)),background:HB(r.pipChg,mPC)}}>{FP(r.pipChg,1)}</td>
               <td style={cS("#34D399",true)}>{F(r.iyM,2)}</td><td style={{...cS(CC(r.iyChg)),background:HB(r.iyChg,mIC)}}>{FP(r.iyChg,2)}</td>
-              <td style={cS("#FB923C")}>{F(r.sofT,2)}</td><td style={cS((r.basisT||0)>=0?"#C084FC":"#F472B6")}>{FP((r.basisT||0)*100,1)}</td>
+              <td style={cS("#FB923C")}>{F(r.sofT,2)}</td><td style={cS(r.basisT!=null&&r.basisT>=0?"#C084FC":"#F472B6")}>{r.basisT!=null?FP(r.basisT*100,1):"—"}</td>
               <td style={cS(r.ffM>=0?"#A78BFA":"#F472B6")}>{FP(r.ffM,1)}</td><td style={{...cS(CC(r.ffChg)),background:HB(r.ffChg,mFC)}}>{FP(r.ffChg,1)}</td>
               <td style={cS("#34D399")}>{F(r.ffIyM,2)}</td>
             </tr>))}</tbody></table></div></div>
         <SprTbl spreads={immSpr} title={`${cfg.pair} IMM ROLL SPREADS`} color="#F59E0B" mx={mSC} onDbl={dblR}/>
       </div>)}
 
-      {tab==="tools"&&<ToolsPanel ad={ad} onDbl={dblR}/>}
+      {tab==="tools"&&<ToolsPanel ad={ad} onDbl={dblR} ccy={ccy}/>}
       {tab==="broker"&&<BrokerMon ad={ad}/>}
 
       <div style={{marginTop:4,fontSize:6.5,color:"#334155",display:"flex",justifyContent:"space-between",flexWrap:"wrap",gap:2}}>

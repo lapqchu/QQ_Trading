@@ -39,6 +39,20 @@ export async function getStatus() {
   return r.json();
 }
 
+// IPA: Workspace-computed forward for any tenor
+export async function getIpaForward(pair, tenor) {
+  const r = await fetch(`${API}/ipa/forward?pair=${pair}&tenor=${encodeURIComponent(tenor)}`);
+  if (!r.ok) return { data: null, source: "unavailable" };
+  return r.json();
+}
+
+// IPA: batch forward for multiple tenors
+export async function getIpaForwardBatch(pair, tenors) {
+  const r = await fetch(`${API}/ipa/forward-batch?pair=${pair}&tenors=${encodeURIComponent(tenors.join(","))}`);
+  if (!r.ok) return { data: {}, source: "unavailable" };
+  return r.json();
+}
+
 // Open a WebSocket channel. Returns { close } and emits onMsg(data) for each message.
 export function openChannel(channel, onMsg, onOpen, onClose) {
   let ws = null;

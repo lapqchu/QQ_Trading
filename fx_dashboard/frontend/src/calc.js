@@ -64,13 +64,7 @@ export const sS = (color) => ({
 });
 
 // ── Historical stats helpers ──
-export function genHist(val, n = 252) {
-  const v = .002, d = new Array(n); d[n - 1] = val;
-  for (let i = n - 2; i >= 0; i--) d[i] = d[i + 1] * (1 - v * ((Math.random() - .5) * 3));
-  const pts = []; const end = new Date(); let dt = new Date(end);
-  for (let i = n - 1; i >= 0; i--) { pts.unshift({ date: new Date(dt), value: d[i] }); dt.setDate(dt.getDate() - 1); while (dt.getDay() === 0 || dt.getDay() === 6) dt.setDate(dt.getDate() - 1); }
-  return pts;
-}
+// genHist REMOVED — no synthetic data generation. If LSEG history is unavailable, UI shows "data unavailable".
 export function calcSMA(d, p) { const r = []; for (let i = 0; i < d.length; i++) { if (i < p - 1) { r.push(null); continue; } let s = 0; for (let j = i - p + 1; j <= i; j++) s += d[j].value; r.push(s / p); } return r; }
 export function calcEMA(d, p) { const k = 2 / (p + 1), r = [d[0].value]; for (let i = 1; i < d.length; i++) r.push(d[i].value * k + r[i - 1] * (1 - k)); return r; }
 export function calcRSI(d, p = 14) { const r = [null]; for (let i = 1; i < d.length; i++) { const ch = []; for (let j = Math.max(1, i - p + 1); j <= i; j++) ch.push(d[j].value - d[j - 1].value); const g = ch.filter(c => c > 0).reduce((a, b) => a + b, 0) / p; const l = Math.abs(ch.filter(c => c < 0).reduce((a, b) => a + b, 0)) / p; r.push(l === 0 ? 100 : 100 - 100 / (1 + g / l)); } return r; }
