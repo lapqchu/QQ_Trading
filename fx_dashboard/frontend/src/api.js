@@ -18,8 +18,10 @@ export async function getSnapshot(ccy) {
   return r.json();
 }
 
-export async function getHistory(ccy, days = 60) {
-  const r = await fetch(`${API}/history/${ccy}?days=${days}`);
+export async function getHistory(ccy, days = 60, contributor = null) {
+  let url = `${API}/history/${ccy}?days=${days}`;
+  if (contributor) url += `&contributor=${encodeURIComponent(contributor)}`;
+  const r = await fetch(url);
   if (!r.ok) throw new Error(`history ${ccy}: ${r.status}`);
   return r.json();
 }

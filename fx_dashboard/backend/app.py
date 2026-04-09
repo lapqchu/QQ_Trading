@@ -110,13 +110,13 @@ def get_snapshot(ccy: str) -> Dict[str, Any]:
 
 
 @app.get("/api/history/{ccy}")
-def get_history(ccy: str, days: int = Query(60, ge=10, le=500)) -> Dict[str, Any]:
+def get_history(ccy: str, days: int = Query(60, ge=10, le=500), contributor: str = Query(None)) -> Dict[str, Any]:
     if ccy not in CURRENCIES:
         raise HTTPException(404, f"Unknown currency: {ccy}")
     if not lseg or not lseg.is_open():
         raise HTTPException(503, "LSEG session not open")
     try:
-        return market.get_history(ccy, days=days)
+        return market.get_history(ccy, days=days, contributor=contributor)
     except Exception as e:
         log.exception("history %s failed", ccy)
         raise HTTPException(500, str(e))
@@ -193,6 +193,8 @@ def status() -> Dict[str, Any]:
     return {
         "sessionOpen": lseg.is_open() if lseg else False,
         "activeCcy": market._active_ccy if market else None,
+        "tickCounts": dict(market._tick_counts) if market else {},
+        "wsSubscribers": {ch: len(subs) for ch, subs in (market._subscribers if market else {}).items()},
     }
 
 
@@ -206,6 +208,8 @@ async def _stream_channel(ws: WebSocket, channel: str):
             await ws.send_json({"channel": channel, "data": msg})
     except WebSocketDisconnect:
         log.debug("WS %s disconnected", channel)
+    except asyncio.CancelledError:
+        log.debug("WS %s cancelled (shutdown)", channel)
     except Exception as e:
         log.warning("WS %s error: %s", channel, e)
     finally:

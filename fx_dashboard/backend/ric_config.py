@@ -21,11 +21,13 @@ Spot:
 SOFR OIS:
   USDSROIS{tenor}=        e.g. USDSROIS1M=, USDSROIS1Y=
 
-Pip factors (convert price-difference to market-convention "pips" / "points"):
-  The pip_factor is used to convert between outright price differences and
-  the swap points convention the market quotes. For most pairs:
-    swap_points = (outright - spot) * pip_factor
-    outright = spot + swap_points / pip_factor
+Pip factors (display multiplier — raw LSEG value → market-convention "pips" / "points"):
+  LSEG always gives swap points as raw OUTRIGHT DIFFERENCES for all currencies.
+  The pip_factor converts raw values to the display convention traders use:
+    display_points = raw_lseg_value * pip_factor
+    outright = spot + raw_lseg_value   (direct addition, no PF division)
+  Example: TWD 1M raw=0.100 → display=0.100*1e3=100 pts, outright=spot+0.100
+  Example: SGD 1M raw=0.0027 → display=0.0027*1e4=27 pts, outright=spot+0.0027
 """
 
 from dataclasses import dataclass, field
@@ -85,7 +87,9 @@ DELIVERABLE_FWDFWD = [
 ]
 
 # Broker contributors — realtime snap RICs on LSEG
-BROKER_CONTRIBUTORS = ["ICAP", "BGCP", "TRDS", "TPTS"]
+# ICAP, BGCP (BGC Partners), TRDS (Tradition), TPTS (Tullett Prebon TP),
+# PYNY (Tullett Prebon NY), GMGM (GFI/GMGM)
+BROKER_CONTRIBUTORS = ["ICAP", "BGCP", "TRDS", "TPTS", "PYNY", "GMGM"]
 
 # NDF live spread composite RICs (market-traded spreads)
 NDF_SPREAD_RICS = {
@@ -118,6 +122,15 @@ class CurrencyConfig:
     max_display_m: int          # max display range (for interpolation)
     spot_ric: str               # "TWD=" or "USDCNH="
     spread_pack: str            # "NDF" or "DELIVERABLE"
+    pts_in_outright: bool = False  # How LSEG swap-point RICs report values:
+                                   #   NDF ({CCY}xMNDF=): pts_in_outright=True
+                                   #     → value IS the raw outright price difference
+                                   #     → outright = spot + raw_value
+                                   #     → display  = raw_value * pip_factor
+                                   #   Deliverable ({CCY}xM=): pts_in_outright=False (default)
+                                   #     → value is already in pip/point convention
+                                   #     → outright = spot + value / pip_factor
+                                   #     → display  = value (no multiplication needed)
 
     @property
     def display_tenors(self):
@@ -191,8 +204,7 @@ def _tenor_str(m) -> str:
 #
 # The pip_factor encodes the market quoting convention:
 #   TWD (spot ~32.xxx):  points quoted as 50.0 meaning +0.050 → PF=1e3
-#   KRW (spot ~1350.xx): points quoted as 3.50 meaning +3.50  → PF=1e0 (whole won)
-#                         BUT interbank quotes in 0.01 (jeon) → PF=1e2
+#   KRW (spot ~1350.xx): points quoted in whole won (3.50) → PF=1e0
 #   INR (spot ~83.xxxx): points quoted in paise (0.01) → PF=1e2
 #   IDR (spot ~15800):   points in whole rupiah → PF=1e0
 #   PHP (spot ~56.xxx):  points in centavos → PF=1e2
@@ -208,42 +220,48 @@ def _tenor_str(m) -> str:
 #   COP (spot ~4200):    points in whole peso → PF=1e0
 
 CURRENCIES: Dict[str, CurrencyConfig] = {
-    # ═══════ NDFs ═══════
-    "TWD": CurrencyConfig("TWD", "USDTWD", "NDF", 1e3, 3, 1, [1,2,3,6,9,12,24], 24, "TWD=", "NDF"),
-    "KRW": CurrencyConfig("KRW", "USDKRW", "NDF", 1e2, 2, 2, [1,2,3,6,9,12,24], 24, "KRW=", "NDF"),
-    "INR": CurrencyConfig("INR", "USDINR", "NDF", 1e2, 4, 2, [1,3,6,12], 12, "INR=", "NDF"),
-    "IDR": CurrencyConfig("IDR", "USDIDR", "NDF", 1e0, 0, 0, [1,3,6,12], 12, "IDR=", "NDF"),
-    "PHP": CurrencyConfig("PHP", "USDPHP", "NDF", 1e2, 3, 2, [1,3,6,12], 12, "PHP=", "NDF"),
-    "CNY": CurrencyConfig("CNY", "USDCNY", "NDF", 1e4, 4, 1, [1,2,3,6,9,12,18,24], 24, "CNY=", "NDF"),
-    "MYR": CurrencyConfig("MYR", "USDMYR", "NDF", 1e4, 4, 1, [1,2,3,6,9,12,18,24], 24, "MYR=", "NDF"),
-    "NGN": CurrencyConfig("NGN", "USDNGN", "NDF", 1e0, 2, 0, [1,3,6,12], 12, "NGN=", "NDF"),
-    "EGP": CurrencyConfig("EGP", "USDEGP", "NDF", 1e2, 4, 2, [1,3,6,12], 12, "EGP=", "NDF"),
-    "CLP": CurrencyConfig("CLP", "USDCLP", "NDF", 1e0, 2, 0, [1,3,6,12], 12, "CLP=", "NDF"),
-    "COP": CurrencyConfig("COP", "USDCOP", "NDF", 1e0, 0, 0, [1,3,6,12], 12, "COP=", "NDF"),
+    # ═══════ NDFs — pts_in_outright=True (LSEG NDF RICs give raw outright diffs) ═══════
+    "TWD": CurrencyConfig("TWD", "USDTWD", "NDF", 1e3, 3, 1, [1,2,3,6,9,12,18,24], 24, "TWD=", "NDF", pts_in_outright=True),
+    "KRW": CurrencyConfig("KRW", "USDKRW", "NDF", 1e0, 2, 2, [1,2,3,6,9,12,18,24], 24, "KRW=", "NDF", pts_in_outright=True),
+    "INR": CurrencyConfig("INR", "USDINR", "NDF", 1e2, 3, 2, [1,2,3,6,9,12,18,24], 24, "INR=", "NDF", pts_in_outright=True),
+    "IDR": CurrencyConfig("IDR", "USDIDR", "NDF", 1e0, 2, 0, [1,3,6,9,12,18,24], 24, "IDR=", "NDF", pts_in_outright=True),
+    "PHP": CurrencyConfig("PHP", "USDPHP", "NDF", 1e2, 2, 2, [1,3,6,9,12,18,24], 24, "PHP=", "NDF", pts_in_outright=True),
+    "CNY": CurrencyConfig("CNY", "USDCNY", "NDF", 1e4, 4, 1, [1,2,3,6,9,12,18,24], 24, "CNY=", "NDF", pts_in_outright=True),
+    "MYR": CurrencyConfig("MYR", "USDMYR", "NDF", 1e4, 4, 1, [1,2,3,6,9,12,18,24], 24, "MYR=", "NDF", pts_in_outright=True),
+    "NGN": CurrencyConfig("NGN", "USDNGN", "NDF", 1e0, 2, 0, [1,3,6,9,12,18,24], 24, "NGN=", "NDF", pts_in_outright=True),
+    "EGP": CurrencyConfig("EGP", "USDEGP", "NDF", 1e2, 2, 2, [1,3,6,9,12,18,24], 24, "EGP=", "NDF", pts_in_outright=True),
+    "CLP": CurrencyConfig("CLP", "USDCLP", "NDF", 1e0, 2, 0, [1,3,6,9,12,18,24], 24, "CLP=", "NDF", pts_in_outright=True),
+    "COP": CurrencyConfig("COP", "USDCOP", "NDF", 1e0, 0, 0, [1,3,6,9,12,18,24], 24, "COP=", "NDF", pts_in_outright=True),
 
-    # ═══════ Deliverables ═══════
+    # ═══════ Deliverables — Tier 1 (Asia majors) ═══════
     "CNH": CurrencyConfig("CNH", "USDCNH", "DELIVERABLE", 1e4, 4, 1, [1,2,3,6,9,12,18,24], 24, "CNH=", "DELIVERABLE"),
     "SGD": CurrencyConfig("SGD", "USDSGD", "DELIVERABLE", 1e4, 4, 1, [1,2,3,6,9,12,18,24], 24, "SGD=", "DELIVERABLE"),
     "HKD": CurrencyConfig("HKD", "USDHKD", "DELIVERABLE", 1e4, 4, 1, [1,2,3,6,9,12,18,24], 24, "HKD=", "DELIVERABLE"),
-    "MXN": CurrencyConfig("MXN", "USDMXN", "DELIVERABLE", 1e4, 4, 1, [1,2,3,6,9,12], 12, "MXN=", "DELIVERABLE"),
-    "ZAR": CurrencyConfig("ZAR", "USDZAR", "DELIVERABLE", 1e2, 4, 2, [1,2,3,6,9,12], 12, "ZAR=", "DELIVERABLE"),
-    "TRY": CurrencyConfig("TRY", "USDTRY", "DELIVERABLE", 1e2, 4, 2, [1,2,3,6,9,12], 12, "TRY=", "DELIVERABLE"),
-    "THB": CurrencyConfig("THB", "USDTHB", "DELIVERABLE", 1e2, 2, 2, [1,2,3,6,9,12], 12, "THB=", "DELIVERABLE"),
-    "KZT": CurrencyConfig("KZT", "USDKZT", "DELIVERABLE", 1e2, 2, 2, [1,3,6,12], 12, "KZT=", "DELIVERABLE"),
+    "THB": CurrencyConfig("THB", "USDTHB", "DELIVERABLE", 1e2, 2, 2, [1,2,3,6,9,12,18,24], 24, "THB=", "DELIVERABLE"),
+
+    # ═══════ Deliverables — Tier 2 (major EM — LSEG carries to 2Y) ═══════
+    "MXN": CurrencyConfig("MXN", "USDMXN", "DELIVERABLE", 1e4, 4, 1, [1,2,3,6,9,12,18,24], 24, "MXN=", "DELIVERABLE"),
+    "ZAR": CurrencyConfig("ZAR", "USDZAR", "DELIVERABLE", 1e2, 4, 2, [1,2,3,6,9,12,18,24], 24, "ZAR=", "DELIVERABLE"),
+    "TRY": CurrencyConfig("TRY", "USDTRY", "DELIVERABLE", 1e2, 4, 2, [1,2,3,6,9,12,18,24], 24, "TRY=", "DELIVERABLE"),
+    "CZK": CurrencyConfig("CZK", "USDCZK", "DELIVERABLE", 1e3, 3, 1, [1,2,3,6,9,12,18,24], 24, "CZK=", "DELIVERABLE"),
+    "ILS": CurrencyConfig("ILS", "USDILS", "DELIVERABLE", 1e4, 4, 1, [1,2,3,6,9,12,18,24], 24, "ILS=", "DELIVERABLE"),
+    "RON": CurrencyConfig("RON", "USDRON", "DELIVERABLE", 1e4, 4, 1, [1,2,3,6,9,12,18,24], 24, "RON=", "DELIVERABLE"),
+    "PLN": CurrencyConfig("PLN", "USDPLN", "DELIVERABLE", 1e4, 4, 1, [1,2,3,6,9,12,18,24], 24, "PLN=", "DELIVERABLE"),
+    "HUF": CurrencyConfig("HUF", "USDHUF", "DELIVERABLE", 1e2, 2, 2, [1,2,3,6,9,12,18,24], 24, "HUF=", "DELIVERABLE"),
+
+    # ═══════ Deliverables — Tier 3 (smaller/restricted — extend to 12M with intermediates, broker fallback for longer) ═══════
+    "KZT": CurrencyConfig("KZT", "USDKZT", "DELIVERABLE", 1e2, 2, 2, [1,3,6,9,12,18,24], 24, "KZT=", "DELIVERABLE"),
     "RUB": CurrencyConfig("RUB", "USDRUB", "DELIVERABLE", 1e4, 4, 1, [1,3,6,12], 12, "RUB=", "DELIVERABLE"),
-    "CZK": CurrencyConfig("CZK", "USDCZK", "DELIVERABLE", 1e3, 3, 1, [1,2,3,6,9,12], 12, "CZK=", "DELIVERABLE"),
-    "ILS": CurrencyConfig("ILS", "USDILS", "DELIVERABLE", 1e4, 4, 1, [1,2,3,6,9,12], 12, "ILS=", "DELIVERABLE"),
-    "RON": CurrencyConfig("RON", "USDRON", "DELIVERABLE", 1e4, 4, 1, [1,2,3,6,9,12], 12, "RON=", "DELIVERABLE"),
-    "PLN": CurrencyConfig("PLN", "USDPLN", "DELIVERABLE", 1e4, 4, 1, [1,2,3,6,9,12], 12, "PLN=", "DELIVERABLE"),
-    "HUF": CurrencyConfig("HUF", "USDHUF", "DELIVERABLE", 1e2, 2, 2, [1,2,3,6,9,12], 12, "HUF=", "DELIVERABLE"),
-    "UGX": CurrencyConfig("UGX", "USDUGX", "DELIVERABLE", 1e0, 0, 0, [1,3,6,12], 12, "UGX=", "DELIVERABLE"),
-    "MUR": CurrencyConfig("MUR", "USDMUR", "DELIVERABLE", 1e2, 2, 2, [1,3,6,12], 12, "MUR=", "DELIVERABLE"),
-    "BWP": CurrencyConfig("BWP", "USDBWP", "DELIVERABLE", 1e4, 4, 1, [1,3,6,12], 12, "BWP=", "DELIVERABLE"),
-    "SAR": CurrencyConfig("SAR", "USDSAR", "DELIVERABLE", 1e4, 4, 1, [1,3,6,12], 12, "SAR=", "DELIVERABLE"),
-    "AED": CurrencyConfig("AED", "USDAED", "DELIVERABLE", 1e4, 4, 1, [1,3,6,12], 12, "AED=", "DELIVERABLE"),
-    "MAD": CurrencyConfig("MAD", "USDMAD", "DELIVERABLE", 1e4, 4, 1, [1,3,6,12], 12, "MAD=", "DELIVERABLE"),
-    "TND": CurrencyConfig("TND", "USDTND", "DELIVERABLE", 1e3, 3, 1, [1,3,6,12], 12, "TND=", "DELIVERABLE"),
-    "QAR": CurrencyConfig("QAR", "USDQAR", "DELIVERABLE", 1e4, 4, 1, [1,3,6,12], 12, "QAR=", "DELIVERABLE"),
+    "UGX": CurrencyConfig("UGX", "USDUGX", "DELIVERABLE", 1e0, 0, 0, [1,3,6,9,12,18,24], 24, "UGX=", "DELIVERABLE"),
+    "MUR": CurrencyConfig("MUR", "USDMUR", "DELIVERABLE", 1e2, 2, 2, [1,3,6,9,12,18,24], 24, "MUR=", "DELIVERABLE"),
+    "BWP": CurrencyConfig("BWP", "USDBWP", "DELIVERABLE", 1e4, 4, 1, [1,3,6,9,12,18,24], 24, "BWP=", "DELIVERABLE"),
+
+    # ═══════ Deliverables — GCC pegs + North Africa ═══════
+    "SAR": CurrencyConfig("SAR", "USDSAR", "DELIVERABLE", 1e4, 4, 1, [1,3,6,9,12,18,24], 24, "SAR=", "DELIVERABLE"),
+    "AED": CurrencyConfig("AED", "USDAED", "DELIVERABLE", 1e4, 4, 1, [1,3,6,9,12,18,24], 24, "AED=", "DELIVERABLE"),
+    "MAD": CurrencyConfig("MAD", "USDMAD", "DELIVERABLE", 1e4, 4, 1, [1,3,6,9,12,18,24], 24, "MAD=", "DELIVERABLE"),
+    "TND": CurrencyConfig("TND", "USDTND", "DELIVERABLE", 1e3, 3, 1, [1,3,6,9,12,18,24], 24, "TND=", "DELIVERABLE"),
+    "QAR": CurrencyConfig("QAR", "USDQAR", "DELIVERABLE", 1e4, 4, 1, [1,3,6,9,12,18,24], 24, "QAR=", "DELIVERABLE"),
 }
 
 NDF_CURRENCIES = [c for c, cfg in CURRENCIES.items() if cfg.kind == "NDF"]

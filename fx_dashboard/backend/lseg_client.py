@@ -104,6 +104,8 @@ class LsegClient:
         start/end: ISO date strings; OR use `count` for last-N bars.
         """
         import lseg.data as ld
+        import pandas as pd
+        pd.set_option("future.no_silent_downcasting", True)
         kwargs: Dict[str, Any] = {"universe": rics, "fields": list(fields), "interval": interval}
         if start: kwargs["start"] = start
         if end: kwargs["end"] = end
@@ -152,21 +154,117 @@ class LsegClient:
             fields=fields,
         ).get_stream()
 
-        def _on_upd(item, instrument, updates):
-            try: on_update(instrument, updates)
-            except Exception as e: log.exception("on_update error %s: %s", instrument, e)
+        # Tick counter for diagnostics
+        _tick_count = {"update": 0, "refresh": 0}
 
-        def _on_ref(item, instrument, fields_):
+        def _extract_fields(raw):
+            """Safely extract a plain dict from LSEG SDK update/fields objects."""
+            if isinstance(raw, dict):
+                return raw
+            # Try common LSEG SDK patterns
+            if hasattr(raw, 'data') and hasattr(raw.data, 'raw'):
+                return dict(raw.data.raw)
+            if hasattr(raw, 'data'):
+                try: return dict(raw.data)
+                except Exception: pass
+            # Try direct dict conversion
+            try: return dict(raw)
+            except Exception: pass
+            # Last resort: iterate known fields
+            out = {}
+            for f in fields:
+                try:
+                    v = raw[f] if hasattr(raw, '__getitem__') else getattr(raw, f, None)
+                    if v is not None:
+                        out[f] = v
+                except Exception:
+                    pass
+            return out
+
+        def _find_fields_and_instrument(*args):
+            """LSEG SDK callback params vary by version:
+               v1: (fields, instrument_name, stream)
+               v2: (stream, instrument_name, fields)
+            Detect which param has the field data vs the stream object."""
+            instrument = None
+            fields_obj = None
+            for p in args:
+                if isinstance(p, str):
+                    instrument = p
+                elif fields_obj is None and not hasattr(p, 'universe') and type(p).__name__ != 'Stream':
+                    # Not a stream → likely the fields/updates data
+                    fields_obj = p
+            # Fallback: if all non-string params look like streams, try the first one
+            if fields_obj is None:
+                for p in args:
+                    if not isinstance(p, str):
+                        fields_obj = p
+                        break
+            if instrument is None:
+                instrument = str(args[1]) if len(args) > 1 else "unknown"
+            return instrument, fields_obj
+
+        def _on_upd(*args):
+            _tick_count["update"] += 1
+            instrument, raw_fields = _find_fields_and_instrument(*args)
+            if _tick_count["update"] <= 5:
+                log.info("[TICK] %s on_update #%d for %s: raw_type=%s, all_types=%s",
+                         tag, _tick_count["update"], instrument,
+                         type(raw_fields).__name__,
+                         [type(a).__name__ for a in args])
+                try:
+                    extracted = _extract_fields(raw_fields)
+                    log.info("[TICK] %s %s extracted: %s", tag, instrument,
+                             {k: v for k, v in extracted.items() if v is not None})
+                except Exception as e:
+                    log.warning("[TICK] %s %s extract failed: %s", tag, instrument, e)
+            try:
+                on_update(instrument, _extract_fields(raw_fields))
+            except Exception as e:
+                log.exception("on_update error %s: %s", instrument, e)
+
+        def _on_ref(*args):
+            _tick_count["refresh"] += 1
+            instrument, raw_fields = _find_fields_and_instrument(*args)
+            log.info("[REFRESH] %s %s (#%d): raw_type=%s, all_types=%s",
+                     tag, instrument, _tick_count["refresh"],
+                     type(raw_fields).__name__,
+                     [type(a).__name__ for a in args])
+            try:
+                extracted = _extract_fields(raw_fields)
+                log.info("[REFRESH] %s %s data: %s", tag, instrument,
+                         {k: v for k, v in extracted.items() if v is not None})
+            except Exception as e:
+                log.warning("[REFRESH] %s %s extract failed: %s", tag, instrument, e)
             handler = on_refresh or on_update
-            try: handler(instrument, fields_)
-            except Exception as e: log.exception("on_refresh error %s: %s", instrument, e)
+            try:
+                handler(instrument, _extract_fields(raw_fields))
+            except Exception as e:
+                log.exception("on_refresh error %s: %s", instrument, e)
+
+        def _on_status(*args):
+            log.info("[STATUS] %s args=%s", tag, [str(a)[:200] for a in args])
+
+        def _on_error(*args):
+            log.error("[ERROR] %s args=%s", tag, [str(a)[:200] for a in args])
+
+        def _on_complete(*args):
+            log.info("[COMPLETE] %s stream completed, args=%s", tag, [str(a)[:200] for a in args])
 
         stream.on_update(_on_upd)
         stream.on_refresh(_on_ref)
+        # Register status/error/complete if the SDK supports them
+        if hasattr(stream, 'on_status'):
+            stream.on_status(_on_status)
+        if hasattr(stream, 'on_error'):
+            stream.on_error(_on_error)
+        if hasattr(stream, 'on_complete'):
+            stream.on_complete(_on_complete)
+
         stream.open()
         with self._lock:
             self._streams[tag] = stream
-        log.info("Stream '%s' opened for %d RICs", tag, len(rics))
+        log.info("Stream '%s' opened for %d RICs: %s", tag, len(rics), rics)
         return stream
 
     def unsubscribe(self, tag: str) -> None:
@@ -318,7 +416,7 @@ class LsegClient:
                 "source": "IPA",
             }
         except Exception as e:
-            log.debug("IPA calc_fx_forward(%s, %s) failed: %s", ccy_pair, tenor, e)
+            log.info("IPA calc_fx_forward(%s, %s) failed: %s", ccy_pair, tenor, e)
         return None
 
     def calc_fx_forward_batch(
@@ -400,7 +498,7 @@ class LsegClient:
                 return results
 
         except Exception as e:
-            log.debug("IPA batch failed for %s, falling back to individual calls: %s", ccy_pair, e)
+            log.info("IPA batch failed for %s, falling back to individual calls: %s", ccy_pair, e)
 
         # Fallback: individual calls
         for t in tenors:

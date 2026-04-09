@@ -1,5 +1,5 @@
 // FX Dashboard — full port from v1, backend-driven
-import { useEffect, useMemo, useState, useCallback, useRef } from "react";
+import React, { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import Plot from "react-plotly.js";
 import { getCurrencies, getHistory, getSnapshot, liveStart, liveStop, openChannel, getIpaForward } from "./api.js";
 import { buildAllData, calcCustom } from "./dataTransform.js";
@@ -97,12 +97,12 @@ function buildHistoryForTenor(data,tenor,isSwapPts,monthHint){
   const anchorData=[];
   for(const ric of rics){
     const m=ricToMonth(ric);
-    if(m<=0)continue; // skip spot for swap points interpolation
+    if(m<=0)continue; // skip spot RIC (we add spot=0 synthetically below)
     const bars=data.history[ric];
     if(!bars||!bars.length)continue;
     anchorData.push({month:m,bars});
   }
-  if(anchorData.length<2)return{pts:null,source:null};
+  if(anchorData.length<1)return{pts:null,source:null};
   anchorData.sort((a,b)=>a.month-b.month);
 
   // Build date-indexed map: date → {month: value, ...}
@@ -118,8 +118,14 @@ function buildHistoryForTenor(data,tenor,isSwapPts,monthHint){
     }
   }
 
+  // For swap points: spot (month=0) always has 0 points, add as synthetic anchor.
+  // This enables interpolation for weekly tenors (0.25, 0.5, 0.75) between spot and 1M.
+  if(isSwapPts){
+    for(const d of dateMap.keys()){dateMap.get(d)[0]=0;}
+  }
+
   // For each date, if we have at least 2 anchor points, interpolate to targetM
-  const months=anchorData.map(a=>a.month);
+  const months=isSwapPts?[0,...anchorData.map(a=>a.month)]:anchorData.map(a=>a.month);
   const sortedDates=[...dateMap.keys()].sort();
   const pts=[];
   for(const d of sortedDates){
@@ -137,8 +143,75 @@ function buildHistoryForTenor(data,tenor,isSwapPts,monthHint){
   return{pts:pts.length>0?pts:null,source:pts.length>0?'interpolated':null};
 }
 
+// ── Build historical spread timeseries from two tenor legs ──
+// For rolling spreads (e.g. 1Mx3M): get each leg's history, compute spread day-by-day
+function buildSpreadHistory(data,nearM,farM){
+  if(!data?.history)return{pts:null,source:null};
+  const rics=Object.keys(data.history);
+  if(!rics.length)return{pts:null,source:null};
+
+  // Helper: get history for a specific month (direct or interpolated)
+  function getMonthSeries(targetM){
+    // Try direct RIC match first
+    for(const ric of rics){
+      const m=ricToMonth(ric);
+      if(m===targetM){
+        const bars=data.history[ric];
+        if(bars&&bars.length>0){
+          const map=new Map();
+          for(const bar of bars){const v=barMid(bar);if(v!=null&&bar.Date)map.set(bar.Date,v);}
+          if(map.size>5)return{map,source:'direct'};
+        }
+      }
+    }
+    // Interpolate from all available anchors
+    const anchorData=[];
+    for(const ric of rics){
+      const m=ricToMonth(ric);
+      if(m<=0)continue;
+      const bars=data.history[ric];
+      if(!bars||!bars.length)continue;
+      anchorData.push({month:m,bars});
+    }
+    if(anchorData.length<2)return{map:new Map(),source:null};
+    anchorData.sort((a,b)=>a.month-b.month);
+    const months=anchorData.map(a=>a.month);
+    if(targetM<months[0]||targetM>months[months.length-1])return{map:new Map(),source:null};
+    // Build date-indexed anchor data
+    const dateMap=new Map();
+    for(const{month,bars}of anchorData){
+      for(const bar of bars){const d=bar.Date;if(!d)continue;const v=barMid(bar);if(v==null)continue;if(!dateMap.has(d))dateMap.set(d,{});dateMap.get(d)[month]=v;}
+    }
+    const map=new Map();
+    for(const[d,vals]of dateMap){
+      const xs=[],ys=[];
+      for(const m of months){if(vals[m]!=null){xs.push(m);ys.push(vals[m]);}}
+      if(xs.length<2)continue;
+      if(targetM<xs[0]||targetM>xs[xs.length-1])continue;
+      const v=mcI(xs,ys)(targetM);
+      if(v!=null&&isFinite(v))map.set(d,v);
+    }
+    return{map,source:map.size>0?'interpolated':null};
+  }
+
+  const nearSeries=getMonthSeries(nearM);
+  const farSeries=getMonthSeries(farM);
+  if(!nearSeries.source||!farSeries.source)return{pts:null,source:null};
+
+  // Compute spread day-by-day: far - near
+  const sortedDates=[...new Set([...nearSeries.map.keys(),...farSeries.map.keys()])].sort();
+  const pts=[];
+  for(const d of sortedDates){
+    const nv=nearSeries.map.get(d),fv=farSeries.map.get(d);
+    if(nv!=null&&fv!=null)pts.push({date:new Date(d),value:fv-nv});
+  }
+  const source=nearSeries.source==='direct'&&farSeries.source==='direct'?'direct':'interpolated';
+  if(pts.length>10)return{pts,source};
+  return{pts:pts.length>0?pts:null,source:pts.length>0?source:null};
+}
+
 // ══════════════════════ HIST MODAL ══════════════════════
-function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint}){
+function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM}){
   const[hist,setHist]=useState(null);
   const[histSource,setHistSource]=useState(null);
   const[loading,setLoading]=useState(true);
@@ -151,7 +224,11 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint}){
     setHistSource(null);
     getHistory(ccy,252).then(data=>{
       if(cancelled)return;
-      const{pts,source}=buildHistoryForTenor(data,tenor,isSwapPts,monthHint);
+      // If nrM/frM provided, this is a spread — compute from individual tenor legs
+      const isSpread=nrM!=null&&frM!=null;
+      const{pts,source}=isSpread
+        ?buildSpreadHistory(data,nrM,frM)
+        :buildHistoryForTenor(data,tenor,isSwapPts,monthHint);
       if(pts&&pts.length>10){
         setHist(pts);
         setHistSource(source);
@@ -159,7 +236,9 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint}){
         setHist(null);
         setUnavailReason(pts&&pts.length>0
           ?`Only ${pts.length} data points available (minimum 10 required)`
-          :"No anchor data available from LSEG to build history for this tenor");
+          :isSpread
+            ?`No anchor data to build spread history (${nrM}M vs ${frM}M legs)`
+            :"No anchor data available from LSEG to build history for this tenor");
       }
       setLoading(false);
     }).catch((err)=>{
@@ -170,7 +249,8 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint}){
       }
     });
     return()=>{cancelled=true;};
-  },[ccy,tenor,val,isSwapPts,monthHint]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[ccy,tenor,isSwapPts,monthHint,nrM,frM]);
   const stats=useMemo(()=>hist?calcStats(hist,sigN):null,[hist,sigN]);
   const rsiD=useMemo(()=>hist?calcRSI(hist):[],[hist]);
   const macdD=useMemo(()=>hist?calcMACD(hist):{line:[],signal:[],hist:[]},[hist]);
@@ -267,19 +347,19 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint}){
           {hovSt&&<div style={{background:"#0F172A",padding:"4px 8px",borderRadius:4,marginBottom:4,fontSize:8,color:"#94A3B8",border:"1px solid #334155"}}>{STRAT_DESCS[hovSt]||hovSt}</div>}
           <div style={{display:"grid",gridTemplateColumns:selSt!=null?"1fr 1fr":"1fr",gap:6}}>
             <table style={{borderCollapse:"collapse",width:"100%",fontSize:9}}>
-              <thead><tr><th style={{...tS(),textAlign:"left"}}>Strategy</th><th style={tS("#FBBF24")}>Sharpe</th><th style={tS("#10B981")}>Return</th><th style={tS("#F87171")}>Max DD</th><th style={tS()}>Win%</th><th style={tS()}>Status</th></tr></thead>
+              <thead><tr><th style={{...tS(),textAlign:"left"}}>Strategy</th><th style={tS("#FBBF24")}>Sharpe</th><th style={tS("#10B981")}>Cum P&L</th><th style={tS("#F87171")}>Max DD</th><th style={tS()}>Win%</th><th style={tS()}>Status</th></tr></thead>
               <tbody>{btRes.map((s,i)=>(<tr key={i} style={{background:selSt===i?"#1E3A5F":i%2===0?"#0F172A":"#131C2E",cursor:s.unavail?"default":"pointer"}} onClick={()=>!s.unavail&&setSelSt(selSt===i?null:i)} onMouseEnter={()=>setHovSt(s.name)} onMouseLeave={()=>setHovSt(null)}>
                 <td style={{...cS("#CBD5E1",true),textAlign:"left"}}>{s.name}</td>
                 <td style={cS(s.unavail?"#475569":(s.sharpe>0?"#FBBF24":"#F472B6"),!s.unavail)}>{s.unavail?"—":s.sharpe.toFixed(2)}</td>
-                <td style={cS(s.unavail?"#475569":(s.cumRet>=0?"#4ADE80":"#F87171"))}>{s.unavail?"—":(s.cumRet*100).toFixed(1)+"%"}</td>
-                <td style={cS(s.unavail?"#475569":"#F87171")}>{s.unavail?"—":(s.maxDD*100).toFixed(1)+"%"}</td>
+                <td style={cS(s.unavail?"#475569":(s.cumRet>=0?"#4ADE80":"#F87171"))}>{s.unavail?"—":FP(s.cumRet,isSwapPts?1:3)+" pts"}</td>
+                <td style={cS(s.unavail?"#475569":"#F87171")}>{s.unavail?"—":F(s.maxDD,isSwapPts?1:3)+" pts"}</td>
                 <td style={cS("#64748B")}>{s.unavail?"—":(s.winRate*100).toFixed(0)+"%"}</td>
                 <td style={cS(s.unavail?"#F87171":"#4ADE80")}>{s.unavail?<span title={s.reason}>N/A</span>:"OK"}</td>
               </tr>))}</tbody>
             </table>
             {selSt!=null&&btRes[selSt]&&!btRes[selSt].unavail&&(()=>{const st=btRes[selSt];
               return(<div>
-                <PChart traces={[{x:st.dates,y:st.eqC.slice(1),type:"scatter",mode:"lines",name:"Equity",line:{color:"#10B981",width:1.5}}]} layout={{title:{text:`${st.name} — Equity`,font:{size:9,color:"#94A3B8"}},shapes:[{type:"line",y0:1,y1:1,x0:0,x1:1,xref:"paper",line:{color:"#475569",dash:"dot"}}]}} height={110}/>
+                <PChart traces={[{x:st.dates,y:st.eqC.slice(1),type:"scatter",mode:"lines",name:"Cum P&L (pts)",line:{color:"#10B981",width:1.5}}]} layout={{title:{text:`${st.name} — Cumulative P&L (pts)`,font:{size:9,color:"#94A3B8"}},yaxis:{title:"Points"},shapes:[{type:"line",y0:0,y1:0,x0:0,x1:1,xref:"paper",line:{color:"#475569",dash:"dot"}}]}} height={110}/>
                 <PChart traces={[{x:st.dates,y:st.rollSh,type:"scatter",mode:"lines",name:"Roll 20d Sharpe",line:{color:"#FBBF24",width:1.3}}]} layout={{title:{text:"Rolling 20d Sharpe",font:{size:9,color:"#94A3B8"}},shapes:[{type:"line",y0:0,y1:0,x0:0,x1:1,xref:"paper",line:{color:"#475569",dash:"dot"}}]}} height={100}/>
               </div>);})()}
           </div>
@@ -289,17 +369,17 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint}){
 }
 
 // ══════════════════════ SPREAD TABLE ══════════════════════
-function SprTbl({spreads,title,color,mx,onDbl}){
+function SprTbl({spreads,title,color,mx,onDbl,pdp=1}){
   if(!spreads||!spreads.length)return null;
   return(<div style={{background:"#131C2E",borderRadius:5,padding:6,marginBottom:6}}>
     <div style={{fontSize:9.5,fontWeight:800,color,marginBottom:3,letterSpacing:".05em"}}>{title}</div>
     <div style={{overflowX:"auto"}}><table style={{borderCollapse:"collapse",width:"100%",minWidth:1000,fontSize:9}}>
       <thead><tr><th style={{...tS(),textAlign:"left",minWidth:60}}>Spread</th><th style={tS()}>Near Val</th><th style={tS()}>Near Fix</th><th style={tS()}>Far Val</th><th style={tS()}>Far Fix</th><th style={tS()}>Days</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#F87171")}>Ask</th><th style={tS()}>D/D</th><th style={tS()}>Pts/D</th><th style={tS("#4ADE80")}>Iy Bid</th><th style={tS("#34D399")}>Iy Mid</th><th style={tS("#F87171")}>Iy Ask</th><th style={tS()}>Iy D/D</th><th style={tS()}>Iy bp/d</th><th style={tS("#FB923C")}>SOFR%</th><th style={tS("#C084FC")}>Basis</th></tr></thead>
-      <tbody>{spreads.map((s,i)=>(<tr key={i} style={{background:i%2===0?"#0F172A":"#131C2E",cursor:"pointer"}} onDoubleClick={()=>onDbl&&onDbl(s.label,Math.abs(s.pM)||1,true)}>
+      <tbody>{spreads.map((s,i)=>(<tr key={i} style={{background:i%2===0?"#0F172A":"#131C2E",cursor:"pointer"}} onDoubleClick={()=>onDbl&&onDbl(s.label,Math.abs(s.pM)||1,true,null,s.nrM,s.frM)}>
         <td style={{...cS(color,true),textAlign:"left"}}>{s.label}</td>
         <td style={cS("#475569")}>{fD(s.nrVD)}</td><td style={cS("#475569")}>{fD(s.nrFxD)}</td><td style={cS("#475569")}>{fD(s.frVD)}</td><td style={cS("#475569")}>{fD(s.frFxD)}</td><td style={cS("#475569",false,true)}>{s.days}</td>
-        <td style={cS("#4ADE80")}>{FP(s.pB,1)}</td><td style={cS("#FBBF24",true)}>{FP(s.pM,1)}</td><td style={cS("#F87171")}>{FP(s.pA,1)}</td>
-        <td style={{...cS(CC(s.chg)),background:HB(s.chg,mx)}}>{FP(s.chg,1)}</td><td style={cS("#64748B",false,true)}>{F(s.ppd,2)}</td>
+        <td style={cS("#4ADE80")}>{FP(s.pB,pdp)}</td><td style={cS("#FBBF24",true)}>{FP(s.pM,pdp)}</td><td style={cS("#F87171")}>{FP(s.pA,pdp)}</td>
+        <td style={{...cS(CC(s.chg)),background:HB(s.chg,mx)}}>{FP(s.chg,pdp)}</td><td style={cS("#64748B",false,true)}>{F(s.ppd,2)}</td>
         <td style={cS("#4ADE80")}>{F(s.fIyB,2)}</td><td style={cS("#34D399",true)}>{F(s.fIy,2)}</td><td style={cS("#F87171")}>{F(s.fIyA,2)}</td>
         <td style={{...cS(CC(s.iyChg)),background:HB(s.iyChg,.1)}}>{FP(s.iyChg,2)}</td><td style={cS("#64748B")}>{s.iyBpD!=null?F(s.iyBpD,2):"—"}</td>
         <td style={cS("#FB923C")}>{F(s.fSof,2)}</td><td style={cS(s.bas!=null&&s.bas>=0?"#C084FC":"#F472B6",true)}>{s.bas!=null?FP(s.bas*100,1):"—"}</td>
@@ -408,9 +488,14 @@ function ToolsPanel({ad,onDbl,ccy}){
 }
 
 // ══════════════════════ BROKER MONITOR ══════════════════════
-function BrokerMon({ad}){
+function BrokerMon({ad,liveQuotes={},liveOn=false}){
   const{rows,ccy,cfg}=ad;const maxT=ad.maxT||24;
-  const[selBrokers,setSelBrokers]=useState(["ICAP","BGCP","TRDS","TPTS"]);
+  const pdp=cfg.pipDp??1;
+  const PF=cfg.pipFactor||1e3;
+  const ptsOutright=cfg.ptsInOutright||false;
+  // For ptsInOutright currencies, LSEG broker quotes are in outright diffs — multiply by PF for display
+  const brkMult=ptsOutright?PF:1;
+  const[selBrokers,setSelBrokers]=useState(["ICAP","BGCP","TRDS","TPTS","PYNY","GMGM"]);
   const[avgBrokers,setAvgBrokers]=useState(false);
 
   // Adapt broker tenor list based on kind
@@ -423,12 +508,54 @@ function BrokerMon({ad}){
   ];
   const brokerTenors=cfg.kind==="NDF"?NDF_BROKER_TENORS:DELIVERABLE_BROKER_TENORS;
   const allT=brokerTenors.filter(t=>{if(t.type==="outright")return true;return t.far<=maxT;});
-  const brokerList=["ICAP","BGCP","TRDS","TPTS"];
+  const brokerList=["ICAP","BGCP","TRDS","TPTS","PYNY","GMGM"];
 
   function getSpreadVal(t){
     if(t.type==="outright"){const r=rows.find(x=>x.month===t.m);return r?{bid:r.spB,mid:r.spM,ask:r.spA}:null;}
     const nr=rows.find(x=>x.month===t.near),fr=rows.find(x=>x.month===t.far);if(!nr||!fr)return null;
-    return{bid:fr.spB-nr.spA,mid:fr.spM-nr.spM,ask:fr.spA-nr.spB};
+    return{bid:fr.spB!=null&&nr.spA!=null?fr.spB-nr.spA:null,mid:fr.spM!=null&&nr.spM!=null?fr.spM-nr.spM:null,ask:fr.spA!=null&&nr.spB!=null?fr.spA-nr.spB:null};
+  }
+
+  // Build broker RIC name for a given tenor month and contributor
+  function brokerRic(m,contrib){
+    const tenor=m===0?"":m<12?`${m}M`:m===12?"1Y":m===18?"18M":m===24?"2Y":`${m}M`;
+    if(cfg.kind==="NDF")return`${ccy}${tenor}NDF=${contrib}`;
+    return`${ccy}${tenor}=${contrib}`;
+  }
+
+  // Get live broker data for a specific tenor setup and contributor
+  function getBrokerVal(t,contrib){
+    if(t.type==="outright"){
+      const ric=brokerRic(t.m,contrib);
+      const q=liveQuotes[ric];
+      if(!q)return null;
+      const b=q.bid!=null?q.bid*brkMult:null,a=q.ask!=null?q.ask*brkMult:null;
+      return{bid:b,mid:(q.mid??mid(q.bid,q.ask))!=null?(q.mid??mid(q.bid,q.ask))*brkMult:null,ask:a};
+    }
+    // Spread: get near and far broker RICs
+    const nrRic=brokerRic(t.near===0?1:t.near,contrib);
+    const frRic=brokerRic(t.far,contrib);
+    if(t.near===0){
+      const fq=liveQuotes[frRic];
+      if(!fq)return null;
+      const b=fq.bid!=null?fq.bid*brkMult:null,a=fq.ask!=null?fq.ask*brkMult:null;
+      return{bid:b,mid:(fq.mid??mid(fq.bid,fq.ask))!=null?(fq.mid??mid(fq.bid,fq.ask))*brkMult:null,ask:a};
+    }
+    const nq=liveQuotes[nrRic],fq=liveQuotes[frRic];
+    if(!nq||!fq)return null;
+    const nMid=nq.mid??mid(nq.bid,nq.ask),fMid=fq.mid??mid(fq.bid,fq.ask);
+    return{
+      bid:fq.bid!=null&&nq.ask!=null?(fq.bid-nq.ask)*brkMult:null,
+      mid:fMid!=null&&nMid!=null?(fMid-nMid)*brkMult:null,
+      ask:fq.ask!=null&&nq.bid!=null?(fq.ask-nq.bid)*brkMult:null,
+    };
+  }
+
+  // Cell renderer for broker value
+  function BrkCell({t,contrib,color}){
+    const v=getBrokerVal(t,contrib);
+    if(!v)return<td style={cS("#334155")}>{liveOn?"—":"Live only"}</td>;
+    return<td style={cS(color)}>{FP(v.mid??v.bid??v.ask,pdp)}</td>;
   }
 
   return(<div>
@@ -439,15 +566,15 @@ function BrokerMon({ad}){
       </tr></thead><tbody>
         {allT.map((t,idx)=>{const v=getSpreadVal(t);return(<tr key={idx} style={{background:idx%2===0?"#0F172A":"#131C2E"}}>
           <td style={{...cS("#CBD5E1",true),textAlign:"left"}}>{t.label}</td>
-          <td style={cS(v?"#4ADE80":"#475569")}>{v?FP(v.bid,1):"—"}</td>
-          <td style={cS(v?"#FBBF24":"#475569",true)}>{v?FP(v.mid,1):"—"}</td>
-          <td style={cS(v?"#F87171":"#475569")}>{v?FP(v.ask,1):"—"}</td>
-          <td style={cS("#94A3B8")}>{v?FP(v.ask-v.bid,1)+"p":"—"}</td>
+          <td style={cS(v?"#4ADE80":"#475569")}>{v?FP(v.bid,pdp):"—"}</td>
+          <td style={cS(v?"#FBBF24":"#475569",true)}>{v?FP(v.mid,pdp):"—"}</td>
+          <td style={cS(v?"#F87171":"#475569")}>{v?FP(v.ask,pdp):"—"}</td>
+          <td style={cS("#94A3B8")}>{v&&v.ask!=null&&v.bid!=null?FP(v.ask-v.bid,pdp)+"p":"—"}</td>
         </tr>);})}
       </tbody></table>
     </div>
 
-    <div style={{fontSize:10,fontWeight:800,color:"#60A5FA",marginBottom:6,letterSpacing:".05em"}}>PER-BROKER CONTRIBUTIONS — {cfg.pair} ({ccy})</div>
+    <div style={{fontSize:10,fontWeight:800,color:"#60A5FA",marginBottom:6,letterSpacing:".05em"}}>PER-BROKER CONTRIBUTIONS — {cfg.pair} ({ccy}){liveOn&&<span style={{color:"#4ADE80",fontSize:8,marginLeft:8}}>● LIVE</span>}</div>
     <div style={{background:"#131C2E",borderRadius:5,padding:6,marginBottom:6}}>
       <div style={{marginBottom:6,display:"flex",gap:4,alignItems:"center",flexWrap:"wrap"}}>
         {brokerList.map(b=>(<label key={b} style={{fontSize:8,color:"#E2E8F0",display:"flex",alignItems:"center",gap:2,cursor:"pointer"}}><input type="checkbox" checked={selBrokers.includes(b)} onChange={e=>e.target.checked?setSelBrokers([...selBrokers,b]):setSelBrokers(selBrokers.filter(x=>x!==b))} style={{accentColor:"#3B82F6",width:8,height:8}}/>{b}</label>))}
@@ -457,25 +584,33 @@ function BrokerMon({ad}){
       </div>
       <table style={{borderCollapse:"collapse",width:"100%",fontSize:9}}><thead><tr>
         <th style={{...tS(),textAlign:"left"}}>Tenor</th>
-        {selBrokers.includes("ICAP")&&<><th style={tS("#4ADE80")}>ICAP B</th><th style={tS("#FBBF24")}>ICAP M</th><th style={tS("#F87171")}>ICAP A</th></>}
-        {selBrokers.includes("BGCP")&&<><th style={tS("#4ADE80")}>BGCP B</th><th style={tS("#FBBF24")}>BGCP M</th><th style={tS("#F87171")}>BGCP A</th></>}
-        {selBrokers.includes("TRDS")&&<><th style={tS("#4ADE80")}>TRDS B</th><th style={tS("#FBBF24")}>TRDS M</th><th style={tS("#F87171")}>TRDS A</th></>}
-        {selBrokers.includes("TPTS")&&<><th style={tS("#4ADE80")}>TPTS B</th><th style={tS("#FBBF24")}>TPTS M</th><th style={tS("#F87171")}>TPTS A</th></>}
+        {selBrokers.map(b=><React.Fragment key={b}><th style={tS("#4ADE80")}>{b} B</th><th style={tS("#FBBF24")}>{b} M</th><th style={tS("#F87171")}>{b} A</th></React.Fragment>)}
         {avgBrokers&&<><th style={tS("#10B981")}>Avg B</th><th style={tS("#34D399")}>Avg M</th><th style={tS("#A78BFA")}>Avg A</th></>}
       </tr></thead><tbody>
-        {allT.map((t,idx)=>{const v=getSpreadVal(t);return(<tr key={idx} style={{background:idx%2===0?"#0F172A":"#131C2E"}}>
+        {allT.map((t,idx)=>{
+          // Gather broker values for averaging
+          const brkVals=selBrokers.map(b=>({b,v:getBrokerVal(t,b)}));
+          const withData=brkVals.filter(x=>x.v&&x.v.mid!=null);
+          const avgMid=withData.length>0?withData.reduce((s,x)=>s+x.v.mid,0)/withData.length:null;
+          const avgBid=withData.length>0?withData.reduce((s,x)=>s+(x.v.bid??x.v.mid),0)/withData.length:null;
+          const avgAsk=withData.length>0?withData.reduce((s,x)=>s+(x.v.ask??x.v.mid),0)/withData.length:null;
+          return(<tr key={idx} style={{background:idx%2===0?"#0F172A":"#131C2E"}}>
           <td style={{...cS("#CBD5E1",true),textAlign:"left"}}>{t.label}</td>
-          {selBrokers.includes("ICAP")&&<><td style={cS("#4ADE80")}>Live only</td><td style={cS("#FBBF24")}>Live only</td><td style={cS("#F87171")}>Live only</td></>}
-          {selBrokers.includes("BGCP")&&<><td style={cS("#4ADE80")}>Live only</td><td style={cS("#FBBF24")}>Live only</td><td style={cS("#F87171")}>Live only</td></>}
-          {selBrokers.includes("TRDS")&&<><td style={cS("#4ADE80")}>Live only</td><td style={cS("#FBBF24")}>Live only</td><td style={cS("#F87171")}>Live only</td></>}
-          {selBrokers.includes("TPTS")&&<><td style={cS("#4ADE80")}>Live only</td><td style={cS("#FBBF24")}>Live only</td><td style={cS("#F87171")}>Live only</td></>}
-          {avgBrokers&&<><td style={cS("#10B981")}>—</td><td style={cS("#34D399")}>—</td><td style={cS("#A78BFA")}>—</td></>}
+          {selBrokers.map(b=>{const v=getBrokerVal(t,b);const hasV=v&&(v.bid!=null||v.mid!=null||v.ask!=null);
+            return<React.Fragment key={b}>
+              <td style={cS(hasV?"#4ADE80":"#334155")}>{hasV?FP(v.bid,pdp):(liveOn?"—":"Live only")}</td>
+              <td style={cS(hasV?"#FBBF24":"#334155",true)}>{hasV?FP(v.mid,pdp):(liveOn?"—":"Live only")}</td>
+              <td style={cS(hasV?"#F87171":"#334155")}>{hasV?FP(v.ask,pdp):(liveOn?"—":"Live only")}</td>
+            </React.Fragment>;})}
+          {avgBrokers&&<><td style={cS("#10B981")}>{avgBid!=null?FP(avgBid,pdp):"—"}</td><td style={cS("#34D399")}>{avgMid!=null?FP(avgMid,pdp):"—"}</td><td style={cS("#A78BFA")}>{avgAsk!=null?FP(avgAsk,pdp):"—"}</td></>}
         </tr>);})}
       </tbody></table>
     </div>
 
-    <div style={{fontSize:8,color:"#F87171",background:"#1F1317",border:"1px solid #7F1D1D",borderRadius:4,padding:6,marginTop:4}}>
-      <b>Per-broker contributions stream when LIVE mode is ON.</b> Real broker RICs (=ICAP, =BGCP, =TRDS, =TPTS) are subscribed via WebSocket. Broker columns show "Live only" when not streaming.
+    <div style={{fontSize:8,color:liveOn?"#4ADE80":"#F87171",background:liveOn?"#064E3B":"#1F1317",border:`1px solid ${liveOn?"#065F46":"#7F1D1D"}`,borderRadius:4,padding:6,marginTop:4}}>
+      {liveOn
+        ?<><b>LIVE streaming active.</b> Broker RICs (=ICAP, =BGCP, =TRDS, =TPTS, =PYNY, =GMGM) updating via WebSocket. Check browser console for tick logs.</>
+        :<><b>Per-broker contributions stream when LIVE mode is ON.</b> Turn on LIVE mode to see real-time broker prices.</>}
     </div>
   </div>);
 }
@@ -489,6 +624,8 @@ export default function Dashboard(){
   const[showI,setShowI]=useState(true);const[tab,setTab]=useState("main");
   const[hm,setHm]=useState(null);
   const[ccy,setCcy]=useState("TWD");
+  const ALL_SOURCES=["DEFAULT","ICAP","BGCP","TRDS","TPTS","PYNY","GMGM"];
+  const[sources,setSources]=useState(["DEFAULT"]);
   const[err,setErr]=useState(null);
   const[lastReload,setLastReload]=useState(null);
   const[reloadMsg,setReloadMsg]=useState(null);
@@ -504,9 +641,17 @@ export default function Dashboard(){
   // Live streaming
   useEffect(()=>{
     if(!liveOn||!snap)return;
-    liveStart(ccy).catch(e=>setErr(`liveStart: ${e.message}`));
-    const onTick=msg=>{if(!msg||!msg.ric)return;setLiveQuotes(p=>({...p,[msg.ric]:{...p[msg.ric],...msg}}));};
-    channelsRef.current=[openChannel("spot",onTick),openChannel("forwards",onTick),openChannel("brokers",onTick)];
+    liveStart(ccy).then(r=>console.log("[LIVE] start OK:",r)).catch(e=>setErr(`liveStart: ${e.message}`));
+    const onTick=msg=>{
+      if(!msg||!msg.ric)return;
+      console.debug("[WS]",msg.ric,"bid:",msg.bid,"ask:",msg.ask,"mid:",msg.mid);
+      setLiveQuotes(p=>({...p,[msg.ric]:{...p[msg.ric],...msg}}));
+    };
+    channelsRef.current=[
+      openChannel("spot",onTick,()=>console.log("[WS] spot OPEN"),()=>console.log("[WS] spot CLOSED")),
+      openChannel("forwards",onTick,()=>console.log("[WS] forwards OPEN"),()=>console.log("[WS] forwards CLOSED")),
+      openChannel("brokers",onTick,()=>console.log("[WS] brokers OPEN"),()=>console.log("[WS] brokers CLOSED")),
+    ];
     return()=>{channelsRef.current.forEach(c=>c.close());channelsRef.current=[];liveStop(ccy).catch(()=>{});};
   },[liveOn,ccy,snap]);
 
@@ -520,7 +665,7 @@ export default function Dashboard(){
     return()=>clearInterval(iv);
   },[liveOn]);
 
-  const ad=useMemo(()=>buildAllData(snap,liveQuotes),[snap,liveQuotes,liveTick]);
+  const ad=useMemo(()=>buildAllData(snap,liveQuotes,sources),[snap,liveQuotes,liveTick,sources]);
   const refreshSnap=useCallback(()=>{
     getSnapshot(ccy).then(s=>{
       setSnap(s);
@@ -540,12 +685,13 @@ export default function Dashboard(){
   const mIC=Math.max(...mr.map(r=>Math.abs(r.iyChg||0)),.01);
   const mBC=Math.max(...mr.map(r=>Math.abs(r.basChg||0)),.01);
   const mFC=Math.max(...mr.filter(r=>r.month>1).map(r=>Math.abs(r.ffChg||0)),1);
-  const mCP=Math.max(...mr.map(r=>Math.abs(r.carryOutP||0)),1);
-  const mCF=Math.max(...mr.filter(r=>r.month>1).map(r=>Math.abs(r.carryFfP||0)),1);
-  const mCY=Math.max(...mr.map(r=>Math.abs(r.carryOutY||0)),.01);
+  const mCP=Math.max(...mr.map(r=>Math.abs(r.carryP||0)),1);
+  const mRP=Math.max(...mr.filter(r=>r.month>1).map(r=>Math.abs(r.rollP||0)),1);
+  const mCY=Math.max(...mr.map(r=>Math.abs(r.carryY||0)),.01);
   const mSC=Math.max(...[...anchors,...qFF,...spSpr,...immSpr].map(s=>Math.abs(s.chg||0)),1);
-  const dblR=(t,v,isSP=false,month=null)=>setHm({tenor:t,value:v,isSP,month});
+  const dblR=(t,v,isSP=false,month=null,nrM=null,frM=null)=>setHm({tenor:t,value:v,isSP,month,nrM,frM});
   const dp=cfg.dp;
+  const pdp=cfg.pipDp??1; // pip decimal places from config
 
   const chartRows=filt.filter(r=>r.month>0&&!r.isWeekly);
   const tenors=chartRows.map(r=>r.tenor);
@@ -559,7 +705,7 @@ export default function Dashboard(){
 
   return(
     <div style={{background:"#0F172A",color:"#E2E8F0",minHeight:"100vh",fontFamily:"'Inter',system-ui,sans-serif",padding:8}}>
-      {hm&&<HistModal tenor={hm.tenor} val={hm.value} isSwapPts={hm.isSP} dpOverride={dp} onClose={()=>setHm(null)} ccy={ccy} monthHint={hm.month}/>}
+      {hm&&<HistModal tenor={hm.tenor} val={hm.value} isSwapPts={hm.isSP} dpOverride={dp} onClose={()=>setHm(null)} ccy={ccy} monthHint={hm.month} nrM={hm.nrM} frM={hm.frM}/>}
       {/* Header */}
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6,paddingBottom:4,borderBottom:"1px solid #1E293B",flexWrap:"wrap",gap:4}}>
         <div><h1 style={{fontSize:14,fontWeight:800,margin:0,color:"#F8FAFC"}}>{cfg.pair} {cfg.kind==="NDF"?"NDF":"FWD"} Dashboard</h1>
@@ -585,6 +731,12 @@ export default function Dashboard(){
             </div>
           )}
           <label style={{fontSize:7.5,color:"#94A3B8",display:"flex",alignItems:"center",gap:2,cursor:"pointer"}}><input type="checkbox" checked={showI} onChange={()=>setShowI(!showI)} style={{accentColor:"#3B82F6",width:9,height:9}}/>Interp</label>
+          <div style={{display:"flex",gap:2,alignItems:"center",background:"#1E293B",padding:"2px 6px",borderRadius:4}}>
+            <span style={{fontSize:7,color:"#64748B",fontWeight:700}}>SRC:</span>
+            {ALL_SOURCES.map(s=>{const on=sources.includes(s);return(<button key={s} onClick={()=>{
+              if(on&&sources.length===1)return;// must have at least one
+              setSources(prev=>on?prev.filter(x=>x!==s):[...prev,s]);
+            }} style={{fontSize:7,padding:"1px 4px",borderRadius:2,border:"none",cursor:"pointer",fontWeight:600,background:on?"#3B82F6":"#0F172A",color:on?"#FFF":"#64748B"}}>{s==="DEFAULT"?"DFLT":s}</button>);})}</div>
           <div style={{background:"#1E293B",padding:"2px 6px",borderRadius:4,fontSize:9,fontFamily:"monospace"}}>
             <span style={{color:"#64748B"}}>Spot </span><span style={{color:"#4ADE80"}}>{F(rows[0].bT,dp)}</span><span style={{color:"#334155"}}>/</span><span style={{color:"#F87171"}}>{F(rows[0].aT,dp)}</span><span style={{color:"#334155"}}> | </span><span style={{color:"#FBBF24",fontWeight:700}}>{F(rows[0].mT,dp)}</span>
           </div>
@@ -622,8 +774,7 @@ export default function Dashboard(){
               <td colSpan={4} style={sS("#64748B")}>TENOR</td><td colSpan={3} style={sS("#60A5FA")}>{cfg.kind} OUTRIGHT</td>
               <td colSpan={4} style={sS("#FBBF24")}>SWAP POINTS</td><td colSpan={4} style={sS("#34D399")}>IMPLIED YIELD*</td>
               <td colSpan={2} style={sS("#FB923C")}>SOFR</td><td colSpan={2} style={sS("#C084FC")}>BASIS</td>
-              <td colSpan={2} style={sS("#38BDF8")}>CARRY PIP</td><td colSpan={2} style={sS("#F472B6")}>CARRY YLD</td>
-              <td colSpan={2} style={sS("#A78BFA")}>ROLL DOWN</td>
+              <td colSpan={2} style={sS("#38BDF8")}>CARRY</td><td colSpan={2} style={sS("#A78BFA")}>ROLL-DOWN</td>
             </tr><tr>
               <th style={{...tS(),textAlign:"left",minWidth:36}}>Tnr</th><th style={tS()}>Val</th><th style={tS()}>Fix</th><th style={{...tS(),borderRight:"1px solid #334155"}}>D</th>
               <th style={tS("#4ADE80")}>Bid</th><th style={tS("#F87171")}>Ask</th><th style={{...tS("#FBBF24"),borderRight:"1px solid #334155"}}>Mid</th>
@@ -631,28 +782,25 @@ export default function Dashboard(){
               <th style={tS("#4ADE80")}>Bid</th><th style={tS("#34D399")}>Mid</th><th style={tS("#F87171")}>Ask</th><th style={{...tS(),borderRight:"1px solid #334155"}}>D/D</th>
               <th style={tS("#FB923C")}>%</th><th style={{...tS(),borderRight:"1px solid #334155"}}>D/D</th>
               <th style={tS("#C084FC")}>bp</th><th style={{...tS(),borderRight:"1px solid #334155"}}>D/D</th>
-              <th style={tS("#38BDF8")}>Outr</th><th style={{...tS("#38BDF8"),borderRight:"1px solid #334155"}}>FF</th>
-              <th style={tS("#F472B6")}>Outr</th><th style={{...tS("#F472B6"),borderRight:"1px solid #334155"}}>FF</th>
-              <th style={tS("#A78BFA")}>Pts</th><th style={tS("#A78BFA")}>IY</th>
+              <th style={tS("#38BDF8")}>Pip</th><th style={{...tS("#38BDF8"),borderRight:"1px solid #334155"}}>IY</th>
+              <th style={tS("#A78BFA")}>Pip</th><th style={tS("#A78BFA")}>IY</th>
             </tr></thead>
             <tbody>{filt.map((r,i)=>{const sp=r.month===0,mj=[0,1,2,3,6,9,12,24].includes(r.month);const bg=sp?"#1a2744":(i%2===0?"#0F172A":"#111827");const tc=r.interp?"#475569":(mj?"#F8FAFC":"#94A3B8");
               return(<tr key={r.tenor} style={{background:bg,borderBottom:[3,6,9,12].includes(r.month)?"1px solid #334155":"none",cursor:"pointer"}} onDoubleClick={()=>dblR(r.tenor,r.spM,true,r.month)}>
                 <td style={{...cS(tc,mj),textAlign:"left",borderRight:"1px solid #1E293B"}}>{r.tenor}{r.interp?"*":""}</td>
                 <td style={cS("#475569")}>{fD(r.valDate)}</td><td style={cS("#475569")}>{fD(r.fixDate)}</td><td style={{...cS("#475569"),borderRight:"1px solid #334155"}}>{r.dT||"—"}</td>
                 <td style={cS("#4ADE80")}>{F(r.bT,dp)}</td><td style={cS("#F87171")}>{F(r.aT,dp)}</td><td style={{...cS("#FBBF24",true),borderRight:"1px solid #334155"}}>{F(r.mT,dp)}</td>
-                <td style={cS("#4ADE80")}>{sp?"—":FP(r.spB,1)}</td><td style={cS("#FBBF24",true)}>{sp?"—":FP(r.spM,1)}</td><td style={cS("#F87171")}>{sp?"—":FP(r.spA,1)}</td>
-                <td style={{...cS(CC(r.pipChg)),borderRight:"1px solid #334155",background:sp?"transparent":HB(r.pipChg,mPC)}}>{sp?"—":FP(r.pipChg,1)}</td>
+                <td style={cS("#4ADE80")}>{sp?"—":FP(r.spB,pdp)}</td><td style={cS("#FBBF24",true)}>{sp?"—":FP(r.spM,pdp)}</td><td style={cS("#F87171")}>{sp?"—":FP(r.spA,pdp)}</td>
+                <td style={{...cS(CC(r.pipChg)),borderRight:"1px solid #334155",background:sp?"transparent":HB(r.pipChg,mPC)}}>{sp?"—":FP(r.pipChg,pdp)}</td>
                 <td style={cS("#4ADE80")}>{sp?"—":F(r.iyB,2)}</td><td style={cS("#34D399",true)}>{sp?"—":F(r.iyM,2)}</td><td style={cS("#F87171")}>{sp?"—":F(r.iyA,2)}</td>
                 <td style={{...cS(CC(r.iyChg)),borderRight:"1px solid #334155",background:sp?"transparent":HB(r.iyChg,mIC)}}>{sp?"—":FP(r.iyChg,2)}</td>
                 <td style={cS("#FB923C")}>{sp?"—":F(r.sofT,2)}</td><td style={{...cS(CC(r.sofChg)),borderRight:"1px solid #334155",background:sp?"transparent":HB(r.sofChg,.005)}}>{sp?"—":FP(r.sofChg*100,1)}</td>
                 <td style={cS(r.basisT!=null&&r.basisT>=0?"#C084FC":"#F472B6",true)}>{sp||r.basisT==null?"—":FP(r.basisT*100,1)}</td>
                 <td style={{...cS(CC(r.basChg)),borderRight:"1px solid #334155",background:sp?"transparent":HB(r.basChg,mBC)}}>{sp?"—":FP(r.basChg*100,1)}</td>
-                <td style={{...cS(r.carryOutP>=0?"#38BDF8":"#F472B6"),background:sp?"transparent":HB(r.carryOutP,mCP)}}>{sp?"—":FP(r.carryOutP,1)}</td>
-                <td style={{...cS(r.carryFfP>=0?"#38BDF8":"#F472B6"),borderRight:"1px solid #334155",background:r.month<2?"transparent":HB(r.carryFfP,mCF)}}>{r.month<2?"—":FP(r.carryFfP,1)}</td>
-                <td style={{...cS(r.carryOutY>=0?"#F472B6":"#4ADE80"),background:sp?"transparent":HB(r.carryOutY,mCY)}}>{sp?"—":FP(r.carryOutY,2)}</td>
-                <td style={{...cS(r.carryFfY>=0?"#F472B6":"#4ADE80"),borderRight:"1px solid #334155",background:r.month<2?"transparent":HB(r.carryFfY||0,mCY)}}>{r.month<2?"—":FP(r.carryFfY,2)}</td>
-                <td style={cS(r.rollPts>=0?"#A78BFA":"#F472B6")}>{r.month<2?"—":FP(r.rollPts,1)}</td>
-                <td style={cS(r.rollIy>=0?"#A78BFA":"#F472B6")}>{r.month<2?"—":FP(r.rollIy,2)}</td>
+                <td style={{...cS(r.carryP>=0?"#38BDF8":"#F472B6"),background:sp?"transparent":HB(r.carryP,mCP)}}>{sp?"—":FP(r.carryP,pdp)}</td>
+                <td style={{...cS(r.carryY>=0?"#38BDF8":"#F472B6"),borderRight:"1px solid #334155",background:sp?"transparent":HB(r.carryY||0,mCY)}}>{sp?"—":FP(r.carryY,2)}</td>
+                <td style={{...cS(r.rollP>=0?"#A78BFA":"#F472B6"),background:r.month<2?"transparent":HB(r.rollP,mRP)}}>{r.month<2?"—":FP(r.rollP,pdp)}</td>
+                <td style={cS(r.rollY>=0?"#A78BFA":"#F472B6")}>{r.month<2?"—":FP(r.rollY,2)}</td>
               </tr>);})}</tbody></table></div>
 
         <div style={{fontSize:8.5,fontWeight:700,color:"#F8FAFC",marginBottom:2}}>1M FORWARD-FORWARD CHAIN</div>
@@ -663,8 +811,8 @@ export default function Dashboard(){
               return(<tr key={r.tenor} style={{background:i%2===0?"#0F172A":"#111827",borderBottom:[3,6,9,12].includes(r.month)?"1px solid #334155":"none",cursor:"pointer"}} onDoubleClick={()=>dblR(label,r.ffM,true,r.month)}>
                 <td style={{...cS(r.interp?"#475569":(mj?"#F8FAFC":"#94A3B8"),mj),textAlign:"left"}}>{label}{r.interp?"*":""}</td>
                 <td style={cS("#475569")}>{fD(p?p.valDate:ad.TENOR_DATES[0]?.valDate)}</td><td style={cS("#475569")}>{fD(r.valDate)}</td><td style={cS("#475569",false,true)}>{fwdD}</td>
-                <td style={cS("#4ADE80")}>{FP(r.ffB,1)}</td><td style={cS("#FBBF24",true)}>{FP(r.ffM,1)}</td><td style={cS("#F87171")}>{FP(r.ffA,1)}</td>
-                <td style={{...cS(CC(r.ffChg)),background:HB(r.ffChg,mFC)}}>{FP(r.ffChg,1)}</td><td style={cS("#64748B",false,true)}>{F(ppd,2)}</td>
+                <td style={cS("#4ADE80")}>{FP(r.ffB,pdp)}</td><td style={cS("#FBBF24",true)}>{FP(r.ffM,pdp)}</td><td style={cS("#F87171")}>{FP(r.ffA,pdp)}</td>
+                <td style={{...cS(CC(r.ffChg)),background:HB(r.ffChg,mFC)}}>{FP(r.ffChg,pdp)}</td><td style={cS("#64748B",false,true)}>{F(ppd,2)}</td>
                 <td style={cS("#4ADE80")}>{F(r.ffIyB,2)}</td><td style={cS("#34D399",true)}>{F(r.ffIyM,2)}</td><td style={cS("#F87171")}>{F(r.ffIyA,2)}</td>
                 <td style={{...cS(CC(r.ffIyChg)),background:HB(r.ffIyChg,.1)}}>{FP(r.ffIyChg,2)}</td><td style={cS("#64748B")}>{r.ffIyBpD!=null?F(r.ffIyBpD,2):"—"}</td>
                 <td style={cS("#FB923C")}>{r.ffSofr!=null?F(r.ffSofr,2):"—"}</td><td style={cS(r.ffBasis!=null&&r.ffBasis>=0?"#C084FC":"#F472B6")}>{r.ffBasis!=null?FP(r.ffBasis*100,1):"—"}</td>
@@ -677,11 +825,11 @@ export default function Dashboard(){
           <PChart traces={[{x:anchors.map(s=>s.label),y:anchors.map(s=>s.pM),type:"bar",name:"Mid",marker:{color:"#10B981"}},{x:anchors.map(s=>s.label),y:anchors.map(s=>s.chg),type:"scatter",mode:"lines+markers",name:"D/D",line:{color:"#FBBF24"},yaxis:"y2"}]} layout={{title:{text:`${cfg.pair} Interbank Anchors`,font:{size:10}},yaxis2:{overlaying:"y",side:"right",gridcolor:"transparent",tickfont:{size:8}}}} height={185}/>
           <PChart traces={[{x:qFF.map(s=>s.label),y:qFF.map(s=>s.pM),type:"bar",name:"Mid",marker:{color:"#8B5CF6"}}]} layout={{title:{text:`${cfg.pair} ${cfg.kind==="NDF"?"3M Fwd-Fwd":"Fwd-Fwd"} Rolls`,font:{size:10}}}} height={185}/>
         </div>
-        {cfg.kind==="NDF"&&<SprTbl spreads={anchors} title={`${cfg.pair} INTERBANK ANCHOR SPREADS`} color="#10B981" mx={mSC} onDbl={dblR}/>}
-        {cfg.kind==="NDF"&&<SprTbl spreads={qFF} title={`${cfg.pair} 3M FORWARD-FORWARD GAPS`} color="#A78BFA" mx={mSC} onDbl={dblR}/>}
-        <SprTbl spreads={spSpr} title={`${cfg.pair} SPOT-START SPREADS`} color="#60A5FA" mx={mSC} onDbl={dblR}/>
-        {cfg.kind==="DELIVERABLE"&&<SprTbl spreads={qFF} title={`${cfg.pair} FWD-FWD SPREADS`} color="#A78BFA" mx={mSC} onDbl={dblR}/>}
-        <SprTbl spreads={immSpr} title={`${cfg.pair} IMM ROLL SPREADS`} color="#F59E0B" mx={mSC} onDbl={dblR}/>
+        {cfg.kind==="NDF"&&<SprTbl spreads={anchors} title={`${cfg.pair} INTERBANK ANCHOR SPREADS`} color="#10B981" mx={mSC} onDbl={dblR} pdp={pdp}/>}
+        {cfg.kind==="NDF"&&<SprTbl spreads={qFF} title={`${cfg.pair} 3M FORWARD-FORWARD GAPS`} color="#A78BFA" mx={mSC} onDbl={dblR} pdp={pdp}/>}
+        <SprTbl spreads={spSpr} title={`${cfg.pair} SPOT-START SPREADS`} color="#60A5FA" mx={mSC} onDbl={dblR} pdp={pdp}/>
+        {cfg.kind==="DELIVERABLE"&&<SprTbl spreads={qFF} title={`${cfg.pair} FWD-FWD SPREADS`} color="#A78BFA" mx={mSC} onDbl={dblR} pdp={pdp}/>}
+        <SprTbl spreads={immSpr} title={`${cfg.pair} IMM ROLL SPREADS`} color="#F59E0B" mx={mSC} onDbl={dblR} pdp={pdp}/>
       </div>)}
 
       {/* IMM TAB */}
@@ -699,17 +847,17 @@ export default function Dashboard(){
             <tbody>{immR.map((r,i)=>(<tr key={i} style={{background:i%2===0?"#0F172A":"#131C2E",cursor:"pointer"}} onDoubleClick={()=>dblR(r.tenor,r.spM,true,r.month)}>
               <td style={{...cS("#FB923C",true),textAlign:"left"}}>{r.tenor}</td><td style={cS("#475569")}>{fD(r.valDate)}</td><td style={cS("#475569")}>{fD(r.fixDate)}</td><td style={cS("#475569")}>{r.dT}</td>
               <td style={cS("#4ADE80")}>{F(r.bT,dp)}</td><td style={cS("#F87171")}>{F(r.aT,dp)}</td><td style={cS("#FBBF24",true)}>{F(r.mT,dp)}</td>
-              <td style={cS("#FBBF24",true)}>{FP(r.spM,1)}</td><td style={{...cS(CC(r.pipChg)),background:HB(r.pipChg,mPC)}}>{FP(r.pipChg,1)}</td>
+              <td style={cS("#FBBF24",true)}>{FP(r.spM,pdp)}</td><td style={{...cS(CC(r.pipChg)),background:HB(r.pipChg,mPC)}}>{FP(r.pipChg,pdp)}</td>
               <td style={cS("#34D399",true)}>{F(r.iyM,2)}</td><td style={{...cS(CC(r.iyChg)),background:HB(r.iyChg,mIC)}}>{FP(r.iyChg,2)}</td>
               <td style={cS("#FB923C")}>{F(r.sofT,2)}</td><td style={cS(r.basisT!=null&&r.basisT>=0?"#C084FC":"#F472B6")}>{r.basisT!=null?FP(r.basisT*100,1):"—"}</td>
-              <td style={cS(r.ffM>=0?"#A78BFA":"#F472B6")}>{FP(r.ffM,1)}</td><td style={{...cS(CC(r.ffChg)),background:HB(r.ffChg,mFC)}}>{FP(r.ffChg,1)}</td>
+              <td style={cS(r.ffM>=0?"#A78BFA":"#F472B6")}>{FP(r.ffM,pdp)}</td><td style={{...cS(CC(r.ffChg)),background:HB(r.ffChg,mFC)}}>{FP(r.ffChg,pdp)}</td>
               <td style={cS("#34D399")}>{F(r.ffIyM,2)}</td>
             </tr>))}</tbody></table></div></div>
-        <SprTbl spreads={immSpr} title={`${cfg.pair} IMM ROLL SPREADS`} color="#F59E0B" mx={mSC} onDbl={dblR}/>
+        <SprTbl spreads={immSpr} title={`${cfg.pair} IMM ROLL SPREADS`} color="#F59E0B" mx={mSC} onDbl={dblR} pdp={pdp}/>
       </div>)}
 
       {tab==="tools"&&<ToolsPanel ad={ad} onDbl={dblR} ccy={ccy}/>}
-      {tab==="broker"&&<BrokerMon ad={ad}/>}
+      {tab==="broker"&&<BrokerMon ad={ad} liveQuotes={liveQuotes} liveOn={liveOn}/>}
 
       <div style={{marginTop:4,fontSize:6.5,color:"#334155",display:"flex",justifyContent:"space-between",flexWrap:"wrap",gap:2}}>
         <div>* = Calculated: ImplYld=((F/S)(1+SOFR×d/360)-1)×360/d · FwdFwd Impl=compounded from outrights · Spread bid=far_bid−near_ask · Weekly tenors interpolated (Fritsch-Carlson monotone cubic)</div>

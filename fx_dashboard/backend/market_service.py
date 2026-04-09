@@ -56,6 +56,7 @@ class MarketService:
         }
         self._active_ccy: Optional[str] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._tick_counts: Dict[str, int] = {}  # diagnostic counters
 
     def set_loop(self, loop: asyncio.AbstractEventLoop):
         self._loop = loop
@@ -66,22 +67,40 @@ class MarketService:
         Fetches SWAP POINTS (primary) + spot + SOFR + IPA for non-anchor tenors."""
         cfg = CURRENCIES[ccy]
 
-        # Build RIC list: spot + swap points + SOFR + funding (deliverables)
+        # Build RIC list: spot + swap points + SOFR + funding (deliverables) + brokers
         swap_pts_rics = all_swap_points_rics(ccy)  # includes spot
         sofr_rics = list(SOFR_RICS.values())
         funding_rics = all_funding_rics(ccy)
-        all_rics = swap_pts_rics + sofr_rics + funding_rics
+        broker_rics = all_broker_rics(ccy)  # all 4 contributors × anchor tenors
+        all_rics = swap_pts_rics + sofr_rics + funding_rics + broker_rics
+        # For NDF: also fetch 1M outright (ticks frequently, used to derive implied spot)
+        ndf_1m_outright_ric = None
+        if cfg.kind == "NDF":
+            ndf_1m_outright_ric = cfg.outright_ric(1)  # e.g. TWD1MNDFOR=
+            if ndf_1m_outright_ric not in all_rics:
+                all_rics.append(ndf_1m_outright_ric)
+
+        log.info("Snapshot for %s: %d RICs (%d swap, %d broker, %d sofr, %d funding)",
+                 ccy, len(all_rics), len(swap_pts_rics), len(broker_rics),
+                 len(sofr_rics), len(funding_rics))
 
         # T (current) — live snapshot
         data_t = self.lseg.get_snapshot(all_rics, FIELDS_QUOTE)
         now = time.time()
         for ric, fields in data_t.items():
-            q = Quote(
-                bid=_num(fields.get("BID")) or _num(fields.get("PRIMACT_1")),
-                ask=_num(fields.get("ASK")) or _num(fields.get("SEC_ACT_1")),
-                last=_num(fields.get("TRDPRC_1")) or _num(fields.get("HST_CLOSE")) or _num(fields.get("GEN_VAL1")),
-                ts=now,
-            )
+            # Use _first: pick first non-None value (do NOT use `or` — 0.0 is valid data)
+            bid = _num(fields.get("BID"))
+            if bid is None:
+                bid = _num(fields.get("PRIMACT_1"))
+            ask = _num(fields.get("ASK"))
+            if ask is None:
+                ask = _num(fields.get("SEC_ACT_1"))
+            last = _num(fields.get("TRDPRC_1"))
+            if last is None:
+                last = _num(fields.get("HST_CLOSE"))
+            if last is None:
+                last = _num(fields.get("GEN_VAL1"))
+            q = Quote(bid=bid, ask=ask, last=last, ts=now)
             self._quotes[ric] = q
 
         # T1 (previous close) — from daily history
@@ -223,9 +242,48 @@ class MarketService:
                 if ric:
                     funding[tenor] = {"ric": ric, "T": _ser(ric, "T"), "T1": _ser(ric, "T1")}
 
+        # NDF 1M outright: used to derive implied spot (ticks frequently on LSEG)
+        ndf_1m_out = None
+        ndf_1m_out_ric = None
+        if cfg.kind == "NDF":
+            ndf_1m_out_ric = cfg.outright_ric(1)
+            ndf_1m_out = {"ric": ndf_1m_out_ric, "T": _ser(ndf_1m_out_ric, "T"), "T1": _ser(ndf_1m_out_ric, "T1")}
+
+        # Broker quotes: { contrib: { tenor_m: { T: {bid,ask,mid,...}, T1: {...} }, ... } }
+        from ric_config import BROKER_CONTRIBUTORS
+        brokers = {}
+        for contrib in BROKER_CONTRIBUTORS:
+            contrib_data = {}
+            for m in cfg.anchor_tenors_m:
+                bric = cfg.broker_ric(m, contrib)
+                bt = _ser(bric, "T")
+                bt1 = _ser(bric, "T1")
+                has_data = bt["bid"] is not None or bt["ask"] is not None or bt["last"] is not None
+                if has_data:
+                    contrib_data[m] = {"ric": bric, "T": bt, "T1": bt1}
+            if contrib_data:
+                brokers[contrib] = contrib_data
+
+        # Broker fallback: for anchor tenors where composite has no data,
+        # try to fill from first available broker source
+        for m in cfg.anchor_tenors_m:
+            if not tenors[m]["hasData"]:
+                for contrib in BROKER_CONTRIBUTORS:
+                    contrib_m = brokers.get(contrib, {}).get(m)
+                    if contrib_m:
+                        log.info("Fallback: %s %dM composite empty, using %s",
+                                 cfg.code, m, contrib)
+                        tenors[m]["T"] = contrib_m["T"]
+                        tenors[m]["T1"] = contrib_m.get("T1", tenors[m]["T1"])
+                        tenors[m]["hasData"] = True
+                        tenors[m]["ric"] = contrib_m["ric"]
+                        tenors[m]["fallbackSource"] = contrib
+                        break
+
         return {
             "ccy": cfg.code, "pair": cfg.pair, "kind": cfg.kind,
             "pipFactor": cfg.pip_factor, "outrightDp": cfg.outright_dp, "pipDp": cfg.pip_dp,
+            "ptsInOutright": cfg.pts_in_outright,
             "tenorsM": cfg.anchor_tenors_m, "anchorTenorsM": cfg.anchor_tenors_m,
             "maxDisplayM": cfg.max_display_m,
             "spreadPack": cfg.spread_pack,
@@ -234,9 +292,13 @@ class MarketService:
             # KEY: dataType tells frontend these are swap points, not outrights
             "dataType": "swapPoints",
             "spot": {"ric": cfg.spot_ric, "T": spot_t, "T1": spot_t1},
+            # NDF 1M outright — frontend uses this to derive implied spot for NDF pairs
+            "ndf1mOutright": ndf_1m_out,
             "tenors": tenors,
             "sofr": sofr,
             "funding": funding,
+            # Broker quotes by contributor
+            "brokers": brokers,
             # IPA-computed values for non-anchor tenors and dates for all tenors.
             # Frontend should prefer these over its own interpolation.
             # Keys are tenor strings: "1W", "2W", "3W", "4M", "5M", etc.
@@ -247,18 +309,25 @@ class MarketService:
     def start_streams(self, ccy: str):
         """Open three streams for active currency."""
         self._active_ccy = ccy
+        self._tick_counts = {"spot": 0, "fwd": 0, "brk": 0}  # reset counters
         cfg = CURRENCIES[ccy]
 
         # Spot — tick granularity
+        # For NDF: also stream 1M outright (ticks frequently, used to derive implied spot)
+        spot_rics = [cfg.spot_ric]
+        if cfg.kind == "NDF":
+            spot_rics.append(cfg.outright_ric(1))  # e.g. TWD1MNDFOR=
+        log.info("Starting SPOT stream for %s: %s", ccy, spot_rics)
         self.lseg.subscribe(
             tag=f"spot-{ccy}",
-            rics=[cfg.spot_ric],
+            rics=spot_rics,
             fields=FIELDS_QUOTE,
             on_update=lambda ric, f: self._on_spot_tick(ric, f),
         )
 
         # Forwards (swap points) — tick but throttled to 15s per RIC
         fwd_rics = [cfg.swap_points_ric(m) for m in cfg.anchor_tenors_m]
+        log.info("Starting FWD stream for %s: %s", ccy, fwd_rics)
         self.lseg.subscribe(
             tag=f"fwd-{ccy}",
             rics=fwd_rics,
@@ -268,6 +337,7 @@ class MarketService:
 
         # Brokers — tick
         br_rics = all_broker_rics(ccy)
+        log.info("Starting BRK stream for %s: %d broker RICs", ccy, len(br_rics))
         if br_rics:
             self.lseg.subscribe(
                 tag=f"brk-{ccy}",
@@ -284,28 +354,53 @@ class MarketService:
             self.lseg.unsubscribe(f"{prefix}-{c}")
 
     def _on_spot_tick(self, ric: str, updates: Dict[str, Any]):
+        self._tick_counts["spot"] = self._tick_counts.get("spot", 0) + 1
         q = self._apply_update(ric, updates)
+        if self._tick_counts["spot"] <= 10:
+            log.info("SPOT tick #%d: %s bid=%s ask=%s mid=%s",
+                     self._tick_counts["spot"], ric, q.bid, q.ask, q.mid())
         self._fanout("spot", {"ric": ric, "bid": q.bid, "ask": q.ask, "mid": q.mid(), "ts": q.ts})
 
     def _on_fwd_tick(self, ric: str, updates: Dict[str, Any]):
+        self._tick_counts["fwd"] = self._tick_counts.get("fwd", 0) + 1
         q = self._apply_update(ric, updates)
+        if self._tick_counts["fwd"] <= 20:
+            log.info("FWD tick #%d: %s bid=%s ask=%s mid=%s",
+                     self._tick_counts["fwd"], ric, q.bid, q.ask, q.mid())
         now = time.time()
         last = self._last_fwd_emit.get(ric, 0.0)
         if now - last >= THROTTLE_FORWARD_SEC:
             self._last_fwd_emit[ric] = now
+            log.info("FWD emit: %s bid=%s ask=%s mid=%s", ric, q.bid, q.ask, q.mid())
             self._fanout("forwards", {"ric": ric, "bid": q.bid, "ask": q.ask, "mid": q.mid(), "ts": q.ts})
 
     def _on_broker_tick(self, ric: str, updates: Dict[str, Any]):
+        self._tick_counts["brk"] = self._tick_counts.get("brk", 0) + 1
         q = self._apply_update(ric, updates)
+        if self._tick_counts["brk"] <= 10:
+            log.info("BRK tick #%d: %s bid=%s ask=%s mid=%s",
+                     self._tick_counts["brk"], ric, q.bid, q.ask, q.mid())
         self._fanout("brokers", {"ric": ric, "bid": q.bid, "ask": q.ask, "mid": q.mid(), "ts": q.ts})
 
     def _apply_update(self, ric: str, updates: Dict[str, Any]) -> Quote:
-        q = self._quotes.get(ric) or Quote()
-        if "BID" in updates: q.bid = _num(updates["BID"])
-        if "ASK" in updates: q.ask = _num(updates["ASK"])
-        if "TRDPRC_1" in updates: q.last = _num(updates["TRDPRC_1"])
-        if "PRIMACT_1" in updates and q.bid is None: q.bid = _num(updates["PRIMACT_1"])
-        if "SEC_ACT_1" in updates and q.ask is None: q.ask = _num(updates["SEC_ACT_1"])
+        q = self._quotes.get(ric)
+        if q is None:
+            q = Quote()
+        # Process updates — dict or pandas-like object
+        try:
+            upd = dict(updates) if not isinstance(updates, dict) else updates
+        except Exception:
+            upd = updates
+        if "BID" in upd:
+            q.bid = _num(upd["BID"])
+        if "ASK" in upd:
+            q.ask = _num(upd["ASK"])
+        if "TRDPRC_1" in upd:
+            q.last = _num(upd["TRDPRC_1"])
+        if "PRIMACT_1" in upd and q.bid is None:
+            q.bid = _num(upd["PRIMACT_1"])
+        if "SEC_ACT_1" in upd and q.ask is None:
+            q.ask = _num(upd["SEC_ACT_1"])
         q.ts = time.time()
         self._quotes[ric] = q
         return q
@@ -332,11 +427,17 @@ class MarketService:
                 log.warning("fanout %s: %s", channel, e)
 
     # ────────────────── history (on demand) ──────────────────
-    def get_history(self, ccy: str, days: int = 60) -> Dict[str, Any]:
-        """Historical daily bars — swap points for NDF, spot+points for deliverable."""
+    def get_history(self, ccy: str, days: int = 60, contributor: str = None) -> Dict[str, Any]:
+        """Historical daily bars — swap points for NDF, spot+points for deliverable.
+        If contributor is provided (e.g. 'TRDS'), use broker-specific RICs instead of composite."""
         cfg = CURRENCIES[ccy]
-        # Use swap points RICs for history (what the market actually trades)
-        rics = all_swap_points_rics(ccy)
+        if contributor:
+            # Broker-specific RICs: e.g. TWD6MNDF=TRDS
+            rics = [cfg.spot_ric]
+            rics.extend(cfg.broker_ric(m, contributor) for m in cfg.anchor_tenors_m)
+        else:
+            # Composite RICs (default)
+            rics = all_swap_points_rics(ccy)
 
         from datetime import datetime, timedelta
         end = datetime.utcnow().date()
@@ -345,7 +446,8 @@ class MarketService:
             rics=rics, fields=["BID", "ASK", "TRDPRC_1"],
             interval="daily", start=start.isoformat(), end=end.isoformat(),
         )
-        return {"ccy": ccy, "pair": cfg.pair, "kind": cfg.kind, "rics": rics, "history": hist}
+        return {"ccy": ccy, "pair": cfg.pair, "kind": cfg.kind, "rics": rics, "history": hist,
+                "contributor": contributor}
 
 
 def _days_for_tenor(m: int) -> int:

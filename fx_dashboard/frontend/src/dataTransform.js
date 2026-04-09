@@ -28,6 +28,17 @@ function snapToRaw(snap) {
     T1: { b: sT1.bid, a: sT1.ask, m: sT1.mid ?? mid(sT1.bid, sT1.ask) },
   };
 
+  // NDF 1M outright (ticks frequently — used to derive implied spot for NDF pairs)
+  RAW.ndf1mOut = null;
+  if (snap.ndf1mOutright) {
+    const oT = snap.ndf1mOutright.T || {}, oT1 = snap.ndf1mOutright.T1 || {};
+    RAW.ndf1mOut = {
+      ric: snap.ndf1mOutright.ric,
+      T: { b: oT.bid, a: oT.ask, m: oT.mid ?? mid(oT.bid, oT.ask) },
+      T1: { b: oT1.bid, a: oT1.ask, m: oT1.mid ?? mid(oT1.bid, oT1.ask) },
+    };
+  }
+
   // Swap points per tenor (PRIMARY data from market-traded RICs)
   RAW.pts = {};
   for (const m of snap.tenorsM) {
@@ -83,15 +94,25 @@ function ipaTenorToMonth(t) {
   return n;
 }
 
+// Build broker swap points RIC for a given ccy/kind/tenor/contributor
+function brokerSwapRic(ccy, kind, m, contrib) {
+  const tenor = m === 0 ? "" : m < 12 ? `${m}M` : m === 12 ? "1Y" : m === 18 ? "18M" : m === 24 ? "2Y" : `${m}M`;
+  if (kind === "NDF") return `${ccy}${tenor}NDF=${contrib}`;
+  return `${ccy}${tenor}=${contrib}`;
+}
+
 // Main build function
-export function buildAllData(snap, liveQuotes = {}) {
+export function buildAllData(snap, liveQuotes = {}, sources = ["DEFAULT"]) {
   if (!snap) return null;
   const { RAW, RAW_SOFR } = snapToRaw(snap);
   const PF = snap.pipFactor || 1e3;
   const dp = snap.outrightDp || 3;
   const pipDp = snap.pipDp || 1;
+  const ptsInOutright = snap.ptsInOutright || false; // LSEG gives pts as outright diff
   const knownM = snap.tenorsM || [1, 2, 3, 6, 9, 12, 18, 24];
   const maxT = snap.maxDisplayM || knownM[knownM.length - 1] || 24;
+  const ccyCode = snap.ccy;
+  const ccyKind = snap.kind;
 
   // IPA data: Workspace-computed values for non-anchor (and anchor) tenors
   // Keys are tenor strings ("1W","2W","3W","4M","1Y",...), values have fwdPoints, impliedYield, days, fixDate, valueDate
@@ -116,29 +137,115 @@ export function buildAllData(snap, liveQuotes = {}) {
   const sBT1 = RAW.spot.T1.b;
   const sAT1 = RAW.spot.T1.a;
 
+  // NDF: derive implied spot from 1M outright - 1M swap points / PF
+  // The 1M outright ticks frequently on LSEG for NDF, making this the responsive anchor.
+  const isNDF = snap.kind === "NDF";
+  const ndf1mOutRic = RAW.ndf1mOut?.ric;
+
+  function deriveNdfSpot(dk) {
+    // Get 1M outright (live or snapshot)
+    let out1m;
+    if (dk === "T") {
+      const lqOut = ndf1mOutRic ? liveQuotes[ndf1mOutRic] : null;
+      out1m = lqOut
+        ? { b: lqOut.bid, a: lqOut.ask, m: lqOut.mid ?? mid(lqOut.bid, lqOut.ask) }
+        : RAW.ndf1mOut?.T;
+    } else {
+      out1m = RAW.ndf1mOut?.T1;
+    }
+    if (!out1m?.m) return null;
+
+    // Get 1M swap points (live or snapshot)
+    const pts1m = getPts(1, dk);
+    const ptsM = pts1m?.m ?? 0;
+
+    // spot = 1M_outright - 1M_swap_points
+    // If ptsInOutright: pts are outright diffs, subtract directly
+    // If not: pts are in pip units, divide by PF first
+    const ptsDiff = ptsInOutright ? ptsM : ptsM / PF;
+    const derivedM = out1m.m - ptsDiff;
+    const ptsDiffA = ptsInOutright ? (pts1m.a ?? 0) : (pts1m.a ?? 0) / PF;
+    const ptsDiffB = ptsInOutright ? (pts1m.b ?? 0) : (pts1m.b ?? 0) / PF;
+    const derivedB = out1m.b != null ? out1m.b - ptsDiffA : derivedM;
+    const derivedA = out1m.a != null ? out1m.a - ptsDiffB : derivedM;
+    return { b: derivedB, m: derivedM, a: derivedA };
+  }
+
   // Live quote override for spot
   function getLiveSpot(dk) {
     if (dk === "T") {
+      // For NDF: derive spot from 1M outright (ticks frequently)
+      if (isNDF && RAW.ndf1mOut) {
+        const derived = deriveNdfSpot("T");
+        if (derived) return derived;
+      }
+      // Fallback: use direct spot RIC
       const spotRic = snap.spot?.ric;
       const lq = liveQuotes[spotRic];
       if (lq) return { b: lq.bid ?? sBT, a: lq.ask ?? sAT, m: lq.mid ?? mid(lq.bid ?? sBT, lq.ask ?? sAT) };
       return RAW.spot.T;
     }
+    // T1: for NDF use derived spot too
+    if (isNDF && RAW.ndf1mOut) {
+      const derived = deriveNdfSpot("T1");
+      if (derived) return derived;
+    }
     return RAW.spot.T1;
   }
 
-  // Get swap points for a tenor, with live override
+  // Broker data from snapshot: { contrib: { tenor_m: { ric, T: {bid,ask,...}, T1: {...} } } }
+  const BROKERS = snap.brokers || {};
+
+  // Get swap points for a tenor, with live override + multi-source averaging
   function getPts(m, dk) {
     const raw = RAW.pts[m];
     if (!raw) return { b: null, m: null, a: null };
     const base = raw[dk] || { b: null, m: null, a: null };
-    if (dk === "T" && snap.tenors) {
-      const tenorData = snap.tenors[m] || snap.tenors[String(m)];
-      const ric = tenorData?.ric;
-      const lq = liveQuotes[ric];
-      if (lq) return { b: lq.bid ?? base.b, m: lq.mid ?? mid(lq.bid, lq.ask) ?? base.m, a: lq.ask ?? base.a };
+    if (dk !== "T") return base;
+
+    // Collect values from all selected sources
+    const vals = []; // each: { b, m, a }
+
+    for (const src of sources) {
+      if (src === "DEFAULT") {
+        // Composite RIC (live or snapshot)
+        const tenorData = snap.tenors?.[m] || snap.tenors?.[String(m)];
+        const ric = tenorData?.ric;
+        const lq = liveQuotes[ric];
+        if (lq && (lq.bid != null || lq.ask != null)) {
+          vals.push({ b: lq.bid, m: lq.mid ?? mid(lq.bid, lq.ask), a: lq.ask });
+        } else if (base.b != null || base.a != null) {
+          vals.push(base);
+        }
+      } else {
+        // Broker source: check liveQuotes first, then snapshot brokers
+        const bRic = brokerSwapRic(ccyCode, ccyKind, m, src);
+        const lq = liveQuotes[bRic];
+        if (lq && (lq.bid != null || lq.ask != null)) {
+          vals.push({ b: lq.bid, m: lq.mid ?? mid(lq.bid, lq.ask), a: lq.ask });
+        } else {
+          // Fallback to snapshot broker data
+          const bSnap = BROKERS[src]?.[m]?.T || BROKERS[src]?.[String(m)]?.T;
+          if (bSnap && (bSnap.bid != null || bSnap.ask != null)) {
+            vals.push({ b: bSnap.bid, m: bSnap.mid ?? mid(bSnap.bid, bSnap.ask), a: bSnap.ask });
+          }
+        }
+      }
     }
-    return base;
+
+    if (vals.length === 0) return base;
+    if (vals.length === 1) return vals[0];
+
+    // Average across sources
+    const avg = (arr) => {
+      const valid = arr.filter(v => v != null);
+      return valid.length > 0 ? valid.reduce((a, b) => a + b, 0) / valid.length : null;
+    };
+    return {
+      b: avg(vals.map(v => v.b)),
+      m: avg(vals.map(v => v.m)),
+      a: avg(vals.map(v => v.a)),
+    };
   }
 
   // Build anchor arrays for interpolation (using swap points)
@@ -217,12 +324,38 @@ export function buildAllData(snap, liveQuotes = {}) {
 
     const spot = getLiveSpot("T");
     const spot1 = getLiveSpot("T1");
-    const bT = month === 0 ? spot.b : (spot.m != null && spB != null ? spot.m + spB / PF : null);
-    const aT = month === 0 ? spot.a : (spot.m != null && spA != null ? spot.m + spA / PF : null);
-    const mT = month === 0 ? spot.m : (spot.m != null && spM != null ? spot.m + spM / PF : null);
-    const bT1 = month === 0 ? spot1.b : (spot1.m != null && spB1 != null ? spot1.m + spB1 / PF : null);
-    const aT1 = month === 0 ? spot1.a : (spot1.m != null && spA1 != null ? spot1.m + spA1 / PF : null);
-    const mT1 = month === 0 ? spot1.m : (spot1.m != null && spM1 != null ? spot1.m + spM1 / PF : null);
+
+    // For NDF 1M: use direct outright from LSEG (it ticks frequently)
+    let bT, aT, mT, bT1, aT1, mT1;
+    if (isNDF && month === 1 && RAW.ndf1mOut) {
+      // 1M outright = direct from LSEG TWD1MNDFOR= (not computed from spot+pts)
+      const lqOut = ndf1mOutRic ? liveQuotes[ndf1mOutRic] : null;
+      const out1 = lqOut
+        ? { b: lqOut.bid, a: lqOut.ask, m: lqOut.mid ?? mid(lqOut.bid, lqOut.ask) }
+        : RAW.ndf1mOut.T;
+      const out1_1 = RAW.ndf1mOut.T1;
+      bT = out1?.b ?? out1?.m; aT = out1?.a ?? out1?.m; mT = out1?.m;
+      bT1 = out1_1?.b ?? out1_1?.m; aT1 = out1_1?.a ?? out1_1?.m; mT1 = out1_1?.m;
+    } else if (month === 0) {
+      bT = spot.b; aT = spot.a; mT = spot.m;
+      bT1 = spot1.b; aT1 = spot1.a; mT1 = spot1.m;
+    } else if (ptsInOutright) {
+      // LSEG gives swap points as outright difference — add directly (no PF division)
+      bT = spot.m != null && spB != null ? spot.m + spB : null;
+      aT = spot.m != null && spA != null ? spot.m + spA : null;
+      mT = spot.m != null && spM != null ? spot.m + spM : null;
+      bT1 = spot1.m != null && spB1 != null ? spot1.m + spB1 : null;
+      aT1 = spot1.m != null && spA1 != null ? spot1.m + spA1 : null;
+      mT1 = spot1.m != null && spM1 != null ? spot1.m + spM1 : null;
+    } else {
+      // LSEG gives swap points in pip units — divide by PF to get outright diff
+      bT = spot.m != null && spB != null ? spot.m + spB / PF : null;
+      aT = spot.m != null && spA != null ? spot.m + spA / PF : null;
+      mT = spot.m != null && spM != null ? spot.m + spM / PF : null;
+      bT1 = spot1.m != null && spB1 != null ? spot1.m + spB1 / PF : null;
+      aT1 = spot1.m != null && spA1 != null ? spot1.m + spA1 / PF : null;
+      mT1 = spot1.m != null && spM1 != null ? spot1.m + spM1 / PF : null;
+    }
 
     const sofTRaw = month > 0 && sT.mo.length > 0 ? iST(Math.min(month, 24)) : null;
     const sofT1Raw = month > 0 && sT1.mo.length > 0 ? iST1(Math.min(month, 24)) : null;
@@ -257,12 +390,20 @@ export function buildAllData(snap, liveQuotes = {}) {
     const valDate = immVD || ipaValDate || td.valDate || (daysOvr ? dateFromSpot(SPOT_DATE, daysOvr) : null);
     const fixDate = ipaFixDate || (valDate ? bizBefore(valDate, 2) : td.fixDate);
 
+    // Convert swap points to pip display units if LSEG gives outright diffs
+    const dpB = ptsInOutright && spB != null ? spB * PF : spB;
+    const dpM = ptsInOutright && spM != null ? spM * PF : spM;
+    const dpA = ptsInOutright && spA != null ? spA * PF : spA;
+    const dpB1 = ptsInOutright && spB1 != null ? spB1 * PF : spB1;
+    const dpM1 = ptsInOutright && spM1 != null ? spM1 * PF : spM1;
+    const dpA1 = ptsInOutright && spA1 != null ? spA1 * PF : spA1;
+
     return {
       tenor: label || (month === 0 ? "Spot" : month <= 12 ? `${month}M` : month === 24 ? "2Y" : `${month}M`),
       month, dT, dT1, dataSource,
       bT, aT, mT, bT1, aT1, mT1,
-      spB, spM, spA, spB1, spM1, spA1,
-      ptsPerDay: dT > 0 && spM != null ? spM / dT : null,
+      spB: dpB, spM: dpM, spA: dpA, spB1: dpB1, spM1: dpM1, spA1: dpA1,
+      ptsPerDay: dT > 0 && dpM != null ? dpM / dT : null,
       sofT, sofT1, iyB, iyM, iyA, iyB1, iyM1, iyA1,
       basisT, basisT1, iyBpD,
       interp: !isK && month !== 0,
@@ -310,14 +451,16 @@ export function buildAllData(snap, liveQuotes = {}) {
     r.sofChg = r.sofT != null && r.sofT1 != null ? r.sofT - r.sofT1 : null;
     r.basChg = r.basisT != null && r.basisT1 != null ? r.basisT - r.basisT1 : null;
     r.ffIyChg = r.ffIyM != null && r.ffIyM1 != null ? r.ffIyM - r.ffIyM1 : null;
-    // Carry: null if underlying is null
-    r.carryOutP = r.ffM;
-    r.carryFfP = i >= 2 && r.ffM != null && p?.ffM != null ? r.ffM - p.ffM : (i === 1 ? r.ffM : null);
-    r.carryOutY = i > 0 && r.iyM != null && p?.iyM != null ? r.iyM - p.iyM : null;
-    r.carryFfY = i >= 2 && r.ffIyM != null && p?.ffIyM != null ? r.ffIyM - p.ffIyM : (i === 1 ? r.ffIyM : null);
-    // Roll-down: null if underlying is null
-    r.rollPts = i >= 2 && r.ffM != null && p?.ffM != null ? r.ffM - p.ffM : null;
-    r.rollIy = i >= 2 && r.ffIyM != null && p?.ffIyM != null ? r.ffIyM - p.ffIyM : null;
+    // Carry = fwd-fwd points for the marginal period (what you earn holding)
+    //   carryP (pips): the fwd-fwd swap points for period [i-1, i]
+    //   carryY (yield): the fwd-fwd implied yield for period [i-1, i]
+    r.carryP = r.ffM;
+    r.carryY = r.ffIyM;
+    // Roll-down = change in carry as position ages one period (curve convexity benefit)
+    //   rollP (pips): carry[i] - carry[i-1]  (how fwd-fwd changes along the curve)
+    //   rollY (yield): same in yield terms
+    r.rollP = i >= 2 && r.ffM != null && p?.ffM != null ? r.ffM - p.ffM : (i === 1 ? r.ffM : null);
+    r.rollY = i >= 2 && r.ffIyM != null && p?.ffIyM != null ? r.ffIyM - p.ffIyM : (i === 1 ? r.ffIyM : null);
   }
 
   // IMM D/D
@@ -363,7 +506,7 @@ export function buildAllData(snap, liveQuotes = {}) {
     const fSof1 = haveSof1 ? ((1 + fr.sofT1 / 100 * fr.dT1 / 360) / (1 + nr.sofT1 / 100 * nr.dT1 / 360) - 1) * 360 / ds * 100 : null;
     const bas = fIy != null && fSof != null ? fIy - fSof : null;
     return {
-      label, pB, pM, pA, pB1, pM1, pA1, chg: pM != null && pM1 != null ? pM - pM1 : null, days: ds,
+      label, nrM, frM, pB, pM, pA, pB1, pM1, pA1, chg: pM != null && pM1 != null ? pM - pM1 : null, days: ds,
       nrVD: nr.valDate, frVD: fr.valDate, nrFxD: nr.fixDate, frFxD: fr.fixDate,
       nrDT: nr.dT, frDT: fr.dT,
       fIyB, fIy, fIyA, fIy1,
@@ -413,6 +556,7 @@ export function buildAllData(snap, liveQuotes = {}) {
     const fSof1 = haveSofImm1 ? ((1 + fr.sofT1 / 100 * fr.dT1 / 360) / (1 + nr.sofT1 / 100 * nr.dT1 / 360) - 1) * 360 / ds * 100 : null;
     immSpr.push({
       label: `${nr.tenor.split(" ")[1] || nr.tenor}→${fr.tenor.split(" ")[1] || fr.tenor}`,
+      nrM: nr.month, frM: fr.month,
       pB, pM, pA, pB1: null, pM1, pA1: null, chg: pM != null && pM1 != null ? pM - pM1 : null, days: ds,
       nrVD: nr.valDate, frVD: fr.valDate, nrFxD: nr.fixDate, frFxD: fr.fixDate,
       nrDT: nr.dT, frDT: fr.dT,
@@ -426,7 +570,7 @@ export function buildAllData(snap, liveQuotes = {}) {
   }
 
   const funding = RAW.funding || {};
-  const cfg = { pair: snap.pair, pipFactor: PF, dp, pipDp, kind: snap.kind, spreadPack: snap.spreadPack };
+  const cfg = { pair: snap.pair, pipFactor: PF, dp, pipDp, kind: snap.kind, spreadPack: snap.spreadPack, ptsInOutright };
   return {
     rows, immR, anchors, qFF, spSpr, immSpr, funding,
     sMT, sMT1, sBT, sAT, cfg, ccy: snap.ccy, maxT,

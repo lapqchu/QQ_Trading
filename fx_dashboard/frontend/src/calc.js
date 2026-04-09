@@ -150,16 +150,28 @@ function bbRevertStrategy(d) { const bb = calcBB(d, 20, 2); return d.map((v, i) 
 function rsiFadeStrategy(d) { const rsi = calcRSI(d, 14); return rsi.map(v => v == null ? 0 : (v > 70 ? -1 : v < 30 ? 1 : 0)); }
 
 function runBacktest(name, data, signals) {
+  // Swap-point backtest: absolute point returns, NOT percentage returns.
+  // Return on day i = (pts[i] - pts[i-1]) * position[i-1]
+  // position ∈ {-1, 0, +1} from strategy signal.
+  // Percentage returns break when points are near zero and are economically
+  // meaningless for swap-point trading where P&L is linear in point moves.
   const n = data.length; const dates = data.map(d => d.date); const rets = [];
-  for (let i = 1; i < n; i++) { const r = (data[i].value - data[i - 1].value) / data[i - 1].value; rets.push(signals[i - 1] * r); }
-  const eqC = [1]; for (let i = 0; i < rets.length; i++) eqC.push(eqC[i] * (1 + rets[i]));
-  const cumRet = eqC[eqC.length - 1] - 1; let peak = 1, maxDD = 0;
-  for (let i = 0; i < eqC.length; i++) { if (eqC[i] > peak) peak = eqC[i]; const dd = (eqC[i] - peak) / peak; if (dd < maxDD) maxDD = dd; }
+  for (let i = 1; i < n; i++) {
+    const ptChg = data[i].value - data[i - 1].value;  // absolute point change
+    rets.push(signals[i - 1] * ptChg);                 // P&L = position * Δpts
+  }
+  // Additive equity curve (cumulative P&L in points, starts at 0)
+  const eqC = [0]; for (let i = 0; i < rets.length; i++) eqC.push(eqC[i] + rets[i]);
+  const cumRet = eqC[eqC.length - 1];  // total accumulated points
+  // Max drawdown in absolute points
+  let peak = 0, maxDD = 0;
+  for (let i = 0; i < eqC.length; i++) { if (eqC[i] > peak) peak = eqC[i]; const dd = eqC[i] - peak; if (dd < maxDD) maxDD = dd; }
+  // Sharpe on absolute point returns (mean daily pts / std daily pts * √252)
   const mean = rets.reduce((a, b) => a + b, 0) / rets.length;
   const std = Math.sqrt(rets.reduce((a, b) => a + (b - mean) ** 2, 0) / rets.length);
   const sharpe = std > 0 ? (mean / std) * Math.sqrt(252) : 0;
   const wins = rets.filter(r => r > 0).length; const winRate = rets.length > 0 ? wins / rets.length : 0;
-  // Rolling sharpe
+  // Rolling sharpe (20d window, point returns)
   const rollSh = []; for (let i = 0; i < rets.length; i++) {
     if (i < 19) { rollSh.push(null); continue; }
     const sl = rets.slice(i - 19, i + 1); const m = sl.reduce((a, b) => a + b, 0) / 20;
