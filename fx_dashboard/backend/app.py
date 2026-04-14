@@ -110,15 +110,42 @@ def get_snapshot(ccy: str) -> Dict[str, Any]:
 
 
 @app.get("/api/history/{ccy}")
-def get_history(ccy: str, days: int = Query(60, ge=10, le=500), contributor: str = Query(None)) -> Dict[str, Any]:
+def get_history(
+    ccy: str,
+    period: str = Query("1Y"),
+    contributor: str | None = Query(None),
+    extra_rics: str | None = Query(None, description="comma-separated RICs to include alongside composite"),
+    tenor: str | None = Query(None, description="ON|TN|SN — if set, overrides RIC list with funding RICs for that tenor"),
+) -> Dict[str, Any]:
     if ccy not in CURRENCIES:
         raise HTTPException(404, f"Unknown currency: {ccy}")
     if not lseg or not lseg.is_open():
         raise HTTPException(503, "LSEG session not open")
     try:
-        return market.get_history(ccy, days=days, contributor=contributor)
+        extras = [r.strip() for r in extra_rics.split(",")] if extra_rics else None
+        return market.get_history(ccy, period=period, contributor=contributor, extra_rics=extras, tenor=tenor)
     except Exception as e:
         log.exception("history %s failed", ccy)
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/history-custom/{ccy}")
+def get_history_custom(
+    ccy: str,
+    near: str = Query(..., description="near date ISO YYYY-MM-DD"),
+    far: str = Query(..., description="far date ISO YYYY-MM-DD"),
+    period: str = Query("1Y"),
+    contributor: str | None = Query(None),
+) -> Dict[str, Any]:
+    if ccy not in CURRENCIES:
+        raise HTTPException(404, f"Unknown currency: {ccy}")
+    if not lseg or not lseg.is_open():
+        raise HTTPException(503, "LSEG session not open")
+    try:
+        return market.get_history_custom_dates(ccy, near_date=near, far_date=far,
+                                               period=period, contributor=contributor)
+    except Exception as e:
+        log.exception("history-custom %s failed", ccy)
         raise HTTPException(500, str(e))
 
 

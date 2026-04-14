@@ -1,51 +1,130 @@
 """
 Market data service — orchestrates snapshots + streaming for the FX dashboard.
 
-KEY DESIGN: The market trades two components — SPOT and SWAP POINTS.
-We fetch swap points RICs (e.g. TWD1MNDF=) as the primary data source,
-NOT outright RICs. Outrights are derived: outright = spot + points/PF.
+KEY INVARIANTS
+  1. For each tenor we publish an explicit per-source dict ("sources"):
+     { "composite": {...}, "FMD": {...}, "BGCP": {...}, ... }
+     Each entry carries its own bid/ask/mid, TIMACT ts, ageSec, freshness
+     bucket ('fresh' | 'stale' | 'very_stale'), and valueMode ('pips'|'outright').
+  2. No silent fallbacks. Frontend decides how to aggregate — we don't fill
+     composite from broker or vice versa.
+  3. 18M NDF tenors: composite slot is absent; frontend shows only the
+     configured broker fallbacks (e.g. FMD).
+  4. NGN (derive_from_outrights): per-broker "sources" entries carry
+     {outright_bid, outright_ask} AND derived {bid, ask} in market points
+     convention. Frontend can display either.
+  5. Funding tenors (ON/TN/SN) publish the same per-source dict shape.
 
-This ensures bid/ask spreads on swap points are accurate (market-traded
-widths) rather than artificially wide from crossing two outright prices.
-
-Channels:
-  • spot      → every tick
-  • forwards  → every 15s (debounced per RIC)
-  • brokers   → every tick (broker monitor)
+STALENESS
+  fresh      < 10 min
+  stale      10 min – 1 h
+  very_stale > 1 h
 """
 
 from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Dict, List, Any, Callable, Optional, Set
-from dataclasses import dataclass, field
+from datetime import datetime, date, timedelta
+from typing import Dict, List, Any, Optional, Set, Tuple
+from dataclasses import dataclass
 
 from lseg_client import LsegClient
 from ric_config import (
-    CURRENCIES, SOFR_RICS, CurrencyConfig, FUNDING_TENORS,
+    CURRENCIES, SOFR_RICS, FUNDING_TENORS, BROKER_META,
+    CurrencyConfig,
     all_swap_points_rics, all_outright_rics, all_broker_rics, all_funding_rics,
 )
 
+
+def _sofr_ric_for_tenor(tenor: Optional[str]) -> Optional[str]:
+    """Map a tenor code (e.g. '1M', '3M', '1Y') to the nearest SOFR RIC."""
+    if not tenor:
+        return None
+    t = tenor.upper().strip()
+    m = None
+    try:
+        if t.endswith("Y"):
+            m = int(t[:-1]) * 12
+        elif t.endswith("M"):
+            m = int(t[:-1])
+        elif t.endswith("W"):
+            m = max(1, int(t[:-1]) // 4)
+    except (TypeError, ValueError):
+        return None
+    if m is None:
+        return None
+    # pick nearest available key in SOFR_RICS
+    keys = sorted(SOFR_RICS.keys())
+    nearest = min(keys, key=lambda k: abs(k - m))
+    return SOFR_RICS[nearest]
+
 log = logging.getLogger(__name__)
 
-FIELDS_QUOTE = ["BID", "ASK", "PRIMACT_1", "SEC_ACT_1", "TRDPRC_1", "HST_CLOSE", "GEN_VAL1", "TIMACT"]
+FIELDS_QUOTE = ["BID", "ASK", "PRIMACT_1", "SEC_ACT_1", "TRDPRC_1",
+                "HST_CLOSE", "GEN_VAL1", "TIMACT"]
+
 THROTTLE_FORWARD_SEC = 15.0
+FRESH_SEC = 10 * 60       # < 10 min
+STALE_SEC = 60 * 60       # < 1 h    (above → very_stale)
 
 
+# ─────────────────────────────────────────────────────────────
+# QUOTE STORE
+# ─────────────────────────────────────────────────────────────
 @dataclass
 class Quote:
     bid: Optional[float] = None
     ask: Optional[float] = None
     last: Optional[float] = None
-    ts: Optional[float] = None
+    ts: Optional[float] = None          # our receive-time (unix)
+    timact: Optional[str] = None        # LSEG TIMACT field (HH:MM:SS source clock)
+    timact_ts: Optional[float] = None   # TIMACT converted to unix (today's date)
 
     def mid(self) -> Optional[float]:
         if self.bid is not None and self.ask is not None:
             return (self.bid + self.ask) / 2
-        return self.last  # fallback to last if no bid/ask
+        return self.last
 
 
+def _parse_timact(timact: Any) -> Optional[float]:
+    """TIMACT is HH:MM:SS string on source's clock. Convert to today's unix ts (UTC)."""
+    if timact is None:
+        return None
+    try:
+        import pandas as pd
+        if pd.isna(timact):
+            return None
+    except (TypeError, ValueError):
+        pass
+    s = str(timact).strip()
+    if not s or s in ("<NA>", "NaT", "nan", "None"):
+        return None
+    try:
+        parts = s.split(":")
+        if len(parts) < 2:
+            return None
+        h, m = int(parts[0]), int(parts[1])
+        sec = int(parts[2]) if len(parts) > 2 else 0
+        today = datetime.utcnow().date()
+        dt = datetime(today.year, today.month, today.day, h, m, sec)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
+def _freshness(ts: Optional[float]) -> str:
+    if ts is None:
+        return "unknown"
+    age = time.time() - ts
+    if age < FRESH_SEC:
+        return "fresh"
+    if age < STALE_SEC:
+        return "stale"
+    return "very_stale"
+
+
+# ─────────────────────────────────────────────────────────────
 class MarketService:
     def __init__(self, lseg: LsegClient):
         self.lseg = lseg
@@ -56,356 +135,382 @@ class MarketService:
         }
         self._active_ccy: Optional[str] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._tick_counts: Dict[str, int] = {}  # diagnostic counters
+        self._tick_counts: Dict[str, int] = {}
+        # IPA day-cache: Workspace's IPA endpoint serializes concurrent calls
+        # (~1s each), and fix/value dates don't change intraday — cache per
+        # (pair, date_str) and invalidate at midnight UTC.
+        self._ipa_cache: Dict[str, Any] = {}        # key: f"{pair}@{date}"
+        self._tomfix_cache: Dict[str, Any] = {}
+        self._t1_cache: Dict[str, Quote] = {}       # key: f"{ric}@{date}"
 
     def set_loop(self, loop: asyncio.AbstractEventLoop):
         self._loop = loop
 
     # ────────────────── snapshot ──────────────────
     def build_snapshot(self, ccy: str) -> Dict[str, Any]:
-        """Pull a one-shot snapshot for a currency.
-        Fetches SWAP POINTS (primary) + spot + SOFR + IPA for non-anchor tenors."""
         cfg = CURRENCIES[ccy]
 
-        # Build RIC list: spot + swap points + SOFR + funding (deliverables) + brokers
-        swap_pts_rics = all_swap_points_rics(ccy)  # includes spot
+        composite_rics = all_swap_points_rics(ccy)            # includes spot
+        outright_rics = all_outright_rics(ccy)                # NGN MBGL outrights
+        broker_rics = all_broker_rics(ccy)                    # swap pts per broker
         sofr_rics = list(SOFR_RICS.values())
-        funding_rics = all_funding_rics(ccy)
-        broker_rics = all_broker_rics(ccy)  # all 4 contributors × anchor tenors
-        all_rics = swap_pts_rics + sofr_rics + funding_rics + broker_rics
-        # For NDF: also fetch 1M outright (ticks frequently, used to derive implied spot)
-        ndf_1m_outright_ric = None
-        if cfg.kind == "NDF":
-            ndf_1m_outright_ric = cfg.outright_ric(1)  # e.g. TWD1MNDFOR=
-            if ndf_1m_outright_ric not in all_rics:
-                all_rics.append(ndf_1m_outright_ric)
+        funding_rics = all_funding_rics(ccy)                  # deliverables only
 
-        log.info("Snapshot for %s: %d RICs (%d swap, %d broker, %d sofr, %d funding)",
-                 ccy, len(all_rics), len(swap_pts_rics), len(broker_rics),
-                 len(sofr_rics), len(funding_rics))
+        # Also fetch 1M NDF outright for implied-spot derivation
+        ndf_1m_out_ric = None
+        if cfg.kind == "NDF" and not cfg.derive_from_outrights:
+            ndf_1m_out_ric = f"{cfg.code}1MNDFOR="
+        extra = [ndf_1m_out_ric] if ndf_1m_out_ric else []
 
-        # T (current) — live snapshot
+        all_rics = list({*composite_rics, *outright_rics, *broker_rics,
+                         *sofr_rics, *funding_rics, *extra})
+
+        log.info("Snapshot %s: %d RICs (comp=%d brk=%d out=%d fund=%d)",
+                 ccy, len(all_rics), len(composite_rics), len(broker_rics),
+                 len(outright_rics), len(funding_rics))
+
+        # T snapshot
         data_t = self.lseg.get_snapshot(all_rics, FIELDS_QUOTE)
         now = time.time()
         for ric, fields in data_t.items():
-            # Use _first: pick first non-None value (do NOT use `or` — 0.0 is valid data)
-            bid = _num(fields.get("BID"))
-            if bid is None:
-                bid = _num(fields.get("PRIMACT_1"))
-            ask = _num(fields.get("ASK"))
-            if ask is None:
-                ask = _num(fields.get("SEC_ACT_1"))
-            last = _num(fields.get("TRDPRC_1"))
-            if last is None:
-                last = _num(fields.get("HST_CLOSE"))
-            if last is None:
-                last = _num(fields.get("GEN_VAL1"))
-            q = Quote(bid=bid, ask=ask, last=last, ts=now)
-            self._quotes[ric] = q
+            bid = _num(fields.get("BID"))  or _num(fields.get("PRIMACT_1"))
+            ask = _num(fields.get("ASK"))  or _num(fields.get("SEC_ACT_1"))
+            last = _num(fields.get("TRDPRC_1")) or _num(fields.get("HST_CLOSE")) or _num(fields.get("GEN_VAL1"))
+            timact_raw = fields.get("TIMACT")
+            timact_ts = _parse_timact(timact_raw)
+            timact_str = None
+            if timact_ts is not None:
+                timact_str = str(timact_raw)
+            self._quotes[ric] = Quote(bid=bid, ask=ask, last=last, ts=now,
+                                      timact=timact_str, timact_ts=timact_ts)
 
-        # T1 (previous close) — from daily history
-        t1_quotes: Dict[str, Quote] = {}
-        try:
-            hist = self.lseg.get_history(
-                rics=all_rics, fields=["BID", "ASK", "TRDPRC_1"],
-                interval="daily", count=2,
-            )
-            for ric, bars in hist.items():
-                if not bars:
-                    continue
-                bar = bars[-1] if len(bars) == 1 else bars[-2]
-                t1_quotes[ric] = Quote(
-                    bid=_num(bar.get("BID")), ask=_num(bar.get("ASK")),
-                    last=_num(bar.get("TRDPRC_1")), ts=None,
-                )
-        except Exception as e:
-            log.warning("T1 fetch failed: %s", e)
+        # T1 (prev close) — composite swap pts + spot + SOFR only; cached per
+        # (ric, date) since prev-close doesn't change intraday.
+        t1_rics = [cfg.spot_ric] + [r for r in composite_rics if r != cfg.spot_ric] + sofr_rics
+        today_iso = date.today().isoformat()
+        t1: Dict[str, Quote] = {}
+        uncached: List[str] = []
+        for r in t1_rics:
+            cached = self._t1_cache.get(f"{r}@{today_iso}")
+            if cached is not None:
+                t1[r] = cached
+            else:
+                uncached.append(r)
+        if uncached:
+            try:
+                hist = self.lseg.get_history(uncached, ["BID", "ASK", "TRDPRC_1"],
+                                             interval="daily", count=2)
+                for ric, bars in hist.items():
+                    if not bars:
+                        continue
+                    bar = bars[-1] if len(bars) == 1 else bars[-2]
+                    q = Quote(bid=_num(bar.get("BID")), ask=_num(bar.get("ASK")),
+                              last=_num(bar.get("TRDPRC_1")))
+                    t1[ric] = q
+                    self._t1_cache[f"{ric}@{today_iso}"] = q
+            except Exception as e:
+                log.warning("T1 fetch failed: %s", e)
 
-        # IPA enrichment: get Workspace-computed values for non-anchor display tenors
-        # This covers weekly tenors and any month that isn't a direct RIC anchor
+        # IPA enrichment (non-anchor tenors, fix/value dates)
         ipa_data = self._fetch_ipa_tenors(cfg)
 
-        return self._serialize_snapshot(cfg, t1_quotes, ipa_data)
+        tomfix_pl = self._fetch_tomfix_cached(cfg)
+
+        return self._serialize(cfg, t1, ipa_data, ndf_1m_out_ric, tomfix_pl)
 
     def _fetch_ipa_tenors(self, cfg: CurrencyConfig) -> Dict[str, Any]:
         """
-        Call Workspace IPA for non-anchor tenors.
-
-        Returns dict: { tenor_str: {fwdPoints, fwdRate, impliedYield, days, fixDate, valueDate, ...} }
+        IPA enrichment for anchor tenors + 1W only. Non-anchor tenors
+        (4M/5M/7M/8M/10M/11M/13-17M/19-23M) are interpolated client-side
+        from anchor days — avoids ~20 extra IPA calls per snapshot.
+        Result is cached per (pair, today) — dates don't change intraday.
         """
-        anchor_set = set(cfg.anchor_tenors_m)
-        ipa_tenors = []
+        cache_key = f"{cfg.pair}@{date.today().isoformat()}"
+        if cache_key in self._ipa_cache:
+            return self._ipa_cache[cache_key]
 
-        # Weekly tenors: 1W, 2W, 3W
-        ipa_tenors.extend(["1W", "2W", "3W"])
-
-        # Non-anchor monthly tenors up to max display
-        for m in range(1, cfg.max_display_m + 1):
-            if m not in anchor_set:
-                if m < 12:
-                    ipa_tenors.append(f"{m}M")
-                elif m == 12:
-                    ipa_tenors.append("1Y")
-                elif m == 18:
-                    ipa_tenors.append("18M")
-                elif m == 24:
-                    ipa_tenors.append("2Y")
-                else:
-                    ipa_tenors.append(f"{m}M")
-
-        # Also get IPA for anchor tenors — for fix/value dates and cross-check
-        for m in cfg.anchor_tenors_m:
-            if m < 12:
-                ipa_tenors.append(f"{m}M")
-            elif m == 12:
-                ipa_tenors.append("1Y")
-            elif m == 18:
-                ipa_tenors.append("18M")
-            elif m == 24:
-                ipa_tenors.append("2Y")
-
-        if not ipa_tenors:
-            return {}
-
+        tenors = ["1W"] + [_ipa_tenor_code(m) for m in cfg.anchor_tenors_m]
         try:
-            log.info("IPA batch for %s: %s", cfg.pair, ipa_tenors)
-            results = self.lseg.calc_fx_forward_batch(cfg.pair, ipa_tenors)
-            ipa_out = {}
-            for tenor, data in results.items():
-                if data:
-                    ipa_out[tenor] = data
-            log.info("IPA returned data for %d/%d tenors on %s", len(ipa_out), len(ipa_tenors), cfg.pair)
-            return ipa_out
+            out = {t: d for t, d in self.lseg.calc_fx_forward_batch(cfg.pair, tenors, kind=cfg.kind).items() if d}
         except Exception as e:
-            log.warning("IPA batch for %s failed (non-anchor tenors will use interpolation): %s", cfg.pair, e)
-            return {}
+            log.warning("IPA batch %s failed: %s", cfg.pair, e)
+            out = {}
+        self._ipa_cache[cache_key] = out
+        return out
 
-    def _serialize_snapshot(self, cfg: CurrencyConfig, t1_quotes: Optional[Dict[str, Quote]] = None, ipa_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Package cached quotes into a dashboard-friendly structure.
+    def _fetch_tomfix_cached(self, cfg: CurrencyConfig):
+        if cfg.kind != "NDF":
+            return None
+        cache_key = f"{cfg.pair}@{date.today().isoformat()}"
+        if cache_key in self._tomfix_cache:
+            return self._tomfix_cache[cache_key]
+        try:
+            res = self.lseg.calc_tomfix_plus_1bd(cfg.pair, kind=cfg.kind)
+        except Exception as e:
+            log.info("calc_tomfix_plus_1bd %s failed: %s", cfg.pair, e)
+            res = None
+        self._tomfix_cache[cache_key] = res
+        return res
 
-        KEY: For each tenor, we send swap points bid/ask directly from the RIC.
-        The frontend uses these as the primary anchor for all calculations.
-        Outrights are computed: outright = spot + points / pip_factor.
+    # ────────────────── serialise ──────────────────
+    def _serialize(self, cfg: CurrencyConfig, t1: Dict[str, Quote],
+                   ipa: Dict[str, Any], ndf_1m_out_ric: Optional[str],
+                   tomfix_pl: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        spot_t = self._ser_ric(cfg.spot_ric, "T")
+        spot_t1 = self._ser_ric(cfg.spot_ric, "T", t1=t1)
 
-        IPA data is included for non-anchor tenors and for fix/value dates on all tenors.
-        The frontend should prefer IPA values over its own interpolation.
-        """
-        t1 = t1_quotes or {}
-        ipa = ipa_data or {}
-
-        def _q(ric, dk="T"):
-            if dk == "T1":
-                return t1.get(ric, Quote())
-            return self._quotes.get(ric, Quote())
-
-        def _ser(ric, dk="T"):
-            q = _q(ric, dk)
-            return {"bid": q.bid, "ask": q.ask, "mid": q.mid(), "last": q.last, "ts": q.ts}
-
-        # Spot
-        spot_t = _ser(cfg.spot_ric, "T")
-        spot_t1 = _ser(cfg.spot_ric, "T1")
-
-        # Swap points per tenor (PRIMARY data)
-        tenors = {}
-        for m in cfg.anchor_tenors_m:
-            ric = cfg.swap_points_ric(m)
-            days_approx = _days_for_tenor(m)
-            pts_data_t = _ser(ric, "T")
-            pts_data_t1 = _ser(ric, "T1")
-
-            # Check if we got meaningful data
-            has_data = bool(
-                pts_data_t["bid"] is not None or
-                pts_data_t["ask"] is not None or
-                pts_data_t["last"] is not None
-            )
-
-            tenors[m] = {
-                "ric": ric,
-                "days": days_approx,
-                "T": pts_data_t,
-                "T1": pts_data_t1,
-                "hasData": has_data,
+        ndf_1m_out = None
+        if ndf_1m_out_ric:
+            ndf_1m_out = {
+                "ric": ndf_1m_out_ric,
+                "T":  self._ser_ric(ndf_1m_out_ric, "T"),
+                "T1": self._ser_ric(ndf_1m_out_ric, "T", t1=t1),
             }
 
-        # SOFR curve
-        sofr = {}
-        for m, ric in SOFR_RICS.items():
-            sofr[m] = {"ric": ric, "T": _ser(ric, "T"), "T1": _ser(ric, "T1")}
+        # Per-tenor per-source bundle (pass IPA data so days reflect real calendar)
+        tenors = {m: self._tenor_bundle(cfg, m, t1, ipa) for m in cfg.anchor_tenors_m}
 
-        # Funding tenors (deliverables only: ON, TN, SN)
+        # Funding (deliverables)
         funding = {}
         if cfg.kind == "DELIVERABLE":
-            for tenor in FUNDING_TENORS:
-                ric = cfg.funding_ric(tenor)
-                if ric:
-                    funding[tenor] = {"ric": ric, "T": _ser(ric, "T"), "T1": _ser(ric, "T1")}
+            for tfund in FUNDING_TENORS:
+                funding[tfund] = self._funding_bundle(cfg, tfund, t1)
 
-        # NDF 1M outright: used to derive implied spot (ticks frequently on LSEG)
-        ndf_1m_out = None
-        ndf_1m_out_ric = None
-        if cfg.kind == "NDF":
-            ndf_1m_out_ric = cfg.outright_ric(1)
-            ndf_1m_out = {"ric": ndf_1m_out_ric, "T": _ser(ndf_1m_out_ric, "T"), "T1": _ser(ndf_1m_out_ric, "T1")}
+        # SOFR
+        sofr = {m: {"ric": r, "T": self._ser_ric(r, "T"),
+                    "T1": self._ser_ric(r, "T", t1=t1)}
+                for m, r in SOFR_RICS.items()}
 
-        # Broker quotes: { contrib: { tenor_m: { T: {bid,ask,mid,...}, T1: {...} }, ... } }
-        from ric_config import BROKER_CONTRIBUTORS
-        brokers = {}
-        for contrib in BROKER_CONTRIBUTORS:
-            contrib_data = {}
-            for m in cfg.anchor_tenors_m:
-                bric = cfg.broker_ric(m, contrib)
-                bt = _ser(bric, "T")
-                bt1 = _ser(bric, "T1")
-                has_data = bt["bid"] is not None or bt["ask"] is not None or bt["last"] is not None
-                if has_data:
-                    contrib_data[m] = {"ric": bric, "T": bt, "T1": bt1}
-            if contrib_data:
-                brokers[contrib] = contrib_data
-
-        # Broker fallback: for anchor tenors where composite has no data,
-        # try to fill from first available broker source
-        for m in cfg.anchor_tenors_m:
-            if not tenors[m]["hasData"]:
-                for contrib in BROKER_CONTRIBUTORS:
-                    contrib_m = brokers.get(contrib, {}).get(m)
-                    if contrib_m:
-                        log.info("Fallback: %s %dM composite empty, using %s",
-                                 cfg.code, m, contrib)
-                        tenors[m]["T"] = contrib_m["T"]
-                        tenors[m]["T1"] = contrib_m.get("T1", tenors[m]["T1"])
-                        tenors[m]["hasData"] = True
-                        tenors[m]["ric"] = contrib_m["ric"]
-                        tenors[m]["fallbackSource"] = contrib
-                        break
+        # Broker meta (labels/groups) — only brokers configured for this ccy
+        brokers_meta = {}
+        for b in cfg.brokers:
+            base = dict(BROKER_META.get(b, {"group": b, "label": b}))
+            base["valueMode"] = cfg.value_mode_for(b)
+            brokers_meta[b] = base
 
         return {
             "ccy": cfg.code, "pair": cfg.pair, "kind": cfg.kind,
             "pipFactor": cfg.pip_factor, "outrightDp": cfg.outright_dp, "pipDp": cfg.pip_dp,
-            "ptsInOutright": cfg.pts_in_outright,
+            "valueMode": cfg.value_mode, "ptsInOutright": cfg.pts_in_outright,
+            "deriveFromOutrights": cfg.derive_from_outrights,
             "tenorsM": cfg.anchor_tenors_m, "anchorTenorsM": cfg.anchor_tenors_m,
             "maxDisplayM": cfg.max_display_m,
             "spreadPack": cfg.spread_pack,
             "weeklyTenors": [0.25, 0.5, 0.75],
             "displayTenors": cfg.display_tenors,
-            # KEY: dataType tells frontend these are swap points, not outrights
             "dataType": "swapPoints",
             "spot": {"ric": cfg.spot_ric, "T": spot_t, "T1": spot_t1},
-            # NDF 1M outright — frontend uses this to derive implied spot for NDF pairs
             "ndf1mOutright": ndf_1m_out,
             "tenors": tenors,
-            "sofr": sofr,
             "funding": funding,
-            # Broker quotes by contributor
-            "brokers": brokers,
-            # IPA-computed values for non-anchor tenors and dates for all tenors.
-            # Frontend should prefer these over its own interpolation.
-            # Keys are tenor strings: "1W", "2W", "3W", "4M", "5M", etc.
+            "sofr": sofr,
+            "brokers": [b for b in cfg.brokers],     # just the ordered list
+            "brokersMeta": brokers_meta,
+            "freshnessThresholdsSec": {"fresh": FRESH_SEC, "stale": STALE_SEC},
             "ipa": ipa,
+            "tomfixPlus1bd": tomfix_pl,
         }
+
+    # ───── per-tenor bundle ─────
+    def _tenor_bundle(self, cfg: CurrencyConfig, m: int,
+                      t1: Dict[str, Quote],
+                      ipa: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        sources: Dict[str, Any] = {}
+
+        # Composite (unless derive-from-outrights ccy)
+        if not cfg.derive_from_outrights:
+            if not (cfg.kind == "NDF" and m == 18 and cfg.composite_18m_fallback_brokers):
+                ric = cfg.swap_points_ric(m)
+                sources["composite"] = self._source_entry(
+                    ric, mode=cfg.value_mode_for("composite"), t1=t1)
+
+        # Per-broker swap points
+        for b in cfg.brokers:
+            ric = cfg.broker_ric(m, b)
+            entry = self._source_entry(ric, mode=cfg.value_mode_for(b), t1=t1)
+            if entry["hasData"]:
+                sources[b] = entry
+
+        # NGN-style: derive points from broker outright
+        if cfg.derive_from_outrights:
+            spot_q = self._quotes.get(cfg.spot_ric, Quote())
+            for b in cfg.outright_source_brokers:
+                or_ric = cfg.outright_ric(m, broker=b)
+                or_q = self._quotes.get(or_ric, Quote())
+                if or_q.bid is None and or_q.ask is None and or_q.last is None:
+                    continue
+                derived = _derive_pts_from_outright(spot_q, or_q, cfg)
+                if derived is None:
+                    continue
+                derived["ric"] = or_ric
+                derived["sourceKind"] = "outright_derived"
+                derived["outright"] = {
+                    "bid": or_q.bid, "ask": or_q.ask, "mid": or_q.mid(),
+                }
+                # Freshness based on outright RIC's TIMACT
+                derived["ts"] = or_q.timact_ts or or_q.ts
+                derived["ageSec"] = _age(derived["ts"])
+                derived["freshness"] = _freshness(derived["ts"])
+                sources[b] = derived
+
+        # Prefer IPA-derived days (real calendar, holiday-aware); fall back to approx.
+        ipa_entry = (ipa or {}).get(_ipa_tenor_code(m)) if ipa else None
+        days = None
+        val_date = None
+        fix_date = None
+        if ipa_entry:
+            days = ipa_entry.get("days")
+            val_date = ipa_entry.get("endDate") or ipa_entry.get("valueDate")
+            fix_date = ipa_entry.get("fixDate")
+        if days is None:
+            days = _days_for_tenor(m)  # IPA-approx: fallback when IPA unreachable
+        return {
+            "days": days,
+            "valueDate": val_date,
+            "fixDate": fix_date,
+            "sources": sources,
+            "hasAnyData": any(s.get("hasData") for s in sources.values()),
+        }
+
+    # ───── per-funding bundle ─────
+    def _funding_bundle(self, cfg: CurrencyConfig, tenor: str,
+                        t1: Dict[str, Quote]) -> Dict[str, Any]:
+        sources: Dict[str, Any] = {}
+        comp_ric = cfg.funding_ric(tenor)
+        if comp_ric:
+            entry = self._source_entry(comp_ric,
+                                       mode=cfg.value_mode_for("composite"), t1=t1)
+            sources["composite"] = entry
+        for b in cfg.brokers:
+            bric = cfg.funding_ric(tenor, broker=b)
+            if not bric:
+                continue
+            entry = self._source_entry(bric, mode=cfg.value_mode_for(b), t1=t1)
+            if entry["hasData"]:
+                sources[b] = entry
+        return {
+            "tenor": tenor,
+            "sources": sources,
+            "hasAnyData": any(s.get("hasData") for s in sources.values()),
+        }
+
+    # ───── per-source entry ─────
+    def _source_entry(self, ric: str, mode: str,
+                      t1: Dict[str, Quote]) -> Dict[str, Any]:
+        q = self._quotes.get(ric, Quote())
+        tq1 = t1.get(ric, Quote())
+        ts = q.timact_ts or q.ts
+        has = q.bid is not None or q.ask is not None or q.last is not None
+        return {
+            "ric": ric,
+            "bid": q.bid, "ask": q.ask, "mid": q.mid(), "last": q.last,
+            "ts": ts, "ageSec": _age(ts), "freshness": _freshness(ts),
+            "timact": q.timact,
+            "valueMode": mode,
+            "hasData": has,
+            "T1": {"bid": tq1.bid, "ask": tq1.ask, "mid": tq1.mid(), "last": tq1.last},
+        }
+
+    def _ser_ric(self, ric: str, _kind: str = "T",
+                 t1: Optional[Dict[str, Quote]] = None) -> Dict[str, Any]:
+        """Plain quote dict for spot / sofr / ndf1mOutright where no sources-dict needed."""
+        if t1 is not None:
+            q = t1.get(ric, Quote())
+            return {"bid": q.bid, "ask": q.ask, "mid": q.mid(), "last": q.last, "ts": None}
+        q = self._quotes.get(ric, Quote())
+        ts = q.timact_ts or q.ts
+        return {"bid": q.bid, "ask": q.ask, "mid": q.mid(), "last": q.last, "ts": ts,
+                "timact": q.timact, "freshness": _freshness(ts), "ageSec": _age(ts)}
 
     # ────────────────── live streaming ──────────────────
     def start_streams(self, ccy: str):
-        """Open three streams for active currency."""
         self._active_ccy = ccy
-        self._tick_counts = {"spot": 0, "fwd": 0, "brk": 0}  # reset counters
+        self._tick_counts = {"spot": 0, "fwd": 0, "brk": 0}
         cfg = CURRENCIES[ccy]
 
-        # Spot — tick granularity
-        # For NDF: also stream 1M outright (ticks frequently, used to derive implied spot)
+        # Spot (+ 1M outright for NDF)
         spot_rics = [cfg.spot_ric]
         if cfg.kind == "NDF":
-            spot_rics.append(cfg.outright_ric(1))  # e.g. TWD1MNDFOR=
-        log.info("Starting SPOT stream for %s: %s", ccy, spot_rics)
-        self.lseg.subscribe(
-            tag=f"spot-{ccy}",
-            rics=spot_rics,
-            fields=FIELDS_QUOTE,
-            on_update=lambda ric, f: self._on_spot_tick(ric, f),
-        )
+            # derive_from_outrights ccys don't have a 1MNDFOR= composite, skip
+            if not cfg.derive_from_outrights:
+                spot_rics.append(f"{cfg.code}1MNDFOR=")
+        log.info("SPOT stream %s: %s", ccy, spot_rics)
+        self.lseg.subscribe(tag=f"spot-{ccy}", rics=spot_rics, fields=FIELDS_QUOTE,
+                            on_update=lambda r, f: self._on_spot(r, f))
 
-        # Forwards (swap points) — tick but throttled to 15s per RIC
-        fwd_rics = [cfg.swap_points_ric(m) for m in cfg.anchor_tenors_m]
-        log.info("Starting FWD stream for %s: %s", ccy, fwd_rics)
-        self.lseg.subscribe(
-            tag=f"fwd-{ccy}",
-            rics=fwd_rics,
-            fields=FIELDS_QUOTE,
-            on_update=lambda ric, f: self._on_fwd_tick(ric, f),
-        )
+        # Forwards (composite swap pts) — 15s throttle
+        fwd_rics = []
+        for m in cfg.anchor_tenors_m:
+            if cfg.derive_from_outrights:
+                continue
+            if cfg.kind == "NDF" and m == 18 and cfg.composite_18m_fallback_brokers:
+                continue
+            fwd_rics.append(cfg.swap_points_ric(m))
+        if fwd_rics:
+            log.info("FWD stream %s: %d", ccy, len(fwd_rics))
+            self.lseg.subscribe(tag=f"fwd-{ccy}", rics=fwd_rics, fields=FIELDS_QUOTE,
+                                on_update=lambda r, f: self._on_fwd(r, f))
 
-        # Brokers — tick
-        br_rics = all_broker_rics(ccy)
-        log.info("Starting BRK stream for %s: %d broker RICs", ccy, len(br_rics))
+        # Brokers (tick) — includes MBGL outrights for NGN, funding brokers for deliverables
+        br_rics = list(all_broker_rics(ccy))
+        br_rics += list(all_outright_rics(ccy))
+        if cfg.kind == "DELIVERABLE":
+            br_rics += all_funding_rics(ccy)
+        br_rics = list(set(br_rics))
         if br_rics:
-            self.lseg.subscribe(
-                tag=f"brk-{ccy}",
-                rics=br_rics,
-                fields=FIELDS_QUOTE,
-                on_update=lambda ric, f: self._on_broker_tick(ric, f),
-            )
+            log.info("BRK stream %s: %d", ccy, len(br_rics))
+            self.lseg.subscribe(tag=f"brk-{ccy}", rics=br_rics, fields=FIELDS_QUOTE,
+                                on_update=lambda r, f: self._on_brk(r, f))
 
     def stop_streams(self, ccy: Optional[str] = None):
         c = ccy or self._active_ccy
         if not c:
             return
-        for prefix in ("spot", "fwd", "brk"):
-            self.lseg.unsubscribe(f"{prefix}-{c}")
+        for pref in ("spot", "fwd", "brk"):
+            self.lseg.unsubscribe(f"{pref}-{c}")
 
-    def _on_spot_tick(self, ric: str, updates: Dict[str, Any]):
-        self._tick_counts["spot"] = self._tick_counts.get("spot", 0) + 1
-        q = self._apply_update(ric, updates)
-        if self._tick_counts["spot"] <= 10:
-            log.info("SPOT tick #%d: %s bid=%s ask=%s mid=%s",
-                     self._tick_counts["spot"], ric, q.bid, q.ask, q.mid())
-        self._fanout("spot", {"ric": ric, "bid": q.bid, "ask": q.ask, "mid": q.mid(), "ts": q.ts})
-
-    def _on_fwd_tick(self, ric: str, updates: Dict[str, Any]):
-        self._tick_counts["fwd"] = self._tick_counts.get("fwd", 0) + 1
-        q = self._apply_update(ric, updates)
-        if self._tick_counts["fwd"] <= 20:
-            log.info("FWD tick #%d: %s bid=%s ask=%s mid=%s",
-                     self._tick_counts["fwd"], ric, q.bid, q.ask, q.mid())
-        now = time.time()
-        last = self._last_fwd_emit.get(ric, 0.0)
-        if now - last >= THROTTLE_FORWARD_SEC:
-            self._last_fwd_emit[ric] = now
-            log.info("FWD emit: %s bid=%s ask=%s mid=%s", ric, q.bid, q.ask, q.mid())
-            self._fanout("forwards", {"ric": ric, "bid": q.bid, "ask": q.ask, "mid": q.mid(), "ts": q.ts})
-
-    def _on_broker_tick(self, ric: str, updates: Dict[str, Any]):
-        self._tick_counts["brk"] = self._tick_counts.get("brk", 0) + 1
-        q = self._apply_update(ric, updates)
-        if self._tick_counts["brk"] <= 10:
-            log.info("BRK tick #%d: %s bid=%s ask=%s mid=%s",
-                     self._tick_counts["brk"], ric, q.bid, q.ask, q.mid())
-        self._fanout("brokers", {"ric": ric, "bid": q.bid, "ask": q.ask, "mid": q.mid(), "ts": q.ts})
-
-    def _apply_update(self, ric: str, updates: Dict[str, Any]) -> Quote:
-        q = self._quotes.get(ric)
-        if q is None:
-            q = Quote()
-        # Process updates — dict or pandas-like object
+    def _apply(self, ric: str, upd: Dict[str, Any]) -> Quote:
+        q = self._quotes.get(ric) or Quote()
         try:
-            upd = dict(updates) if not isinstance(updates, dict) else updates
+            upd = dict(upd)
         except Exception:
-            upd = updates
-        if "BID" in upd:
-            q.bid = _num(upd["BID"])
-        if "ASK" in upd:
-            q.ask = _num(upd["ASK"])
-        if "TRDPRC_1" in upd:
-            q.last = _num(upd["TRDPRC_1"])
-        if "PRIMACT_1" in upd and q.bid is None:
-            q.bid = _num(upd["PRIMACT_1"])
-        if "SEC_ACT_1" in upd and q.ask is None:
-            q.ask = _num(upd["SEC_ACT_1"])
+            pass
+        if "BID" in upd:       q.bid  = _num(upd["BID"])
+        if "ASK" in upd:       q.ask  = _num(upd["ASK"])
+        if "TRDPRC_1" in upd:  q.last = _num(upd["TRDPRC_1"])
+        if "PRIMACT_1" in upd and q.bid is None: q.bid = _num(upd["PRIMACT_1"])
+        if "SEC_ACT_1" in upd and q.ask is None: q.ask = _num(upd["SEC_ACT_1"])
+        if "TIMACT" in upd:
+            ts_parsed = _parse_timact(upd["TIMACT"])
+            if ts_parsed is not None:
+                q.timact = str(upd["TIMACT"])
+                q.timact_ts = ts_parsed
         q.ts = time.time()
         self._quotes[ric] = q
         return q
 
-    # ────────────────── pub/sub (WebSocket fanout) ──────────────────
+    def _on_spot(self, ric, fields):
+        self._tick_counts["spot"] = self._tick_counts.get("spot", 0) + 1
+        q = self._apply(ric, fields)
+        self._fanout("spot", {"ric": ric, "bid": q.bid, "ask": q.ask,
+                              "mid": q.mid(), "ts": q.ts, "timact": q.timact})
+
+    def _on_fwd(self, ric, fields):
+        self._tick_counts["fwd"] = self._tick_counts.get("fwd", 0) + 1
+        q = self._apply(ric, fields)
+        now = time.time()
+        if now - self._last_fwd_emit.get(ric, 0) >= THROTTLE_FORWARD_SEC:
+            self._last_fwd_emit[ric] = now
+            self._fanout("forwards", {"ric": ric, "bid": q.bid, "ask": q.ask,
+                                      "mid": q.mid(), "ts": q.ts, "timact": q.timact})
+
+    def _on_brk(self, ric, fields):
+        self._tick_counts["brk"] = self._tick_counts.get("brk", 0) + 1
+        q = self._apply(ric, fields)
+        self._fanout("brokers", {"ric": ric, "bid": q.bid, "ask": q.ask,
+                                 "mid": q.mid(), "ts": q.ts, "timact": q.timact})
+
+    # ────────────────── pub/sub ──────────────────
     def subscribe_channel(self, channel: str) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=1000)
         self._subscribers.setdefault(channel, set()).add(q)
@@ -419,40 +524,210 @@ class MarketService:
     def _fanout(self, channel: str, msg: Dict[str, Any]):
         if not self._loop:
             return
-        subs = list(self._subscribers.get(channel, set()))
-        for q in subs:
+        for q in list(self._subscribers.get(channel, set())):
             try:
                 self._loop.call_soon_threadsafe(_safe_put, q, msg)
             except Exception as e:
                 log.warning("fanout %s: %s", channel, e)
 
-    # ────────────────── history (on demand) ──────────────────
-    def get_history(self, ccy: str, days: int = 60, contributor: str = None) -> Dict[str, Any]:
-        """Historical daily bars — swap points for NDF, spot+points for deliverable.
-        If contributor is provided (e.g. 'TRDS'), use broker-specific RICs instead of composite."""
+    # ────────────────── history ──────────────────
+    def get_history(self, ccy: str,
+                    period: str = "1Y",
+                    contributor: Optional[str] = None,
+                    extra_rics: Optional[List[str]] = None,
+                    tenor: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Historical bars for swap pts + spot.
+        period: '1D','5D','1M','3M','6M','1Y','3Y','5Y','10Y','Max'.
+        contributor: if given, use broker RICs for swap pts; else composite.
+        extra_rics: optional list of additional RICs (e.g. specific broker feeds the
+                    frontend wants alongside composite — per-broker history toggle).
+        """
         cfg = CURRENCIES[ccy]
+        start, interval = _resolve_period(period)
+
+        rics: List[str] = [cfg.spot_ric]
+        # Funding-tenor override: query ON/TN/SN RICs for that single funding tenor.
+        if tenor and tenor.upper() in FUNDING_TENORS and cfg.kind == "DELIVERABLE":
+            t = tenor.upper()
+            base = cfg.funding_ric(t)
+            if base:
+                rics.append(base)
+            for b in cfg.brokers:
+                br = cfg.funding_ric(t, broker=b)
+                if br:
+                    rics.append(br)
+            if extra_rics:
+                rics = list(dict.fromkeys(rics + extra_rics))
+            end = date.today()
+            kwargs = {"rics": rics, "fields": ["BID", "ASK", "TRDPRC_1"],
+                      "interval": interval, "end": end.isoformat()}
+            if start is not None:
+                kwargs["start"] = start.isoformat()
+            hist = self.lseg.get_history(**kwargs)
+            return {
+                "ccy": ccy, "pair": cfg.pair, "kind": cfg.kind,
+                "period": period, "interval": interval,
+                "start": start.isoformat() if start else None,
+                "end": end.isoformat(),
+                "contributor": contributor, "tenor": t,
+                "rics": rics, "history": hist,
+            }
         if contributor:
-            # Broker-specific RICs: e.g. TWD6MNDF=TRDS
-            rics = [cfg.spot_ric]
-            rics.extend(cfg.broker_ric(m, contributor) for m in cfg.anchor_tenors_m)
+            for m in cfg.anchor_tenors_m:
+                rics.append(cfg.broker_ric(m, contributor))
         else:
-            # Composite RICs (default)
-            rics = all_swap_points_rics(ccy)
+            if cfg.derive_from_outrights:
+                # NGN: "composite" history = use first outright broker
+                pri = cfg.outright_source_brokers[0] if cfg.outright_source_brokers else None
+                if pri:
+                    for m in cfg.anchor_tenors_m:
+                        rics.append(cfg.outright_ric(m, broker=pri))
+            else:
+                for m in cfg.anchor_tenors_m:
+                    if cfg.kind == "NDF" and m == 18 and cfg.composite_18m_fallback_brokers:
+                        # use first fallback broker for 18M composite history
+                        b = cfg.composite_18m_fallback_brokers[0]
+                        rics.append(cfg.broker_ric(m, b))
+                    else:
+                        rics.append(cfg.swap_points_ric(m))
 
-        from datetime import datetime, timedelta
-        end = datetime.utcnow().date()
-        start = end - timedelta(days=days + 20)  # padding for non-trading days
-        hist = self.lseg.get_history(
-            rics=rics, fields=["BID", "ASK", "TRDPRC_1"],
-            interval="daily", start=start.isoformat(), end=end.isoformat(),
-        )
-        return {"ccy": ccy, "pair": cfg.pair, "kind": cfg.kind, "rics": rics, "history": hist,
-                "contributor": contributor}
+        if extra_rics:
+            rics = list(dict.fromkeys(rics + extra_rics))
+
+        # Append SOFR history — single tenor-matched RIC if caller specified `tenor`,
+        # else the full SOFR anchor set so frontend can interpolate per-date.
+        sofr_rics: List[str] = []
+        if tenor and tenor.upper() not in FUNDING_TENORS:
+            s = _sofr_ric_for_tenor(tenor)
+            if s:
+                sofr_rics.append(s)
+        if not sofr_rics:
+            sofr_rics = list(SOFR_RICS.values())
+        rics = list(dict.fromkeys(rics + sofr_rics))
+
+        end = date.today()
+        kwargs = {"rics": rics, "fields": ["BID", "ASK", "TRDPRC_1"],
+                  "interval": interval, "end": end.isoformat()}
+        if start is not None:
+            kwargs["start"] = start.isoformat()
+        hist = self.lseg.get_history(**kwargs)
+
+        return {
+            "ccy": ccy, "pair": cfg.pair, "kind": cfg.kind,
+            "period": period, "interval": interval,
+            "start": start.isoformat() if start else None,
+            "end": end.isoformat(),
+            "contributor": contributor,
+            "rics": rics,
+            "sofrRics": sofr_rics,
+            "history": hist,
+        }
+
+    def get_history_custom_dates(self, ccy: str,
+                                 near_date: str, far_date: str,
+                                 period: str = "1Y",
+                                 contributor: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Time series for a user-defined fwd-fwd spread with FIXED absolute dates.
+        Strategy: pull daily anchor-tenor curves, for each historical day
+        interpolate the curve to (near_date, far_date) by days-to-date,
+        then return the spread (= far - near) per day.
+        """
+        cfg = CURRENCIES[ccy]
+        start, interval = _resolve_period(period)
+
+        rics: List[str] = [cfg.spot_ric]
+        if contributor:
+            for m in cfg.anchor_tenors_m:
+                rics.append(cfg.broker_ric(m, contributor))
+        else:
+            for m in cfg.anchor_tenors_m:
+                if cfg.kind == "NDF" and m == 18 and cfg.composite_18m_fallback_brokers:
+                    rics.append(cfg.broker_ric(m, cfg.composite_18m_fallback_brokers[0]))
+                elif cfg.derive_from_outrights and cfg.outright_source_brokers:
+                    rics.append(cfg.outright_ric(m, broker=cfg.outright_source_brokers[0]))
+                else:
+                    rics.append(cfg.swap_points_ric(m))
+
+        end = date.today()
+        kwargs = {"rics": rics, "fields": ["BID", "ASK", "TRDPRC_1"],
+                  "interval": interval, "end": end.isoformat()}
+        if start is not None:
+            kwargs["start"] = start.isoformat()
+        hist = self.lseg.get_history(**kwargs)
+
+        near_d = _parse_iso(near_date)
+        far_d = _parse_iso(far_date)
+        if near_d is None or far_d is None:
+            raise ValueError(f"invalid dates: near={near_date} far={far_date}")
+
+        # Build per-day curves
+        by_date: Dict[str, Dict[int, float]] = {}          # date → {months: mid}
+        spot_by_date: Dict[str, float] = {}
+        for ric, bars in (hist or {}).items():
+            for b in bars:
+                d = b.get("Date") or ""
+                if not d:
+                    continue
+                bid, ask = _num(b.get("BID")), _num(b.get("ASK"))
+                last = _num(b.get("TRDPRC_1"))
+                mid = (bid + ask) / 2 if (bid is not None and ask is not None) else last
+                if mid is None:
+                    continue
+                # Identify tenor month from ric. Spot ric: no tenor digits.
+                m = _tenor_months_from_ric(ric, cfg)
+                if ric == cfg.spot_ric:
+                    spot_by_date[d[:10]] = mid
+                elif m is not None:
+                    by_date.setdefault(d[:10], {})[m] = mid
+
+        series = []
+        for d_str, curve in sorted(by_date.items()):
+            near_days = (near_d - _parse_iso(d_str)).days
+            far_days = (far_d - _parse_iso(d_str)).days
+            if near_days < 0 or far_days < 0:
+                continue
+            near_val = _interp_curve_days(curve, near_days)
+            far_val = _interp_curve_days(curve, far_days)
+            if near_val is None or far_val is None:
+                continue
+            series.append({
+                "date": d_str,
+                "near": near_val, "far": far_val,
+                "spread": far_val - near_val,
+                "nearDays": near_days, "farDays": far_days,
+            })
+
+        return {
+            "ccy": ccy, "pair": cfg.pair,
+            "nearDate": near_date, "farDate": far_date,
+            "period": period, "interval": interval,
+            "contributor": contributor,
+            "series": series,
+            "interpolated": True,
+        }
 
 
-def _days_for_tenor(m: int) -> int:
-    """Approximate days for a tenor in months."""
-    return {1: 30, 2: 61, 3: 91, 6: 182, 9: 273, 12: 365, 18: 547, 24: 730}.get(m, m * 30)
+# ─────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────
+def _days_for_tenor(m) -> int:
+    return {0.25: 7, 0.5: 14, 0.75: 21,
+            1: 30, 2: 61, 3: 91, 6: 182, 9: 273,
+            12: 365, 18: 547, 24: 730}.get(m, int(m * 30))
+
+
+def _ipa_tenor_code(m: int) -> str:
+    if m < 12:
+        return f"{m}M"
+    if m == 12:
+        return "1Y"
+    if m == 18:
+        return "18M"
+    if m == 24:
+        return "2Y"
+    return f"{m}M"
 
 
 def _num(x) -> Optional[float]:
@@ -466,11 +741,109 @@ def _num(x) -> Optional[float]:
         pass
     try:
         v = float(x)
-        if v != v:  # NaN
+        if v != v:
             return None
         return v
     except (TypeError, ValueError):
         return None
+
+
+def _age(ts: Optional[float]) -> Optional[float]:
+    if ts is None:
+        return None
+    return round(time.time() - ts, 1)
+
+
+def _derive_pts_from_outright(spot_q: Quote, out_q: Quote,
+                              cfg: CurrencyConfig) -> Optional[Dict[str, Any]]:
+    """Convert broker outright → market-pts entry.  Bid/ask mapped 1:1.
+    Display convention follows ccy value_mode (outright here since NGN=outright)."""
+    if out_q.bid is None and out_q.ask is None and out_q.last is None:
+        return None
+    sbid, sask = spot_q.bid, spot_q.ask
+    smid = spot_q.mid()
+    obid, oask = out_q.bid, out_q.ask
+    def _diff(o, s):
+        return None if (o is None or s is None) else (o - s)
+    bid = _diff(obid, sask) if (obid is not None and sask is not None) else _diff(obid, smid)
+    ask = _diff(oask, sbid) if (oask is not None and sbid is not None) else _diff(oask, smid)
+    mid = None
+    if bid is not None and ask is not None:
+        mid = (bid + ask) / 2
+    elif out_q.mid() is not None and smid is not None:
+        mid = out_q.mid() - smid
+    return {
+        "bid": bid, "ask": ask, "mid": mid, "last": None,
+        "valueMode": cfg.value_mode,
+        "hasData": bid is not None or ask is not None or mid is not None,
+    }
+
+
+def _resolve_period(period: str) -> Tuple[Optional[date], str]:
+    """Return (start_date, interval) for a period preset."""
+    today = date.today()
+    p = (period or "1Y").upper()
+    if p == "1D":   return (today - timedelta(days=2),   "hourly")
+    if p == "5D":   return (today - timedelta(days=7),   "hourly")
+    if p == "1M":   return (today - timedelta(days=32),  "daily")
+    if p == "3M":   return (today - timedelta(days=95),  "daily")
+    if p == "6M":   return (today - timedelta(days=185), "daily")
+    if p == "1Y":   return (today - timedelta(days=375), "daily")
+    if p == "3Y":   return (today - timedelta(days=3*366),  "daily")
+    if p == "5Y":   return (today - timedelta(days=5*366),  "daily")
+    if p == "10Y":  return (today - timedelta(days=10*366), "daily")
+    if p == "MAX":  return (None, "daily")
+    return (today - timedelta(days=375), "daily")
+
+
+def _parse_iso(s: str) -> Optional[date]:
+    try:
+        return datetime.fromisoformat(str(s)[:10]).date()
+    except Exception:
+        return None
+
+
+_TENOR_MONTH_MAP = {
+    "1M": 1, "2M": 2, "3M": 3, "4M": 4, "5M": 5, "6M": 6, "7M": 7, "8M": 8,
+    "9M": 9, "10M": 10, "11M": 11, "12M": 12, "1Y": 12, "18M": 18, "24M": 24, "2Y": 24,
+}
+
+
+def _tenor_months_from_ric(ric: str, cfg: CurrencyConfig) -> Optional[int]:
+    """Extract tenor months from a RIC string for the given ccy."""
+    s = ric
+    # Strip ccy prefix if present
+    for prefix in (cfg.code,):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+            break
+    # Strip broker suffix after '='
+    if "=" in s:
+        s = s.split("=")[0]
+    # Strip trailing NDF / NDFOR
+    for tail in ("NDFOR", "NDF"):
+        if s.endswith(tail):
+            s = s[:-len(tail)]
+            break
+    return _TENOR_MONTH_MAP.get(s.upper())
+
+
+def _interp_curve_days(curve: Dict[int, float], target_days: int) -> Optional[float]:
+    """Linear interp on a {months → value} curve by days (months × 30.4)."""
+    if not curve or target_days is None:
+        return None
+    pts = sorted(((int(m * 30.4), v) for m, v in curve.items()), key=lambda p: p[0])
+    if target_days <= pts[0][0]:
+        return pts[0][1]
+    if target_days >= pts[-1][0]:
+        return pts[-1][1]
+    for (d0, v0), (d1, v1) in zip(pts, pts[1:]):
+        if d0 <= target_days <= d1:
+            if d1 == d0:
+                return v0
+            w = (target_days - d0) / (d1 - d0)
+            return v0 + w * (v1 - v0)
+    return None
 
 
 def _safe_put(q: asyncio.Queue, msg):

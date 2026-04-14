@@ -110,7 +110,26 @@ class LsegClient:
         if start: kwargs["start"] = start
         if end: kwargs["end"] = end
         if count: kwargs["count"] = count
-        df = ld.get_history(**kwargs)
+        try:
+            df = ld.get_history(**kwargs)
+        except (TypeError, KeyError, AttributeError) as e:
+            # SDK bug: multi-RIC intraday queries throw when some RICs have no data.
+            # Fall back to per-RIC queries (slower but reliable).
+            log.info("get_history batch failed (%s); falling back per-RIC", e)
+            result: Dict[str, list] = {}
+            for r in rics:
+                one_kwargs = dict(kwargs); one_kwargs["universe"] = [r]
+                try:
+                    subdf = ld.get_history(**one_kwargs)
+                except Exception as e2:
+                    log.debug("per-RIC history %s failed: %s", r, e2)
+                    continue
+                if subdf is None or subdf.empty:
+                    continue
+                sub = subdf.reset_index()
+                sub["Date"] = sub.iloc[:, 0].astype(str)
+                result[r] = sub.to_dict(orient="records")
+            return result
         if df is None or df.empty:
             return {}
         # Convert to JSON-friendly format
@@ -324,11 +343,141 @@ class LsegClient:
             log.debug("IPA calc_fx_implied_yield failed (expected if IPA not available): %s", e)
         return None
 
+    # ─────── new IPA forward API (via cross.Definition) ───────
+    def _detect_kind(self, ccy_pair: str) -> str:
+        """Detect NDF vs DELIVERABLE from CURRENCIES config."""
+        try:
+            from ric_config import CURRENCIES
+            code = ccy_pair.replace("USD", "")
+            cfg = CURRENCIES.get(code)
+            if cfg is not None:
+                return cfg.kind
+        except Exception:
+            pass
+        return "DELIVERABLE"
+
+    def _fwd_batch(
+        self,
+        ccy_pair: str,
+        legs_spec: List[Dict[str, Any]],   # each: {"key": str, "tenor"?: str, "start_date"?: str, "end_date"?: str}
+        kind: Optional[str] = None,
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
+        """
+        Core IPA call using cross.Definition. Returns {key: entry-dict or None}.
+        entry: {startDate, endDate, fixDate, days, fwdPoints, fwdRate, impliedYield, source}
+        """
+        out: Dict[str, Optional[Dict[str, Any]]] = {s["key"]: None for s in legs_spec}
+        if not legs_spec:
+            return out
+        try:
+            from lseg.data.content.ipa.financial_contracts import cross
+        except Exception as e:
+            log.info("IPA cross import failed: %s", e)
+            return out
+
+        k = kind or self._detect_kind(ccy_pair)
+        fx_cross_type = (cross.FxCrossType.FX_NON_DELIVERABLE_FORWARD
+                         if k == "NDF" else cross.FxCrossType.FX_FORWARD)
+
+        def _iso(v):
+            try:
+                import pandas as pd
+                if v is None or pd.isna(v):
+                    return None
+            except Exception:
+                if v is None:
+                    return None
+            if hasattr(v, "isoformat"):
+                try:
+                    s = v.isoformat()
+                    return s[:10] if "T" in s else s
+                except Exception:
+                    return None
+            s = str(v)
+            if s in ("NaT", "nan", "None", "<NA>"):
+                return None
+            return s[:10] if len(s) >= 10 else s
+
+        def _num(v):
+            try:
+                import pandas as pd
+                if v is None or pd.isna(v):
+                    return None
+            except Exception:
+                if v is None:
+                    return None
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        # SDK collapses multi-leg batches to one row on this version; parallel per-leg.
+        from datetime import date as _date
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _one(spec):
+            kw: Dict[str, Any] = {"fx_leg_type": cross.FxLegType.FX_FORWARD}
+            if spec.get("tenor"):      kw["tenor"] = spec["tenor"]
+            if spec.get("start_date"): kw["start_date"] = spec["start_date"]
+            if spec.get("end_date"):   kw["end_date"] = spec["end_date"]
+            try:
+                resp = cross.Definition(
+                    fx_cross_code=ccy_pair,
+                    fx_cross_type=fx_cross_type,
+                    legs=[cross.LegDefinition(**kw)],
+                    fields=["ForwardPoints", "FixingDate", "StartDate", "EndDate",
+                            "DaysToExpiry", "ForwardRate", "ImpliedYieldPercent"],
+                ).get_data()
+            except Exception as e:
+                log.info("IPA leg %s failed: %s", spec, e)
+                return spec["key"], None
+            if not resp or not hasattr(resp, "data") or resp.data is None:
+                return spec["key"], None
+            try:
+                df = resp.data.df
+            except Exception:
+                return spec["key"], None
+            if df is None or len(df) == 0:
+                return spec["key"], None
+            row = df.iloc[0]
+            sd = _iso(row.get("StartDate"))
+            ed = _iso(row.get("EndDate"))
+            fd = _iso(row.get("FixingDate"))
+            days = None
+            if sd and ed:
+                try:
+                    d0 = _date.fromisoformat(sd); d1 = _date.fromisoformat(ed)
+                    days = (d1 - d0).days
+                except Exception:
+                    days = None
+            if days is None:
+                dte = _num(row.get("DaysToExpiry"))
+                days = int(dte) if dte is not None else None
+            entry = {
+                "startDate": sd, "endDate": ed, "valueDate": ed, "fixDate": fd,
+                "days": days,
+                "fwdPoints":    _num(row.get("ForwardPoints")),
+                "fwdRate":      _num(row.get("ForwardRate")),
+                "impliedYield": _num(row.get("ImpliedYieldPercent")),
+                "tenor": spec.get("tenor"), "source": "IPA",
+            }
+            if entry["endDate"] is None and entry["fwdPoints"] is None and entry["fwdRate"] is None:
+                return spec["key"], None
+            return spec["key"], entry
+
+        with ThreadPoolExecutor(max_workers=min(16, len(legs_spec))) as ex:
+            for k, v in ex.map(_one, legs_spec):
+                out[k] = v
+        return out
+
     def calc_fx_forward(
         self,
         ccy_pair: str,
         tenor: str,
         valuation_date: Optional[str] = None,
+        kind: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Use LSEG IPA to calculate forward points, outright, implied yield,
@@ -345,162 +494,100 @@ class LsegClient:
             valuation_date: ISO date string, defaults to today.
 
         Returns dict with keys:
-            fwdPoints, fwdRate, impliedYield, fixDate, valueDate, tenor, source
+            fwdPoints, fwdRate, impliedYield, fixDate, startDate, endDate, valueDate, days, tenor, source
         Or None if IPA is unavailable.
         """
-        try:
-            import lseg.data as ld
-            val_date = valuation_date or datetime.utcnow().strftime("%Y-%m-%dT00:00:00Z")
-
-            # Do NOT pass forwardPoints — let IPA compute from its internal curve
-            resp = ld.content.ipa.financial_contracts.Definition(
-                instrument_type="FxCross",
-                instrument_definition={
-                    "instrumentCode": ccy_pair,
-                    "legs": [{
-                        "dealType": "FxForward",
-                        "fxForwardType": "FxOutright",
-                        "forwardTenor": tenor,
-                    }],
-                },
-                pricing_parameters={
-                    "valuationDate": val_date,
-                },
-                fields=[
-                    "ForwardPoints",
-                    "ForwardRate",
-                    "ImpliedYieldPercent",
-                    "FixingDate",
-                    "EndDate",
-                    "StartDate",
-                    "DaysToExpiry",
-                    "FxSpotRate",
-                ],
-            ).get_data()
-
-            if not resp or not hasattr(resp, "data") or not resp.data:
-                return None
-
-            df = resp.data.df
-            result = {}
-            for col in ["ForwardPoints", "ForwardRate", "ImpliedYieldPercent",
-                        "FixingDate", "EndDate", "StartDate", "DaysToExpiry", "FxSpotRate"]:
-                val = df.get(col)
-                if val is not None and len(val) > 0:
-                    v = val.iloc[0]
-                    # Convert pandas Timestamp to ISO string for dates
-                    if hasattr(v, 'isoformat'):
-                        result[col] = v.isoformat()
-                    elif v is not None and str(v) != 'nan':
-                        result[col] = float(v)
-                    else:
-                        result[col] = None
-                else:
-                    result[col] = None
-
-            # Only return if we got at least forward points or rate
-            if result.get("ForwardPoints") is None and result.get("ForwardRate") is None:
-                log.debug("IPA returned no ForwardPoints/ForwardRate for %s %s", ccy_pair, tenor)
-                return None
-
-            return {
-                "fwdPoints": result.get("ForwardPoints"),
-                "fwdRate": result.get("ForwardRate"),
-                "impliedYield": result.get("ImpliedYieldPercent"),
-                "fixDate": result.get("FixingDate"),
-                "valueDate": result.get("EndDate"),
-                "startDate": result.get("StartDate"),
-                "days": result.get("DaysToExpiry"),
-                "spotRate": result.get("FxSpotRate"),
-                "tenor": tenor,
-                "source": "IPA",
-            }
-        except Exception as e:
-            log.info("IPA calc_fx_forward(%s, %s) failed: %s", ccy_pair, tenor, e)
-        return None
+        spec = {"key": tenor}
+        if start_date or end_date:
+            if start_date: spec["start_date"] = start_date
+            if end_date: spec["end_date"] = end_date
+        else:
+            spec["tenor"] = tenor
+        res = self._fwd_batch(ccy_pair, [spec], kind=kind).get(tenor)
+        return res
 
     def calc_fx_forward_batch(
         self,
         ccy_pair: str,
         tenors: List[str],
         valuation_date: Optional[str] = None,
+        kind: Optional[str] = None,
     ) -> Dict[str, Optional[Dict[str, Any]]]:
+        """Batch IPA call. {tenor: entry or None}."""
+        specs = [{"key": t, "tenor": t} for t in tenors]
+        return self._fwd_batch(ccy_pair, specs, kind=kind)
+
+    def calc_fx_forward_custom_batch(
+        self,
+        ccy_pair: str,
+        legs: List[Dict[str, Any]],   # each: {key, tenor?, start_date?, end_date?}
+        kind: Optional[str] = None,
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
+        """Batch call supporting explicit start/end dates per leg."""
+        return self._fwd_batch(ccy_pair, legs, kind=kind)
+
+    def calc_tomfix_plus_1bd(
+        self,
+        ccy_pair: str,
+        kind: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
-        Batch IPA call for multiple tenors on one pair.
-        Returns {tenor: result_dict or None}.
+        Return TOMFIX x (1M+1bd) near/far legs with IPA business-day-adjusted dates.
+          near = TN-tenor leg (TOMFIX value date)
+          far  = 1M-leg-endDate + 1 calendar day, snapped to next business day by IPA
+
+        Returns {near: {startDate,endDate,days}, far: {startDate,endDate,days}} or None.
         """
-        results = {}
-        # Try batch via multiple legs in one call first
+        # Step 1: resolve TN + 1M
+        first = self._fwd_batch(
+            ccy_pair,
+            [{"key": "TN", "tenor": "TN"}, {"key": "1M", "tenor": "1M"}],
+            kind=kind,
+        )
+        tn = first.get("TN")
+        onem = first.get("1M")
+        if not tn or not onem or not onem.get("startDate") or not onem.get("endDate"):
+            return None
+        # Step 2: far leg = start=1M.startDate, end=1M.endDate+1 calendar day
         try:
-            import lseg.data as ld
-            val_date = valuation_date or datetime.utcnow().strftime("%Y-%m-%dT00:00:00Z")
+            from datetime import date as _date, timedelta as _td
+            end1m = _date.fromisoformat(onem["endDate"])
+            target_end = (end1m + _td(days=1)).isoformat()
+        except Exception:
+            return None
+        far = self._fwd_batch(
+            ccy_pair,
+            [{"key": "FAR", "start_date": onem["startDate"], "end_date": target_end}],
+            kind=kind,
+        ).get("FAR")
+        if not far:
+            return None
 
-            legs = []
-            for t in tenors:
-                legs.append({
-                    "dealType": "FxForward",
-                    "fxForwardType": "FxOutright",
-                    "forwardTenor": t,
-                })
+        # near_days measured from today; far_days likewise (backend valuation date)
+        from datetime import date as _date
+        today = _date.today()
+        def _d_from_today(iso):
+            try:
+                return (_date.fromisoformat(iso) - today).days
+            except Exception:
+                return None
 
-            resp = ld.content.ipa.financial_contracts.Definition(
-                instrument_type="FxCross",
-                instrument_definition={
-                    "instrumentCode": ccy_pair,
-                    "legs": legs,
-                },
-                pricing_parameters={
-                    "valuationDate": val_date,
-                },
-                fields=[
-                    "ForwardPoints", "ForwardRate", "ImpliedYieldPercent",
-                    "FixingDate", "EndDate", "StartDate", "DaysToExpiry", "FxSpotRate",
-                ],
-            ).get_data()
+        return {
+            "near": {
+                "startDate": tn.get("startDate"),
+                "endDate": tn.get("endDate"),
+                "days": tn.get("days"),
+                "nearDays": _d_from_today(tn.get("endDate")),
+            },
+            "far": {
+                "startDate": far.get("startDate"),
+                "endDate": far.get("endDate"),
+                "days": far.get("days"),
+                "farDays": _d_from_today(far.get("endDate")),
+            },
+            "nearDays": _d_from_today(tn.get("endDate")),
+            "farDays": _d_from_today(far.get("endDate")),
+            "nearDate": tn.get("endDate"),
+            "farDate": far.get("endDate"),
+        }
 
-            if resp and hasattr(resp, "data") and resp.data:
-                df = resp.data.df
-                # Multi-leg response: each row corresponds to a leg
-                for i, t in enumerate(tenors):
-                    if i < len(df):
-                        row = df.iloc[i]
-                        entry = {}
-                        for col in ["ForwardPoints", "ForwardRate", "ImpliedYieldPercent",
-                                    "FixingDate", "EndDate", "StartDate", "DaysToExpiry", "FxSpotRate"]:
-                            v = row.get(col) if hasattr(row, 'get') else getattr(row, col, None)
-                            if v is not None and hasattr(v, 'isoformat'):
-                                entry[col] = v.isoformat()
-                            elif v is not None and str(v) != 'nan':
-                                try:
-                                    entry[col] = float(v)
-                                except (TypeError, ValueError):
-                                    entry[col] = str(v)
-                            else:
-                                entry[col] = None
-
-                        if entry.get("ForwardPoints") is not None or entry.get("ForwardRate") is not None:
-                            results[t] = {
-                                "fwdPoints": entry.get("ForwardPoints"),
-                                "fwdRate": entry.get("ForwardRate"),
-                                "impliedYield": entry.get("ImpliedYieldPercent"),
-                                "fixDate": entry.get("FixingDate"),
-                                "valueDate": entry.get("EndDate"),
-                                "startDate": entry.get("StartDate"),
-                                "days": entry.get("DaysToExpiry"),
-                                "spotRate": entry.get("FxSpotRate"),
-                                "tenor": t,
-                                "source": "IPA",
-                            }
-                        else:
-                            results[t] = None
-                    else:
-                        results[t] = None
-                return results
-
-        except Exception as e:
-            log.info("IPA batch failed for %s, falling back to individual calls: %s", ccy_pair, e)
-
-        # Fallback: individual calls
-        for t in tenors:
-            results[t] = self.calc_fx_forward(ccy_pair, t, valuation_date)
-        return results

@@ -1,8 +1,8 @@
 // FX Dashboard — full port from v1, backend-driven
 import React, { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import Plot from "react-plotly.js";
-import { getCurrencies, getHistory, getSnapshot, liveStart, liveStop, openChannel, getIpaForward } from "./api.js";
-import { buildAllData, calcCustom } from "./dataTransform.js";
+import { getCurrencies, getHistory, getHistoryCustom, getSnapshot, liveStart, liveStop, openChannel, getIpaForward } from "./api.js";
+import { buildAllData, calcCustom, valueModeForSource } from "./dataTransform.js";
 import { F, FP, CC, HB, cS, tS, sS, mid, implYld, fwdFwdIy, mcI, calcSMA, calcEMA, calcRSI, calcBB, calcMACD, calcStats, calcZDev, backtest, STRAT_DESCS } from "./calc.js";
 import { fD, daysBtwn } from "./dates.js";
 
@@ -43,6 +43,29 @@ function barMid(bar){
   if(bar.BID!=null)return bar.BID;
   if(bar.ASK!=null)return bar.ASK;
   return null;
+}
+
+// ── Build a per-date SOFR map from history response, picking the RIC whose
+//    tenor is closest to `targetMonths`. Returns { "YYYY-MM-DD": sofr% }.
+function buildSofrHist(data,targetMonths){
+  if(!data?.history)return null;
+  const rics=Object.keys(data.history);
+  const sofrRics=rics.filter(r=>r.startsWith("USDSROIS"));
+  if(!sofrRics.length)return null;
+  const ricMonths=sofrRics.map(r=>{
+    const m=r.match(/USDSROIS(\d+)([MY])=/i);
+    if(!m)return[r,null];
+    const n=parseInt(m[1]),u=m[2].toUpperCase();
+    return[r,u==='Y'?n*12:n];
+  }).filter(([,m])=>m!=null);
+  if(!ricMonths.length)return null;
+  const tgt=targetMonths==null?1:Math.max(0.1,targetMonths);
+  ricMonths.sort((a,b)=>Math.abs(a[1]-tgt)-Math.abs(b[1]-tgt));
+  const chosen=ricMonths[0][0];
+  const bars=data.history[chosen]||[];
+  const out={};
+  for(const b of bars){const v=barMid(b);if(v!=null&&b.Date)out[b.Date.slice(0,10)]=v;}
+  return out;
 }
 
 // ── Map a RIC to its approximate month value for interpolation ──
@@ -211,18 +234,82 @@ function buildSpreadHistory(data,nearM,farM){
 }
 
 // ══════════════════════ HIST MODAL ══════════════════════
-function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM}){
+function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM,nrDate,frDate,brokersMeta,snap,fundingTenor,ad}){
   const[hist,setHist]=useState(null);
   const[histSource,setHistSource]=useState(null);
   const[loading,setLoading]=useState(true);
   const[unavailReason,setUnavailReason]=useState(null);
   const[sigN,setSigN]=useState(20);
+  const[period,setPeriod]=useState("1Y");
+  const[contributor,setContributor]=useState(null);
+  const[viewMode,setViewMode]=useState("swap"); // swap|iy|ppd
+  const[spotHist,setSpotHist]=useState(null); // map: Date(yyyy-mm-dd) → spot mid (for IY calc)
+  const[sofrHist,setSofrHist]=useState(null); // map: yyyy-mm-dd → nearest-tenor SOFR% (for IY calc)
+  const[rawHist,setRawHist]=useState(null); // pre-transform raw points for IY recalc
+  const[customNear,setCustomNear]=useState(nrDate||"");
+  const[customFar,setCustomFar]=useState(frDate||"");
+  const[customSeries,setCustomSeries]=useState(null);
+  const useBackendCustom=!!(nrDate&&frDate);
+  // Pip-convention transform: raw history values → displayed (pip) values.
+  const PF=snap?.pipFactor||1e3;
+  const vm=valueModeForSource(snap,contributor);
+  const pipMul=vm==="outright"?PF:1;
+  function transformPts(rawPts){
+    if(!rawPts)return rawPts;
+    return rawPts.map(p=>({date:p.date,value:p.value==null?null:p.value*pipMul})).filter(p=>p.value!=null&&!isNaN(p.value));
+  }
   useEffect(()=>{
     let cancelled=false;
     setLoading(true);
     setUnavailReason(null);
     setHistSource(null);
-    getHistory(ccy,252).then(data=>{
+    // Funding-tenor (ON/TN/SN) history: backend supports tenor= param.
+    if(fundingTenor){
+      getHistory(ccy,{period,contributor,tenor:fundingTenor}).then(data=>{
+        if(cancelled)return;
+        const rics=Object.keys(data?.history||{});
+        // Pick the first funding RIC (prefer one matching contributor suffix, else base).
+        let chosen=null;
+        for(const r of rics){if(r.includes(`${fundingTenor}=`)&&(!contributor||r.endsWith(contributor))){chosen=r;break;}}
+        if(!chosen)for(const r of rics){if(r.includes(`${fundingTenor}=`)){chosen=r;break;}}
+        const bars=chosen?data.history[chosen]:[];
+        const rawPts=bars.map(b=>({date:new Date(b.Date),value:barMid(b)})).filter(p=>p.value!=null&&!isNaN(p.value));
+        if(rawPts.length>10){
+          setRawHist(rawPts);
+          setHist(transformPts(rawPts));
+          setHistSource('direct');
+          // Extract spot series too
+          const spotRic=rics.find(r=>r.match(/^[A-Z]{6}=$/));
+          const sMap={};
+          if(spotRic&&data.history[spotRic]){for(const b of data.history[spotRic]){const v=barMid(b);if(v!=null&&b.Date)sMap[b.Date]=v;}}
+          setSpotHist(sMap);
+          setSofrHist(buildSofrHist(data,fundingTenor==="ON"||fundingTenor==="TN"||fundingTenor==="SN"?"1M":null));
+        }else{setHist(null);setRawHist(null);setUnavailReason(`No funding history for ${fundingTenor}`);}
+        setLoading(false);
+      }).catch(err=>{if(!cancelled){setHist(null);setUnavailReason(`funding history error: ${err?.message||"failed"}`);setLoading(false);}});
+      return()=>{cancelled=true;};
+    }
+    // Custom-date fwd-fwd: call backend endpoint directly, skip local interp.
+    if(useBackendCustom){
+      getHistoryCustom({ccy,near:nrDate,far:frDate,period,contributor}).then(d=>{
+        if(cancelled)return;
+        const series=d?.series||[];
+        if(series.length>10){
+          const rawPts=series.map(p=>({date:new Date(p.date),value:p.spread})).filter(p=>p.value!=null&&!isNaN(p.value));
+          setRawHist(rawPts);
+          setHist(transformPts(rawPts));
+          setHistSource(d.interpolated?"interpolated":"direct");
+        }else{
+          setHist(null);
+          setUnavailReason(series.length>0?`Only ${series.length} data points from backend`:"no historical data for this window");
+        }
+        setLoading(false);
+      }).catch(err=>{
+        if(!cancelled){setHist(null);setUnavailReason(`history-custom error: ${err?.message||"failed"}`);setLoading(false);}
+      });
+      return()=>{cancelled=true;};
+    }
+    getHistory(ccy,{period,contributor}).then(data=>{
       if(cancelled)return;
       // If nrM/frM provided, this is a spread — compute from individual tenor legs
       const isSpread=nrM!=null&&frM!=null;
@@ -230,8 +317,17 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
         ?buildSpreadHistory(data,nrM,frM)
         :buildHistoryForTenor(data,tenor,isSwapPts,monthHint);
       if(pts&&pts.length>10){
-        setHist(pts);
+        setRawHist(pts);
+        setHist(transformPts(pts));
         setHistSource(source);
+        // Extract spot series (for IY view)
+        const rics=Object.keys(data.history||{});
+        const spotRic=rics.find(r=>r.match(/^[A-Z]{6}=$/));
+        const sMap={};
+        if(spotRic&&data.history[spotRic]){for(const b of data.history[spotRic]){const v=barMid(b);if(v!=null&&b.Date)sMap[b.Date]=v;}}
+        setSpotHist(sMap);
+        // Build SOFR-per-date history for IY view: pick RIC matching current tenor, else fall back.
+        setSofrHist(buildSofrHist(data,monthHint||(nrM!=null&&frM!=null?(frM-nrM):null)));
       }else{
         setHist(null);
         setUnavailReason(pts&&pts.length>0
@@ -250,19 +346,82 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
     });
     return()=>{cancelled=true;};
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[ccy,tenor,isSwapPts,monthHint,nrM,frM]);
-  const stats=useMemo(()=>hist?calcStats(hist,sigN):null,[hist,sigN]);
-  const rsiD=useMemo(()=>hist?calcRSI(hist):[],[hist]);
-  const macdD=useMemo(()=>hist?calcMACD(hist):{line:[],signal:[],hist:[]},[hist]);
-  const bb=useMemo(()=>hist?calcBB(hist):{upper:[],lower:[],mid:[]},[hist]);
-  const s20=useMemo(()=>hist?calcSMA(hist,20):[],[hist]);
-  const s50=useMemo(()=>hist?calcSMA(hist,50):[],[hist]);
-  const zDev=useMemo(()=>hist?calcZDev(hist,sigN):[],[hist,sigN]);
+  },[ccy,tenor,isSwapPts,monthHint,nrM,frM,nrDate,frDate,period,contributor]);
+
+  // Custom fwd-fwd spread history (only when user changes dates beyond initial — avoids duplicate chart).
+  useEffect(()=>{
+    if(!customNear||!customFar){setCustomSeries(null);return;}
+    // If the current main chart is already rendering these exact dates via useBackendCustom, skip duplicate fetch.
+    if(useBackendCustom&&customNear===nrDate&&customFar===frDate){setCustomSeries(null);return;}
+    let cancelled=false;
+    getHistoryCustom({ccy,near:customNear,far:customFar,period,contributor})
+      .then(d=>{if(!cancelled)setCustomSeries(d);})
+      .catch(()=>{if(!cancelled)setCustomSeries(null);});
+    return()=>{cancelled=true;};
+  },[ccy,customNear,customFar,period,contributor]);
+  // View-aware history (swap/iy/ppd) for stats+indicators. Use hist for structure + replace value.
+  const vHist=useMemo(()=>{
+    if(!hist)return null;
+    if(viewMode==="swap")return hist;
+    const out=[];
+    for(let i=0;i<hist.length;i++){const v=(typeof vals[i]==="number"&&isFinite(vals[i]))?vals[i]:null;if(v!=null)out.push({date:hist[i].date,value:v});}
+    return out.length>5?out:null;
+  },[hist,viewMode,vals]);
+  const stats=useMemo(()=>vHist?calcStats(vHist,sigN):null,[vHist,sigN]);
+  const rsiD=useMemo(()=>vHist?calcRSI(vHist):[],[vHist]);
+  const macdD=useMemo(()=>vHist?calcMACD(vHist):{line:[],signal:[],hist:[]},[vHist]);
+  const bb=useMemo(()=>vHist?calcBB(vHist):{upper:[],lower:[],mid:[]},[vHist]);
+  const s20=useMemo(()=>vHist?calcSMA(vHist,20):[],[vHist]);
+  const s50=useMemo(()=>vHist?calcSMA(vHist,50):[],[vHist]);
+  const zDev=useMemo(()=>vHist?calcZDev(vHist,sigN):[],[vHist,sigN]);
   const[btPeriod,setBtPeriod]=useState(252);
-  const btRes=useMemo(()=>hist?backtest(hist,btPeriod):[],[hist,btPeriod]);
+  const btRes=useMemo(()=>vHist?backtest(vHist,btPeriod):[],[vHist,btPeriod]);
   const[selSt,setSelSt]=useState(null);const[hovSt,setHovSt]=useState(null);
-  const dates=hist?hist.map(h=>h.date):[];const vals=hist?hist.map(h=>h.value):[];
-  const yLabel=isSwapPts?"Swap Points (pips)":"Level";
+  const dates=hist?hist.map(h=>h.date):[];
+  // Tenor days heuristic for IY/PPD
+  const tenorDays=(()=>{
+    if(fundingTenor==="ON")return 1; if(fundingTenor==="TN")return 1; if(fundingTenor==="SN")return 1;
+    if(nrM!=null&&frM!=null)return Math.max(1,(frM-nrM)*30);
+    if(monthHint)return Math.max(1,Math.round(monthHint*30));
+    return 30;
+  })();
+  // Current SOFR for this tenor from live snapshot (approximation — SOFR history not fetched).
+  const currentSofr=(()=>{
+    if(!ad||!ad.rows)return null;
+    const r=ad.rows.find(x=>x.month===(monthHint||Math.round(tenorDays/30)));
+    return r?.sofT??null;
+  })();
+  // Build series per viewMode
+  let vals=[];
+  if(hist){
+    if(viewMode==="swap"){vals=hist.map(h=>h.value);}
+    else if(viewMode==="ppd"){vals=hist.map(h=>h.value*365/Math.max(tenorDays,1)/PF);}
+    else if(viewMode==="iy"){
+      // Need spot per date + fwdPoints (raw) + current SOFR (approximation).
+      vals=hist.map((h,i)=>{
+        const raw=rawHist?.[i]?.value;
+        if(raw==null)return null;
+        const iso=h.date instanceof Date?h.date.toISOString().slice(0,10):null;
+        const spot=spotHist?.[iso]??ad?.sMT;
+        // Prefer per-date SOFR from history; fall back to previous bar; then current snapshot.
+        let sofrForDate=null;
+        if(sofrHist&&iso){
+          sofrForDate=sofrHist[iso];
+          if(sofrForDate==null){
+            // walk back up to 7 days
+            const d=new Date(iso);
+            for(let k=1;k<=7&&sofrForDate==null;k++){d.setDate(d.getDate()-1);const key=d.toISOString().slice(0,10);sofrForDate=sofrHist[key];}
+          }
+        }
+        if(sofrForDate==null)sofrForDate=currentSofr;
+        if(spot==null||sofrForDate==null)return null;
+        const fwd=vm==="outright"?spot+raw:spot+raw/PF;
+        return implYld(fwd,spot,sofrForDate,tenorDays);
+      });
+    }
+  }
+  const yLabel=viewMode==="swap"?(isSwapPts?"Swap Points (pips)":"Level")
+    :viewMode==="iy"?"Implied Yield (%)":"PPD";
   const priceTraces=[
     {x:dates,y:vals,type:"scatter",mode:"lines",name:tenor,line:{color:"#10B981",width:1.8}},
     {x:dates,y:s20,type:"scatter",mode:"lines",name:"SMA(20)",line:{color:"#FBBF24",width:1,dash:"dot"},opacity:.7},
@@ -305,9 +464,20 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
   return(
     <div style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,.85)",zIndex:100,display:"flex",justifyContent:"center",alignItems:"center",padding:8}} onClick={onClose}>
       <div style={{background:"#0F172A",border:"1px solid #334155",borderRadius:8,width:"96%",maxWidth:1300,maxHeight:"96vh",overflow:"auto",padding:12}} onClick={e=>e.stopPropagation()}>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6,flexWrap:"wrap",gap:4}}>
           <h2 style={{fontSize:13,fontWeight:800,color:"#F8FAFC",margin:0}}>{tenor} — Historical {isSwapPts?"(Swap Points)":""}{histSource==='interpolated'&&<span style={{color:"#60A5FA",fontWeight:400,fontSize:9,marginLeft:8}}>Interpolated from anchor data</span>}</h2>
-          <button onClick={onClose} style={{background:"#1E293B",border:"1px solid #334155",color:"#94A3B8",padding:"3px 10px",borderRadius:4,cursor:"pointer",fontSize:9}}>Close (ESC)</button>
+          <div style={{display:"flex",gap:4,alignItems:"center",flexWrap:"wrap"}}>
+            <div style={{display:"flex",gap:2}}>{["1D","5D","1M","3M","6M","1Y","3Y","5Y","10Y","Max"].map(p=>(<button key={p} onClick={()=>setPeriod(p)} style={{fontSize:7.5,padding:"1px 5px",borderRadius:3,border:"none",cursor:"pointer",background:period===p?"#3B82F6":"#1E293B",color:period===p?"#FFF":"#94A3B8"}}>{p}</button>))}</div>
+            <div style={{display:"flex",gap:2,borderLeft:"1px solid #334155",paddingLeft:4}}>{[["swap","Swap Pts"],["iy","Impl Yld"],["ppd","PPD"]].map(([k,l])=>(<button key={k} onClick={()=>setViewMode(k)} style={{fontSize:7.5,padding:"1px 5px",borderRadius:3,border:"none",cursor:"pointer",background:viewMode===k?"#8B5CF6":"#1E293B",color:viewMode===k?"#FFF":"#94A3B8"}}>{l}</button>))}</div>
+            {brokersMeta&&Object.keys(brokersMeta).length>0&&(<select value={contributor||""} onChange={e=>setContributor(e.target.value||null)} style={{background:"#1E293B",border:"1px solid #334155",color:"#E2E8F0",borderRadius:3,padding:"1px 4px",fontSize:8}}>
+              <option value="">Refinitiv</option>
+              {Object.entries(brokersMeta).map(([code,m])=>(<option key={code} value={code}>{m.label||code}</option>))}
+            </select>)}
+            <span style={{fontSize:7.5,color:"#64748B"}}>Fwd-Fwd:</span>
+            <input type="date" value={customNear} onChange={e=>setCustomNear(e.target.value)} style={{background:"#0F172A",border:"1px solid #334155",color:"#E2E8F0",borderRadius:3,padding:"1px 3px",fontSize:8}}/>
+            <input type="date" value={customFar} onChange={e=>setCustomFar(e.target.value)} style={{background:"#0F172A",border:"1px solid #334155",color:"#E2E8F0",borderRadius:3,padding:"1px 3px",fontSize:8}}/>
+            <button onClick={onClose} style={{background:"#1E293B",border:"1px solid #334155",color:"#94A3B8",padding:"3px 10px",borderRadius:4,cursor:"pointer",fontSize:9}}>Close (ESC)</button>
+          </div>
         </div>
         <div style={{display:"grid",gridTemplateColumns:"1fr 220px",gap:8}}>
           <div>
@@ -337,6 +507,12 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
             <div style={{display:"flex",justifyContent:"space-between",padding:"1px 0",borderBottom:"1px solid #1E293B",fontSize:8.5}}><span style={{color:"#64748B"}}>Z(Dev,{sigN})</span><span style={{color:stats.zDev==null?"#475569":(Math.abs(stats.zDev)>=2?"#F472B6":Math.abs(stats.zDev)>=1?"#FBBF24":"#4ADE80"),fontFamily:"monospace",fontWeight:700}}>{stats.zDev!=null?stats.zDev.toFixed(2):"—"}</span></div>
           </div>
         </div>
+        {customSeries&&customSeries.series&&customSeries.series.length>0&&(
+          <div style={{marginTop:8,background:"#131C2E",borderRadius:5,padding:6}}>
+            <div style={{fontSize:9,fontWeight:800,color:"#60A5FA",letterSpacing:".1em",marginBottom:4}}>CUSTOM FWD-FWD SPREAD {customSeries.interpolated&&<span style={{color:"#FBBF24",fontWeight:400,fontSize:8,marginLeft:6}}>interpolated</span>}</div>
+            <PChart traces={[{x:customSeries.series.map(p=>p.date),y:customSeries.series.map(p=>p.spread),type:"scatter",mode:"lines",name:`${customSeries.nearDate} × ${customSeries.farDate}`,line:{color:"#F59E0B",width:1.5}}]} layout={{title:{text:`Fwd-Fwd spread ${customSeries.nearDate} × ${customSeries.farDate}`,font:{size:9}},yaxis:{title:"Pts"}}} height={150}/>
+          </div>
+        )}
         {/* Backtesting */}
         <div style={{marginTop:8,background:"#131C2E",borderRadius:5,padding:6}}>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
@@ -368,22 +544,56 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
     </div>);
 }
 
+// ══════════════════════ FUNDING TABLE ══════════════════════
+const FRESH_OPACITY={fresh:1.0,stale:0.6,very_stale:0.35,unknown:0.5};
+function FundingTbl({ad,brokersMeta,onDbl}){
+  const funding=ad.funding||{};
+  const tenors=["ON","TN","SN"].filter(t=>funding[t]);
+  if(!tenors.length)return null;
+  // Union of source keys present across tenors, preserving order: composite first, then brokers.
+  const srcSet=new Set();
+  for(const t of tenors){const bs=funding[t]?.bySource||{};for(const k of Object.keys(bs))srcSet.add(k);}
+  const selection=ad.selection||[];
+  const sources=[];
+  if(srcSet.has("composite")&&selection.includes("composite"))sources.push("composite");
+  for(const b of (ad.cfg.brokers||[]))if(srcSet.has(b)&&selection.includes(b))sources.push(b);
+  if(!sources.length)return null;
+  const labelFor=k=>k==="composite"?"Refinitiv":(brokersMeta?.[k]?.label||k);
+  const pdp=ad.cfg.pipDp??1;
+  return(<div style={{background:"#131C2E",borderRadius:5,padding:6,marginBottom:6}}>
+    <div style={{fontSize:9.5,fontWeight:800,color:"#FB923C",marginBottom:3,letterSpacing:".05em"}}>{ad.cfg.pair} FUNDING (ON / TN / SN)</div>
+    <div style={{overflowX:"auto"}}><table style={{borderCollapse:"collapse",width:"100%",fontSize:9,minWidth:600}}>
+      <thead><tr><th style={{...tS(),textAlign:"left"}}>Tenor</th>
+        {sources.map(s=><React.Fragment key={s}><th style={tS("#4ADE80")}>{labelFor(s)} B</th><th style={tS("#FBBF24")}>{labelFor(s)} M</th><th style={tS("#F87171")}>{labelFor(s)} A</th></React.Fragment>)}
+      </tr></thead>
+      <tbody>{tenors.map((t,i)=>{const bySource=funding[t]?.bySource||{};return(<tr key={t} style={{background:i%2===0?"#0F172A":"#131C2E",cursor:"pointer"}} title="Double-click for history" onDoubleClick={()=>onDbl&&onDbl(`${t} Funding`,funding[t]?.T?.mid||0,true,null,null,null,null,null,t)}>
+        <td style={{...cS("#CBD5E1",true),textAlign:"left"}}>{t}</td>
+        {sources.map(s=>{const v=bySource[s];const has=v&&v.hasData&&(v.T.bid!=null||v.T.mid!=null||v.T.ask!=null);const op=has?(FRESH_OPACITY[v.freshness]??1):1;
+          return<React.Fragment key={s}>
+            <td style={{...cS(has?"#4ADE80":"#334155"),opacity:op}}>{has?FP(v.T.bid,pdp):"—"}</td>
+            <td style={{...cS(has?"#FBBF24":"#334155",true),opacity:op}} title={has?`${v.freshness||''} ${v.timact||''} ${v.ric||''}`:"no data"}>{has?FP(v.T.mid,pdp):"—"}</td>
+            <td style={{...cS(has?"#F87171":"#334155"),opacity:op}}>{has?FP(v.T.ask,pdp):"—"}</td>
+          </React.Fragment>;})}
+      </tr>);})}</tbody></table></div></div>);
+}
+
 // ══════════════════════ SPREAD TABLE ══════════════════════
 function SprTbl({spreads,title,color,mx,onDbl,pdp=1}){
   if(!spreads||!spreads.length)return null;
   return(<div style={{background:"#131C2E",borderRadius:5,padding:6,marginBottom:6}}>
     <div style={{fontSize:9.5,fontWeight:800,color,marginBottom:3,letterSpacing:".05em"}}>{title}</div>
     <div style={{overflowX:"auto"}}><table style={{borderCollapse:"collapse",width:"100%",minWidth:1000,fontSize:9}}>
-      <thead><tr><th style={{...tS(),textAlign:"left",minWidth:60}}>Spread</th><th style={tS()}>Near Val</th><th style={tS()}>Near Fix</th><th style={tS()}>Far Val</th><th style={tS()}>Far Fix</th><th style={tS()}>Days</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#F87171")}>Ask</th><th style={tS()}>D/D</th><th style={tS()}>Pts/D</th><th style={tS("#4ADE80")}>Iy Bid</th><th style={tS("#34D399")}>Iy Mid</th><th style={tS("#F87171")}>Iy Ask</th><th style={tS()}>Iy D/D</th><th style={tS()}>Iy bp/d</th><th style={tS("#FB923C")}>SOFR%</th><th style={tS("#C084FC")}>Basis</th></tr></thead>
-      <tbody>{spreads.map((s,i)=>(<tr key={i} style={{background:i%2===0?"#0F172A":"#131C2E",cursor:"pointer"}} onDoubleClick={()=>onDbl&&onDbl(s.label,Math.abs(s.pM)||1,true,null,s.nrM,s.frM)}>
-        <td style={{...cS(color,true),textAlign:"left"}}>{s.label}</td>
+      <thead><tr><th style={{...tS(),textAlign:"left",minWidth:60}}>Spread</th><th style={tS()}>Near Val</th><th style={tS()}>Near Fix</th><th style={tS()}>Far Val</th><th style={tS()}>Far Fix</th><th style={tS()}>Days</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#F87171")}>Ask</th><th style={tS()}>D/D</th><th style={tS()}>Pts/D</th><th style={tS("#22D3EE")} title="Static-curve carry (display pips). Spot-start: carry=fwdPts[T]. Fwd-fwd NxF: carry=fwdPts[F-N]-(fwdPts[F]-fwdPts[N]).">Carry</th><th style={tS("#4ADE80")}>Iy Bid</th><th style={tS("#34D399")}>Iy Mid</th><th style={tS("#F87171")}>Iy Ask</th><th style={tS()}>Iy D/D</th><th style={tS()}>Iy bp/d</th><th style={tS("#FB923C")}>SOFR%</th><th style={tS("#C084FC")}>Basis</th></tr></thead>
+      <tbody>{spreads.map((s,i)=>{const iso=d=>{if(!d)return null;const x=d instanceof Date?d:new Date(d);if(isNaN(x))return null;return x.toISOString().slice(0,10);};const ndIso=iso(s.nrVD),fdIso=iso(s.frVD);return(<tr key={i} style={{background:i%2===0?"#0F172A":"#131C2E",cursor:s.unavailable?"default":"pointer",opacity:s.unavailable?.55:1}} onDoubleClick={()=>!s.unavailable&&onDbl&&onDbl(s.label,Math.abs(s.pM)||1,true,null,s.nrM,s.frM,ndIso,fdIso)}>
+        <td style={{...cS(color,true),textAlign:"left"}} title={s.unavailable?s.unavailableReason:undefined}>{s.label}{s.unavailable?" *":""}</td>
         <td style={cS("#475569")}>{fD(s.nrVD)}</td><td style={cS("#475569")}>{fD(s.nrFxD)}</td><td style={cS("#475569")}>{fD(s.frVD)}</td><td style={cS("#475569")}>{fD(s.frFxD)}</td><td style={cS("#475569",false,true)}>{s.days}</td>
         <td style={cS("#4ADE80")}>{FP(s.pB,pdp)}</td><td style={cS("#FBBF24",true)}>{FP(s.pM,pdp)}</td><td style={cS("#F87171")}>{FP(s.pA,pdp)}</td>
         <td style={{...cS(CC(s.chg)),background:HB(s.chg,mx)}}>{FP(s.chg,pdp)}</td><td style={cS("#64748B",false,true)}>{F(s.ppd,2)}</td>
+        <td style={cS(s.carry!=null&&s.carry>=0?"#22D3EE":"#F472B6",true)} title={s.carry==null?"—":(s.nearLabel&&s.nearLabel!=="Spot"?"fwdPts[F-N]−(fwdPts[F]−fwdPts[N])":"fwdPts[T] (spot-start)")}>{s.carry!=null?FP(s.carry,pdp):"—"}</td>
         <td style={cS("#4ADE80")}>{F(s.fIyB,2)}</td><td style={cS("#34D399",true)}>{F(s.fIy,2)}</td><td style={cS("#F87171")}>{F(s.fIyA,2)}</td>
         <td style={{...cS(CC(s.iyChg)),background:HB(s.iyChg,.1)}}>{FP(s.iyChg,2)}</td><td style={cS("#64748B")}>{s.iyBpD!=null?F(s.iyBpD,2):"—"}</td>
         <td style={cS("#FB923C")}>{F(s.fSof,2)}</td><td style={cS(s.bas!=null&&s.bas>=0?"#C084FC":"#F472B6",true)}>{s.bas!=null?FP(s.bas*100,1):"—"}</td>
-      </tr>))}</tbody></table></div></div>);
+      </tr>);})}</tbody></table></div></div>);
 }
 
 // ══════════════════════ TOOLS ══════════════════════
@@ -452,7 +662,7 @@ function ToolsPanel({ad,onDbl,ccy}){
         <button onClick={()=>setMode("date")} style={{fontSize:7.5,padding:"1px 6px",borderRadius:3,border:"none",cursor:"pointer",background:mode==="date"?"#3B82F6":"#1E293B",color:mode==="date"?"#FFF":"#64748B"}}>By Date</button>
       </div>
       {mode==="month"?(<div style={{display:"flex",gap:4,alignItems:"center",marginBottom:6}}><span style={{fontSize:8,color:"#64748B"}}>Near:</span>{sel(nearM,setNearM)}<span style={{fontSize:8,color:"#64748B"}}>Far:</span>{sel(farM,setFarM)}</div>):(<div style={{display:"flex",gap:4,alignItems:"center",marginBottom:6,flexWrap:"wrap"}}><span style={{fontSize:8,color:"#64748B"}}>Near date:</span><input type="date" value={nearDt} onChange={e=>setNearDt(e.target.value)} style={{background:"#0F172A",border:"1px solid #334155",color:"#E2E8F0",borderRadius:3,padding:"2px 4px",fontSize:9}}/><span style={{fontSize:8,color:"#64748B"}}>Far date:</span><input type="date" value={farDt} onChange={e=>setFarDt(e.target.value)} style={{background:"#0F172A",border:"1px solid #334155",color:"#E2E8F0",borderRadius:3,padding:"2px 4px",fontSize:9}}/></div>)}
-      {custom&&(<div style={{background:"#0F172A",borderRadius:4,padding:6,fontSize:9,cursor:"pointer"}} onDoubleClick={()=>onDbl&&onDbl(custom.label,Math.abs(custom.pM)||1,true)}>
+      {custom&&(()=>{const iso=d=>{if(!d)return null;const x=d instanceof Date?d:new Date(d);if(isNaN(x))return null;return x.toISOString().slice(0,10);};const ndIso=mode==="date"?nearDt:iso(custom.nrVD);const fdIso=mode==="date"?farDt:iso(custom.frVD);return(<div style={{background:"#0F172A",borderRadius:4,padding:6,fontSize:9,cursor:"pointer"}} onDoubleClick={()=>onDbl&&onDbl(custom.label,Math.abs(custom.pM)||1,true,null,null,null,ndIso,fdIso)}>
         <div style={{color:"#FBBF24",fontWeight:700,marginBottom:3}}>{custom.label} <span style={{color:"#475569",fontWeight:400,fontSize:7.5}}>(double-click for historical)</span></div>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:3}}>
           <div><span style={{color:"#64748B"}}>Bid: </span><span style={{color:"#4ADE80",fontFamily:"monospace"}}>{FP(custom.pB,1)}</span></div>
@@ -464,7 +674,7 @@ function ToolsPanel({ad,onDbl,ccy}){
           <div><span style={{color:"#64748B"}}>Near Fix: </span><span style={{color:"#E2E8F0",fontFamily:"monospace"}}>{fD(custom.nrFxD)}</span></div>
           <div><span style={{color:"#64748B"}}>Far Val: </span><span style={{color:"#E2E8F0",fontFamily:"monospace"}}>{fD(custom.frVD)}</span></div>
           <div><span style={{color:"#64748B"}}>Far Fix: </span><span style={{color:"#E2E8F0",fontFamily:"monospace"}}>{fD(custom.frFxD)}</span></div>
-        </div></div>)}
+        </div></div>);})()}
     </div>
     <div style={{background:"#131C2E",borderRadius:5,padding:8}}>
       <div style={{fontSize:9.5,fontWeight:800,color:"#F59E0B",marginBottom:4,letterSpacing:".05em"}}>SCENARIO CALCULATOR</div>
@@ -488,14 +698,14 @@ function ToolsPanel({ad,onDbl,ccy}){
 }
 
 // ══════════════════════ BROKER MONITOR ══════════════════════
-function BrokerMon({ad,liveQuotes={},liveOn=false}){
+function BrokerMon({ad,liveOn=false}){
   const{rows,ccy,cfg}=ad;const maxT=ad.maxT||24;
   const pdp=cfg.pipDp??1;
-  const PF=cfg.pipFactor||1e3;
-  const ptsOutright=cfg.ptsInOutright||false;
-  // For ptsInOutright currencies, LSEG broker quotes are in outright diffs — multiply by PF for display
-  const brkMult=ptsOutright?PF:1;
-  const[selBrokers,setSelBrokers]=useState(["ICAP","BGCP","TRDS","TPTS","PYNY","GMGM"]);
+  const brokersAvail=cfg.brokers||[];
+  const brokersMeta=cfg.brokersMeta||{};
+  // Broker Monitor: diagnostic view — always show ALL brokers from snapshot.
+  // Do NOT filter by the user's source selection/mode.
+  const selBrokers=brokersAvail;
   const[avgBrokers,setAvgBrokers]=useState(false);
 
   // Adapt broker tenor list based on kind
@@ -508,7 +718,7 @@ function BrokerMon({ad,liveQuotes={},liveOn=false}){
   ];
   const brokerTenors=cfg.kind==="NDF"?NDF_BROKER_TENORS:DELIVERABLE_BROKER_TENORS;
   const allT=brokerTenors.filter(t=>{if(t.type==="outright")return true;return t.far<=maxT;});
-  const brokerList=["ICAP","BGCP","TRDS","TPTS","PYNY","GMGM"];
+  const brokerList=selBrokers;
 
   function getSpreadVal(t){
     if(t.type==="outright"){const r=rows.find(x=>x.month===t.m);return r?{bid:r.spB,mid:r.spM,ask:r.spA}:null;}
@@ -516,46 +726,32 @@ function BrokerMon({ad,liveQuotes={},liveOn=false}){
     return{bid:fr.spB!=null&&nr.spA!=null?fr.spB-nr.spA:null,mid:fr.spM!=null&&nr.spM!=null?fr.spM-nr.spM:null,ask:fr.spA!=null&&nr.spB!=null?fr.spA-nr.spB:null};
   }
 
-  // Build broker RIC name for a given tenor month and contributor
-  function brokerRic(m,contrib){
-    const tenor=m===0?"":m<12?`${m}M`:m===12?"1Y":m===18?"18M":m===24?"2Y":`${m}M`;
-    if(cfg.kind==="NDF")return`${ccy}${tenor}NDF=${contrib}`;
-    return`${ccy}${tenor}=${contrib}`;
+  // Per-broker per-tenor display-pts from the new sources metadata on each row.
+  function brkAt(month,contrib){
+    const r=rows.find(x=>x.month===month);
+    return r?.sourcesMeta?.bySource?.[contrib]||null;
   }
 
-  // Get live broker data for a specific tenor setup and contributor
   function getBrokerVal(t,contrib){
     if(t.type==="outright"){
-      const ric=brokerRic(t.m,contrib);
-      const q=liveQuotes[ric];
-      if(!q)return null;
-      const b=q.bid!=null?q.bid*brkMult:null,a=q.ask!=null?q.ask*brkMult:null;
-      return{bid:b,mid:(q.mid??mid(q.bid,q.ask))!=null?(q.mid??mid(q.bid,q.ask))*brkMult:null,ask:a};
+      const v=brkAt(t.m,contrib);
+      if(!v)return null;
+      return{bid:v.b,mid:v.m,ask:v.a,freshness:v.freshness,timact:v.timact};
     }
-    // Spread: get near and far broker RICs
-    const nrRic=brokerRic(t.near===0?1:t.near,contrib);
-    const frRic=brokerRic(t.far,contrib);
     if(t.near===0){
-      const fq=liveQuotes[frRic];
-      if(!fq)return null;
-      const b=fq.bid!=null?fq.bid*brkMult:null,a=fq.ask!=null?fq.ask*brkMult:null;
-      return{bid:b,mid:(fq.mid??mid(fq.bid,fq.ask))!=null?(fq.mid??mid(fq.bid,fq.ask))*brkMult:null,ask:a};
+      const v=brkAt(t.far,contrib);
+      if(!v)return null;
+      return{bid:v.b,mid:v.m,ask:v.a,freshness:v.freshness,timact:v.timact};
     }
-    const nq=liveQuotes[nrRic],fq=liveQuotes[frRic];
-    if(!nq||!fq)return null;
-    const nMid=nq.mid??mid(nq.bid,nq.ask),fMid=fq.mid??mid(fq.bid,fq.ask);
+    const n=brkAt(t.near,contrib),f=brkAt(t.far,contrib);
+    if(!n||!f)return null;
     return{
-      bid:fq.bid!=null&&nq.ask!=null?(fq.bid-nq.ask)*brkMult:null,
-      mid:fMid!=null&&nMid!=null?(fMid-nMid)*brkMult:null,
-      ask:fq.ask!=null&&nq.bid!=null?(fq.ask-nq.bid)*brkMult:null,
+      bid:f.b!=null&&n.a!=null?f.b-n.a:null,
+      mid:f.m!=null&&n.m!=null?f.m-n.m:null,
+      ask:f.a!=null&&n.b!=null?f.a-n.b:null,
+      freshness:(FRESH_OPACITY[f.freshness]||1)<(FRESH_OPACITY[n.freshness]||1)?f.freshness:n.freshness,
+      timact:f.timact||n.timact,
     };
-  }
-
-  // Cell renderer for broker value
-  function BrkCell({t,contrib,color}){
-    const v=getBrokerVal(t,contrib);
-    if(!v)return<td style={cS("#334155")}>{liveOn?"—":"Live only"}</td>;
-    return<td style={cS(color)}>{FP(v.mid??v.bid??v.ask,pdp)}</td>;
   }
 
   return(<div>
@@ -577,7 +773,7 @@ function BrokerMon({ad,liveQuotes={},liveOn=false}){
     <div style={{fontSize:10,fontWeight:800,color:"#60A5FA",marginBottom:6,letterSpacing:".05em"}}>PER-BROKER CONTRIBUTIONS — {cfg.pair} ({ccy}){liveOn&&<span style={{color:"#4ADE80",fontSize:8,marginLeft:8}}>● LIVE</span>}</div>
     <div style={{background:"#131C2E",borderRadius:5,padding:6,marginBottom:6}}>
       <div style={{marginBottom:6,display:"flex",gap:4,alignItems:"center",flexWrap:"wrap"}}>
-        {brokerList.map(b=>(<label key={b} style={{fontSize:8,color:"#E2E8F0",display:"flex",alignItems:"center",gap:2,cursor:"pointer"}}><input type="checkbox" checked={selBrokers.includes(b)} onChange={e=>e.target.checked?setSelBrokers([...selBrokers,b]):setSelBrokers(selBrokers.filter(x=>x!==b))} style={{accentColor:"#3B82F6",width:8,height:8}}/>{b}</label>))}
+        <span style={{fontSize:8,color:"#64748B"}}>All brokers shown (diagnostic view)</span>
         <div style={{borderLeft:"1px solid #334155",paddingLeft:8}}>
           <label style={{fontSize:8,color:"#E2E8F0",display:"flex",alignItems:"center",gap:2,cursor:"pointer"}}><input type="checkbox" checked={avgBrokers} onChange={e=>setAvgBrokers(e.target.checked)} style={{accentColor:"#3B82F6",width:8,height:8}}/>Average</label>
         </div>
@@ -596,13 +792,14 @@ function BrokerMon({ad,liveQuotes={},liveOn=false}){
           const avgAsk=withData.length>0?withData.reduce((s,x)=>s+(x.v.ask??x.v.mid),0)/withData.length:null;
           return(<tr key={idx} style={{background:idx%2===0?"#0F172A":"#131C2E"}}>
           <td style={{...cS("#CBD5E1",true),textAlign:"left"}}>{t.label}</td>
-          {selBrokers.map(b=>{const v=getBrokerVal(t,b);const hasV=v&&(v.bid!=null||v.mid!=null||v.ask!=null);
+          {selBrokers.map(b=>{const v=getBrokerVal(t,b);const hasV=v&&(v.bid!=null||v.mid!=null||v.ask!=null);const op=hasV?(FRESH_OPACITY[v.freshness]??1):1;const stale=hasV&&v.freshness&&v.freshness!=='fresh';
+            const badge=stale?<span style={{fontSize:6,color:"#F59E0B",marginLeft:2}}>{v.freshness==='very_stale'?'⏸':''}{v.timact||''}</span>:null;
             return<React.Fragment key={b}>
-              <td style={cS(hasV?"#4ADE80":"#334155")}>{hasV?FP(v.bid,pdp):(liveOn?"—":"Live only")}</td>
-              <td style={cS(hasV?"#FBBF24":"#334155",true)}>{hasV?FP(v.mid,pdp):(liveOn?"—":"Live only")}</td>
-              <td style={cS(hasV?"#F87171":"#334155")}>{hasV?FP(v.ask,pdp):(liveOn?"—":"Live only")}</td>
+              <td style={{...cS(hasV?"#4ADE80":"#334155"),opacity:op}} title={hasV?`${v.freshness||''} ${v.timact||''}`:"no data in selected sources"}>{hasV?FP(v.bid,pdp):(liveOn?"—":"—")}</td>
+              <td style={{...cS(hasV?"#FBBF24":"#334155",true),opacity:op}}>{hasV?<>{FP(v.mid,pdp)}{badge}</>:(liveOn?"—":"—")}</td>
+              <td style={{...cS(hasV?"#F87171":"#334155"),opacity:op}}>{hasV?FP(v.ask,pdp):(liveOn?"—":"—")}</td>
             </React.Fragment>;})}
-          {avgBrokers&&<><td style={cS("#10B981")}>{avgBid!=null?FP(avgBid,pdp):"—"}</td><td style={cS("#34D399")}>{avgMid!=null?FP(avgMid,pdp):"—"}</td><td style={cS("#A78BFA")}>{avgAsk!=null?FP(avgAsk,pdp):"—"}</td></>}
+          {avgBrokers&&<><td style={cS("#10B981")}>{avgBid!=null?FP(avgBid,pdp):"—"}</td><td style={cS("#34D399")} title={`${withData.length}/${brkVals.length} fresh`}>{avgMid!=null?<>{FP(avgMid,pdp)}<div style={{fontSize:6,color:"#64748B"}}>{withData.length}/{brkVals.length}</div></>:"—"}</td><td style={cS("#A78BFA")}>{avgAsk!=null?FP(avgAsk,pdp):"—"}</td></>}
         </tr>);})}
       </tbody></table>
     </div>
@@ -624,8 +821,17 @@ export default function Dashboard(){
   const[showI,setShowI]=useState(true);const[tab,setTab]=useState("main");
   const[hm,setHm]=useState(null);
   const[ccy,setCcy]=useState("TWD");
-  const ALL_SOURCES=["DEFAULT","ICAP","BGCP","TRDS","TPTS","PYNY","GMGM"];
-  const[sources,setSources]=useState(["DEFAULT"]);
+  // Per-ccy source selection + mode. Default seeded on snapshot load.
+  const[sourcesByCcy,setSourcesByCcy]=useState({});
+  const[modeByCcy,setModeByCcy]=useState({});
+  const manualSelection=sourcesByCcy[ccy];
+  const mode=modeByCcy[ccy]||"Auto";
+  // Effective selection fed to aggregateSources:
+  //   Auto → composite (if present) + all brokers → aggregateSources skips sources without data per tenor.
+  //   Manual → user-picked subset.
+  const selection=(!manualSelection||!snap)?null:(mode==="Auto"
+    ?(snap.deriveFromOutrights?(snap.brokers||[]):["composite",...(snap.brokers||[])])
+    :manualSelection);
   const[err,setErr]=useState(null);
   const[lastReload,setLastReload]=useState(null);
   const[reloadMsg,setReloadMsg]=useState(null);
@@ -635,7 +841,18 @@ export default function Dashboard(){
   useEffect(()=>{getCurrencies().then(setMeta).catch(e=>setErr(e.message));},[]);
   useEffect(()=>{
     setErr(null);setSnap(null);setLiveQuotes({});
-    getSnapshot(ccy).then(s=>{setSnap(s);setLastReload(new Date());}).catch(e=>setErr(e.message));
+    getSnapshot(ccy).then(s=>{
+      setSnap(s);setLastReload(new Date());
+      setSourcesByCcy(prev=>{
+        if(prev[ccy])return prev; // persist across ccy switches
+        const init=s.deriveFromOutrights?((s.brokers||[]).slice(0,1)):["composite"];
+        return{...prev,[ccy]:init};
+      });
+      setModeByCcy(prev=>{
+        if(prev[ccy])return prev;
+        return{...prev,[ccy]:s.deriveFromOutrights?"Manual":"Auto"};
+      });
+    }).catch(e=>setErr(e.message));
   },[ccy]);
 
   // Live streaming
@@ -665,7 +882,7 @@ export default function Dashboard(){
     return()=>clearInterval(iv);
   },[liveOn]);
 
-  const ad=useMemo(()=>buildAllData(snap,liveQuotes,sources),[snap,liveQuotes,liveTick,sources]);
+  const ad=useMemo(()=>buildAllData(snap,liveQuotes,selection),[snap,liveQuotes,liveTick,selection]);
   const refreshSnap=useCallback(()=>{
     getSnapshot(ccy).then(s=>{
       setSnap(s);
@@ -676,7 +893,7 @@ export default function Dashboard(){
   },[ccy]);
 
   if(err)return <div style={{padding:20,color:"#F87171"}}>Backend error: {err}</div>;
-  if(!meta||!snap||!ad)return <div style={{padding:20,color:"#64748B"}}>Loading…</div>;
+  if(!meta||!snap||!ad||!selection)return <div style={{padding:20,color:"#64748B"}}>Loading…</div>;
 
   const{rows,immR,anchors,qFF,spSpr,immSpr,cfg}=ad;
   const filt=showI?rows:rows.filter(r=>!r.interp);
@@ -689,7 +906,7 @@ export default function Dashboard(){
   const mRP=Math.max(...mr.filter(r=>r.month>1).map(r=>Math.abs(r.rollP||0)),1);
   const mCY=Math.max(...mr.map(r=>Math.abs(r.carryY||0)),.01);
   const mSC=Math.max(...[...anchors,...qFF,...spSpr,...immSpr].map(s=>Math.abs(s.chg||0)),1);
-  const dblR=(t,v,isSP=false,month=null,nrM=null,frM=null)=>setHm({tenor:t,value:v,isSP,month,nrM,frM});
+  const dblR=(t,v,isSP=false,month=null,nrM=null,frM=null,nrDate=null,frDate=null,fundingTenor=null)=>setHm({tenor:t,value:v,isSP,month,nrM,frM,nrDate,frDate,fundingTenor});
   const dp=cfg.dp;
   const pdp=cfg.pipDp??1; // pip decimal places from config
 
@@ -705,7 +922,7 @@ export default function Dashboard(){
 
   return(
     <div style={{background:"#0F172A",color:"#E2E8F0",minHeight:"100vh",fontFamily:"'Inter',system-ui,sans-serif",padding:8}}>
-      {hm&&<HistModal tenor={hm.tenor} val={hm.value} isSwapPts={hm.isSP} dpOverride={dp} onClose={()=>setHm(null)} ccy={ccy} monthHint={hm.month} nrM={hm.nrM} frM={hm.frM}/>}
+      {hm&&<HistModal tenor={hm.tenor} val={hm.value} isSwapPts={hm.isSP} dpOverride={dp} onClose={()=>setHm(null)} ccy={ccy} monthHint={hm.month} nrM={hm.nrM} frM={hm.frM} nrDate={hm.nrDate} frDate={hm.frDate} brokersMeta={snap.brokersMeta} snap={snap} fundingTenor={hm.fundingTenor} ad={ad}/>}
       {/* Header */}
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6,paddingBottom:4,borderBottom:"1px solid #1E293B",flexWrap:"wrap",gap:4}}>
         <div><h1 style={{fontSize:14,fontWeight:800,margin:0,color:"#F8FAFC"}}>{cfg.pair} {cfg.kind==="NDF"?"NDF":"FWD"} Dashboard</h1>
@@ -731,12 +948,24 @@ export default function Dashboard(){
             </div>
           )}
           <label style={{fontSize:7.5,color:"#94A3B8",display:"flex",alignItems:"center",gap:2,cursor:"pointer"}}><input type="checkbox" checked={showI} onChange={()=>setShowI(!showI)} style={{accentColor:"#3B82F6",width:9,height:9}}/>Interp</label>
-          <div style={{display:"flex",gap:2,alignItems:"center",background:"#1E293B",padding:"2px 6px",borderRadius:4}}>
-            <span style={{fontSize:7,color:"#64748B",fontWeight:700}}>SRC:</span>
-            {ALL_SOURCES.map(s=>{const on=sources.includes(s);return(<button key={s} onClick={()=>{
-              if(on&&sources.length===1)return;// must have at least one
-              setSources(prev=>on?prev.filter(x=>x!==s):[...prev,s]);
-            }} style={{fontSize:7,padding:"1px 4px",borderRadius:2,border:"none",cursor:"pointer",fontWeight:600,background:on?"#3B82F6":"#0F172A",color:on?"#FFF":"#64748B"}}>{s==="DEFAULT"?"DFLT":s}</button>);})}</div>
+          <div style={{display:"flex",gap:2,alignItems:"center",background:"#1E293B",padding:"2px 6px",borderRadius:4,flexWrap:"wrap"}}>
+            <span style={{fontSize:7,color:"#64748B",fontWeight:700}}>MODE:</span>
+            {["Auto","Manual"].map(mm=>(<button key={mm} onClick={()=>setModeByCcy(p=>({...p,[ccy]:mm}))} style={{fontSize:7,padding:"1px 6px",borderRadius:2,border:"none",cursor:"pointer",fontWeight:700,background:mode===mm?"#3B82F6":"#0F172A",color:mode===mm?"#FFF":"#64748B"}}>{mm}</button>))}
+            {mode==="Manual"&&(<>
+              <span style={{fontSize:7,color:"#334155",padding:"0 2px"}}>|</span>
+              <span style={{fontSize:7,color:"#64748B",fontWeight:700}}>SRC:</span>
+              {(()=>{
+                const opts=[];
+                if(!snap.deriveFromOutrights)opts.push({code:"composite",label:"Refinitiv"});
+                for(const code of (snap.brokers||[]))opts.push({code,label:snap.brokersMeta?.[code]?.label||code});
+                return opts.map(({code,label})=>{const on=(manualSelection||[]).includes(code);return(<button key={code} onClick={()=>{
+                  if(on&&(manualSelection||[]).length===1)return;
+                  setSourcesByCcy(prev=>({...prev,[ccy]:on?(prev[ccy]||[]).filter(x=>x!==code):[...(prev[ccy]||[]),code]}));
+                }} title={label} style={{fontSize:7,padding:"1px 4px",borderRadius:2,border:"none",cursor:"pointer",fontWeight:600,background:on?"#3B82F6":"#0F172A",color:on?"#FFF":"#64748B"}}>{label}</button>);});
+              })()}
+            </>)}
+            {mode==="Auto"&&<span style={{fontSize:7,color:"#475569",fontStyle:"italic"}}>avg of all sources w/ data per tenor</span>}
+          </div>
           <div style={{background:"#1E293B",padding:"2px 6px",borderRadius:4,fontSize:9,fontFamily:"monospace"}}>
             <span style={{color:"#64748B"}}>Spot </span><span style={{color:"#4ADE80"}}>{F(rows[0].bT,dp)}</span><span style={{color:"#334155"}}>/</span><span style={{color:"#F87171"}}>{F(rows[0].aT,dp)}</span><span style={{color:"#334155"}}> | </span><span style={{color:"#FBBF24",fontWeight:700}}>{F(rows[0].mT,dp)}</span>
           </div>
@@ -806,18 +1035,24 @@ export default function Dashboard(){
         <div style={{fontSize:8.5,fontWeight:700,color:"#F8FAFC",marginBottom:2}}>1M FORWARD-FORWARD CHAIN</div>
         <div style={{overflowX:"auto",overflowY:"auto",maxHeight:"28vh",borderRadius:5,border:"1px solid #1E293B"}}>
           <table style={{borderCollapse:"collapse",width:"100%",minWidth:1200}}>
-            <thead><tr><th style={{...tS(),textAlign:"left",minWidth:55}}>Period</th><th style={tS()}>Near Val</th><th style={tS()}>Far Val</th><th style={tS()}>Days</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#F87171")}>Ask</th><th style={tS()}>D/D</th><th style={tS()}>Pts/D</th><th style={tS("#4ADE80")}>Iy Bid</th><th style={tS("#34D399")}>Iy Mid</th><th style={tS("#F87171")}>Iy Ask</th><th style={tS()}>Iy D/D</th><th style={tS()}>Iy bp/d</th><th style={tS("#FB923C")}>Fwd SOFR</th><th style={tS("#C084FC")}>Basis</th></tr></thead>
+            <thead><tr><th style={{...tS(),textAlign:"left",minWidth:55}}>Period</th><th style={tS()}>Near Val</th><th style={tS()}>Far Val</th><th style={tS()}>Days</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#F87171")}>Ask</th><th style={tS()}>D/D</th><th style={tS()}>Pts/D</th><th style={tS("#22D3EE")} title="Static-curve carry (display pips)">Carry</th><th style={tS("#4ADE80")}>Iy Bid</th><th style={tS("#34D399")}>Iy Mid</th><th style={tS("#F87171")}>Iy Ask</th><th style={tS()}>Iy D/D</th><th style={tS()}>Iy bp/d</th><th style={tS("#FB923C")}>Fwd SOFR</th><th style={tS("#C084FC")}>Basis</th></tr></thead>
             <tbody>{filt.filter(r=>r.month>0).map((r,i)=>{const p=i>0?filt.filter(x=>x.month>0)[i-1]:null;const label=r.month===1?"SP×1M":p?`${p.tenor}×${r.tenor}`:`SP×${r.tenor}`;const fwdD=p?r.dT-p.dT:r.dT;const ppd=fwdD>0?r.ffM/fwdD:0;const mj=[1,2,3,6,9,12,24].includes(r.month);
+              // Row-level carry: spot-start → r.spM; fwd-fwd → fwdPts[F-N] − (fwdPts[F]−fwdPts[N]). Use r.ffM as approximation for F-N→r.spM legacy; r.carryP already = r.ffM from buildAllData.
+              const rowCarry = p == null ? r.spM : (r.ffM != null ? r.ffM : null);
               return(<tr key={r.tenor} style={{background:i%2===0?"#0F172A":"#111827",borderBottom:[3,6,9,12].includes(r.month)?"1px solid #334155":"none",cursor:"pointer"}} onDoubleClick={()=>dblR(label,r.ffM,true,r.month)}>
                 <td style={{...cS(r.interp?"#475569":(mj?"#F8FAFC":"#94A3B8"),mj),textAlign:"left"}}>{label}{r.interp?"*":""}</td>
                 <td style={cS("#475569")}>{fD(p?p.valDate:ad.TENOR_DATES[0]?.valDate)}</td><td style={cS("#475569")}>{fD(r.valDate)}</td><td style={cS("#475569",false,true)}>{fwdD}</td>
                 <td style={cS("#4ADE80")}>{FP(r.ffB,pdp)}</td><td style={cS("#FBBF24",true)}>{FP(r.ffM,pdp)}</td><td style={cS("#F87171")}>{FP(r.ffA,pdp)}</td>
                 <td style={{...cS(CC(r.ffChg)),background:HB(r.ffChg,mFC)}}>{FP(r.ffChg,pdp)}</td><td style={cS("#64748B",false,true)}>{F(ppd,2)}</td>
+                <td style={cS(rowCarry!=null&&rowCarry>=0?"#22D3EE":"#F472B6",true)}>{rowCarry!=null?FP(rowCarry,pdp):"—"}</td>
                 <td style={cS("#4ADE80")}>{F(r.ffIyB,2)}</td><td style={cS("#34D399",true)}>{F(r.ffIyM,2)}</td><td style={cS("#F87171")}>{F(r.ffIyA,2)}</td>
                 <td style={{...cS(CC(r.ffIyChg)),background:HB(r.ffIyChg,.1)}}>{FP(r.ffIyChg,2)}</td><td style={cS("#64748B")}>{r.ffIyBpD!=null?F(r.ffIyBpD,2):"—"}</td>
                 <td style={cS("#FB923C")}>{r.ffSofr!=null?F(r.ffSofr,2):"—"}</td><td style={cS(r.ffBasis!=null&&r.ffBasis>=0?"#C084FC":"#F472B6")}>{r.ffBasis!=null?FP(r.ffBasis*100,1):"—"}</td>
               </tr>);})}</tbody></table></div>
       </>)}
+
+      {/* Funding (deliverables only) */}
+      {tab==="main"&&cfg.kind!=="NDF"&&<FundingTbl ad={ad} brokersMeta={cfg.brokersMeta} onDbl={dblR}/>}
 
       {/* SPREADS TAB */}
       {tab==="spreads"&&(<div>
@@ -857,7 +1092,7 @@ export default function Dashboard(){
       </div>)}
 
       {tab==="tools"&&<ToolsPanel ad={ad} onDbl={dblR} ccy={ccy}/>}
-      {tab==="broker"&&<BrokerMon ad={ad} liveQuotes={liveQuotes} liveOn={liveOn}/>}
+      {tab==="broker"&&<BrokerMon ad={ad} liveOn={liveOn}/>}
 
       <div style={{marginTop:4,fontSize:6.5,color:"#334155",display:"flex",justifyContent:"space-between",flexWrap:"wrap",gap:2}}>
         <div>* = Calculated: ImplYld=((F/S)(1+SOFR×d/360)-1)×360/d · FwdFwd Impl=compounded from outrights · Spread bid=far_bid−near_ask · Weekly tenors interpolated (Fritsch-Carlson monotone cubic)</div>
