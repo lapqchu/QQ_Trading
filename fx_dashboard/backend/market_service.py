@@ -34,6 +34,7 @@ from ric_config import (
     CURRENCIES, SOFR_RICS, FUNDING_TENORS, BROKER_META,
     CurrencyConfig,
     all_swap_points_rics, all_outright_rics, all_broker_rics, all_funding_rics,
+    all_extended_rics, all_weekly_rics,
 )
 
 
@@ -155,6 +156,8 @@ class MarketService:
         broker_rics = all_broker_rics(ccy)                    # swap pts per broker
         sofr_rics = list(SOFR_RICS.values())
         funding_rics = all_funding_rics(ccy)                  # deliverables only
+        extended_rics = all_extended_rics(ccy)                # 4M/5M/7M/.../21M
+        weekly_rics = all_weekly_rics(ccy)                    # SW / 2W / 3W
 
         # Also fetch 1M NDF outright for implied-spot derivation
         ndf_1m_out_ric = None
@@ -163,7 +166,8 @@ class MarketService:
         extra = [ndf_1m_out_ric] if ndf_1m_out_ric else []
 
         all_rics = list({*composite_rics, *outright_rics, *broker_rics,
-                         *sofr_rics, *funding_rics, *extra})
+                         *sofr_rics, *funding_rics, *extended_rics,
+                         *weekly_rics, *extra})
 
         log.info("Snapshot %s: %d RICs (comp=%d brk=%d out=%d fund=%d)",
                  ccy, len(all_rics), len(composite_rics), len(broker_rics),
@@ -342,8 +346,38 @@ class MarketService:
                 "T1": self._ser_ric(ndf_1m_out_ric, "T", t1=t1),
             }
 
-        # Per-tenor per-source bundle (pass IPA data so days reflect real calendar)
-        tenors = {m: self._tenor_bundle(cfg, m, t1, ipa) for m in cfg.anchor_tenors_m}
+        # Per-tenor per-source bundle (pass IPA data so days reflect real calendar).
+        # anchor tenors get full source list; extended tenors (non-anchor months
+        # with broker/composite data) get a lighter bundle tagged hasAnchorRic=False.
+        tenors: Dict[int, Any] = {}
+        anchor_set = set(cfg.anchor_tenors_m)
+        for m in cfg.anchor_tenors_m:
+            b = self._tenor_bundle(cfg, m, t1, ipa)
+            b["hasAnchorRic"] = True
+            b["hasBrokerRic"] = "FMD" in cfg.brokers
+            tenors[m] = b
+        for m in cfg.extended_tenors_m:
+            if m in anchor_set:
+                continue
+            b = self._extended_tenor_bundle(cfg, m, t1)
+            b["hasAnchorRic"] = False
+            b["hasBrokerRic"] = "FMD" in cfg.brokers
+            tenors[m] = b
+
+        # Weekly RICs block. NDF: SW only. DELIVERABLE: SW/2W/3W.
+        weekly: Dict[str, Any] = {}
+        for key, ric in cfg.weekly_rics().items():
+            q = self._quotes.get(ric, Quote())
+            ts = q.timact_ts or q.ts
+            has = q.bid is not None or q.ask is not None or q.last is not None
+            weekly[key] = {
+                "ric": ric,
+                "bid": q.bid, "ask": q.ask, "mid": q.mid(), "last": q.last,
+                "ts": ts, "ageSec": _age(ts), "freshness": _freshness(ts),
+                "timact": q.timact,
+                "valueMode": cfg.value_mode,
+                "hasData": has,
+            }
 
         # Funding (deliverables)
         funding = {}
@@ -378,6 +412,8 @@ class MarketService:
             "valueMode": cfg.value_mode, "ptsInOutright": cfg.pts_in_outright,
             "deriveFromOutrights": cfg.derive_from_outrights,
             "tenorsM": cfg.anchor_tenors_m, "anchorTenorsM": cfg.anchor_tenors_m,
+            "extendedTenorsM": cfg.extended_tenors_m,
+            "weekly": weekly,
             "maxDisplayM": cfg.max_display_m,
             "spreadPack": cfg.spread_pack,
             "weeklyTenors": [0.25, 0.5, 0.75],
@@ -472,6 +508,48 @@ class MarketService:
             "hasAnyData": any(s.get("hasData") for s in sources.values()),
         }
 
+    # ───── extended-tenor bundle (non-anchor months with broker data) ─────
+    def _extended_tenor_bundle(self, cfg: CurrencyConfig, m: int,
+                               t1: Dict[str, Quote]) -> Dict[str, Any]:
+        """
+        Lighter bundle for non-anchor months (4/5/7/8/10/11/13-17/19-23).
+        Pulls composite (when expected to exist) and preferred broker (FMD for NDFs).
+        No IPA, no T-1 history — frontend lazy-backfills if user needs T-1.
+        """
+        sources: Dict[str, Any] = {}
+
+        # Composite — only if probe confirms it exists for this month.
+        # NDF: (1,2,3,6,9,12,24) only — we never include non-anchor composite
+        # rics in all_extended_rics for other months, but a composite entry
+        # may still exist in a later probe (e.g. 15/18/21 deliverable). We
+        # include it defensively and let hasData flag gate it.
+        include_composite = (
+            cfg.kind != "NDF" or m in (1, 2, 3, 6, 9, 12, 24)
+        )
+        if include_composite and not cfg.derive_from_outrights:
+            ric = cfg.swap_points_ric(m)
+            entry = self._source_entry(ric, mode=cfg.value_mode_for("composite"), t1=t1)
+            if entry["hasData"]:
+                sources["composite"] = entry
+
+        # Preferred broker
+        preferred = "FMD" if "FMD" in cfg.brokers else (cfg.brokers[0] if cfg.brokers else None)
+        if preferred:
+            ric = cfg.broker_ric(m, preferred)
+            entry = self._source_entry(ric, mode=cfg.value_mode_for(preferred), t1=t1)
+            if entry["hasData"]:
+                sources[preferred] = entry
+
+        return {
+            "days": _days_for_tenor(m),
+            "daysFix": None,
+            "valueDate": None,
+            "fixDate": None,
+            "fixLagDays": None,
+            "sources": sources,
+            "hasAnyData": any(s.get("hasData") for s in sources.values()),
+        }
+
     # ───── per-funding bundle ─────
     def _funding_bundle(self, cfg: CurrencyConfig, tenor: str,
                         t1: Dict[str, Quote]) -> Dict[str, Any]:
@@ -551,9 +629,12 @@ class MarketService:
             self.lseg.subscribe(tag=f"fwd-{ccy}", rics=fwd_rics, fields=FIELDS_QUOTE,
                                 on_update=lambda r, f: self._on_fwd(r, f))
 
-        # Brokers (tick) — includes MBGL outrights for NGN, funding brokers for deliverables
+        # Brokers (tick) — includes MBGL outrights for NGN, funding brokers for deliverables,
+        # plus the extended-tenor composite+FMD feeds so off-anchor months update live.
         br_rics = list(all_broker_rics(ccy))
         br_rics += list(all_outright_rics(ccy))
+        br_rics += list(all_extended_rics(ccy))
+        br_rics += list(all_weekly_rics(ccy))
         if cfg.kind == "DELIVERABLE":
             br_rics += all_funding_rics(ccy)
         br_rics = list(set(br_rics))

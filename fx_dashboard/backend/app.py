@@ -284,13 +284,19 @@ def _spread_defs_for(ccy: str):
 
 
 def _spread_packs_for(ccy: str):
-    """Return JSON-friendly named packs dict.
+    """Return JSON-friendly grouped packs dict.
 
-    NDF:          {interbankAnchors, m1Chain, m3Chain}
-    DELIVERABLE:  {funding, spotStart, m1Chain, m3Chain}
+    Shape:
+      {
+        fullCurve:    {spotStart: [...], m1Chain: [...], m3Chain: [...]},
+        spreadsRolls: {interbankAnchors?: [...], imm: [...]}
+      }
     """
     packs = get_spread_packs(ccy)
-    return {k: [_row_to_dict(r) for r in v] for k, v in packs.items()}
+    out = {}
+    for group, subpacks in packs.items():
+        out[group] = {k: [_row_to_dict(r) for r in v] for k, v in subpacks.items()}
+    return out
 
 
 if __name__ == "__main__":

@@ -64,6 +64,8 @@ FUNDING_TENORS = ["ON", "TN", "SN"]
 # ─────────────────────────────────────────────────────────────
 # SPREAD PACKS — named, per-kind. Row tuple: (label, near_months, far_months,
 # near_label, far_label). Fractional months allowed for sub-monthly rows.
+# Months: 0.25/0.5/0.75 = 1W/2W/3W, ints = months. String tokens "ON","TN",
+# "SP","SN" are allowed for deliverable funding rows.
 # ─────────────────────────────────────────────────────────────
 
 # NDF: interbank-tradable spot-start spreads (1M-anchored) — these are the
@@ -76,20 +78,38 @@ NDF_INTERBANK_ANCHORS = [
     ("1Mx6M",              1,          6,           "1M",     "6M"),
     ("1Mx9M",              1,          9,           "1M",     "9M"),
     ("1Mx12M",             1,          12,          "1M",     "12M"),
+    ("12Mx18M",            12,         18,          "12M",    "18M"),
+    ("12Mx24M",            12,         24,          "12M",    "24M"),
 ]
 
-# 1M rolling chain: anchor-to-next.
-NDF_1M_CHAIN = [
-    ("1Mx2M",   1,  2,  "1M",  "2M"),
-    ("2Mx3M",   2,  3,  "2M",  "3M"),
-    ("3Mx6M",   3,  6,  "3M",  "6M"),
-    ("6Mx9M",   6,  9,  "6M",  "9M"),
-    ("9Mx12M",  9,  12, "9M",  "12M"),
-    ("12Mx18M", 12, 18, "12M", "18M"),
-    ("18Mx24M", 18, 24, "18M", "24M"),
+# Full-curve: NDF spot-start ladder (anchor tenors only — Spot→T rows).
+NDF_SPOT_START = [
+    ("1M",   0, 1,   "Spot", "1M"),
+    ("2M",   0, 2,   "Spot", "2M"),
+    ("3M",   0, 3,   "Spot", "3M"),
+    ("6M",   0, 6,   "Spot", "6M"),
+    ("9M",   0, 9,   "Spot", "9M"),
+    ("12M",  0, 12,  "Spot", "12M"),
+    ("18M",  0, 18,  "Spot", "18M"),
+    ("24M",  0, 24,  "Spot", "24M"),
 ]
 
-# 3M rolling chain: step-3 anchor chain. 15M/21M are interpolated from curve.
+# 1M chain (NDF) — includes weekly leg rolls then every month 1-24.
+def _ndf_1m_chain():
+    rows = [
+        ("1Wx2W", 0.25, 0.5,  "1W", "2W"),
+        ("2Wx3W", 0.5,  0.75, "2W", "3W"),
+        ("3Wx1M", 0.75, 1,    "3W", "1M"),
+    ]
+    _lbl = lambda m: ("1Y" if m == 12 else "2Y" if m == 24 else f"{m}M")
+    for n in range(1, 24):
+        f = n + 1
+        rows.append((f"{_lbl(n)}x{_lbl(f)}", n, f, _lbl(n), _lbl(f)))
+    return rows
+
+NDF_1M_CHAIN = _ndf_1m_chain()
+
+# 3M chain — step-3 starting at 3M, out to 24M.
 NDF_3M_CHAIN = [
     ("3Mx6M",   3,  6,  "3M",  "6M"),
     ("6Mx9M",   6,  9,  "6M",  "9M"),
@@ -100,7 +120,7 @@ NDF_3M_CHAIN = [
     ("21Mx24M", 21, 24, "21M", "24M"),
 ]
 
-# Deliverable: spot-start ladder — how deliverables actually trade.
+# Deliverable: full-curve spot-start anchors (8 rows).
 DEL_SPOT_START = [
     ("SPx1M",   0, 1,   "Spot", "1M"),
     ("SPx2M",   0, 2,   "Spot", "2M"),
@@ -112,19 +132,34 @@ DEL_SPOT_START = [
     ("SPx24M",  0, 24,  "Spot", "24M"),
 ]
 
-# Deliverable funding: single-source rows. pts = dedicated {CCY}ON|TN|SN= RIC
-# value (already the 1-bd swap). Near/far dates come from IPA per-tenor.
+# Deliverable 1M chain — funding legs, weekly legs, then monthly rolls 1-24.
+def _del_1m_chain():
+    rows = [
+        ("ONxTN", "ON", "TN", "ON", "TN"),
+        ("TNxSP", "TN", "SP", "TN", "SP"),
+        ("SPxSN", "SP", "SN", "SP", "SN"),
+        ("SPx1W", 0,    0.25, "SP", "1W"),
+        ("1Wx2W", 0.25, 0.5,  "1W", "2W"),
+        ("2Wx3W", 0.5,  0.75, "2W", "3W"),
+        ("3Wx1M", 0.75, 1,    "3W", "1M"),
+    ]
+    _lbl = lambda m: ("1Y" if m == 12 else "2Y" if m == 24 else f"{m}M")
+    for n in range(1, 24):
+        f = n + 1
+        rows.append((f"{_lbl(n)}x{_lbl(f)}", n, f, _lbl(n), _lbl(f)))
+    return rows
+
+DEL_1M_CHAIN = _del_1m_chain()
+DEL_3M_CHAIN = NDF_3M_CHAIN  # Same monthly step-3 shape
+
+# Back-compat funding pack (still referenced by older frontend paths).
 DEL_FUNDING = [
     ("ONxTN", "ON", "TN", "ON", "TN"),
     ("TNxSP", "TN", "SP", "TN", "SP"),
     ("SPxSN", "SP", "SN", "SP", "SN"),
 ]
 
-# Deliverables reuse the NDF chain shapes (the ladders are universal).
-DEL_1M_CHAIN = NDF_1M_CHAIN
-DEL_3M_CHAIN = NDF_3M_CHAIN
-
-# ── Back-compat aliases (older consumers) ───────────────────────────────
+# ── Back-compat aliases ─────────────────────────────────────
 NDF_SPREAD_PACK = NDF_INTERBANK_ANCHORS + NDF_1M_CHAIN + NDF_3M_CHAIN
 DELIVERABLE_ANCHOR_SPREADS = DEL_SPOT_START
 DELIVERABLE_FWDFWD = DEL_1M_CHAIN
@@ -245,6 +280,20 @@ class CurrencyConfig:
     # NDF-only: weekly tenor collapses to single SW code (1W display label).
     ndf_weekly_single: bool = True
 
+    # Extended tenors: full month range where at least one source (typically
+    # Fenics FMD) has data. Pulled into snapshot so frontend can use real
+    # values for 4M/5M/7M/8M/10M/11M/13-17M/19-23M instead of interpolating.
+    # Defaulted per kind in __post_init__.
+    extended_tenors_m: List[int] = field(default_factory=list)
+
+    def __post_init__(self):
+        # Default extended-tenor set: every month 1-12 plus 15/18/21/24,
+        # capped at max_display_m. Frontend uses this to know which months
+        # a broker RIC (typically FMD) is expected to carry.
+        if not self.extended_tenors_m:
+            candidates = list(range(1, 13)) + [15, 18, 21, 24]
+            self.extended_tenors_m = [m for m in candidates if m <= self.max_display_m]
+
     @property
     def display_tenors(self):
         """Display tenors = weekly + anchor months."""
@@ -267,6 +316,17 @@ class CurrencyConfig:
         if self.kind != "NDF":
             return None
         return f"{self.code}SWNDF="
+
+    def weekly_rics(self) -> Dict[str, str]:
+        """Weekly RICs keyed by label ('SW','2W','3W').
+        NDF: only SW (= {CCY}SWNDF=). Deliverable: SW, 2W, 3W (no 1W RIC)."""
+        if self.kind == "NDF":
+            return {"SW": f"{self.code}SWNDF="}
+        return {
+            "SW": f"{self.code}SW=",
+            "2W": f"{self.code}2W=",
+            "3W": f"{self.code}3W=",
+        }
 
     def outright_ric(self, tenor_m, broker: Optional[str] = None) -> str:
         s = _tenor_str(tenor_m)
@@ -549,6 +609,38 @@ def all_outright_rics(ccy: str) -> List[str]:
     return rics
 
 
+def all_extended_rics(ccy: str) -> List[str]:
+    """Composite + FMD broker RIC for every extended-tenor month that is NOT
+    already an anchor. Frontend uses these as real data points; snapshot pulls
+    them in the T fetch. Skips months the primary feed is known-null for."""
+    cfg = CURRENCIES[ccy]
+    if cfg.derive_from_outrights:
+        return []
+    anchor_set = set(cfg.anchor_tenors_m)
+    rics: List[str] = []
+    for m in cfg.extended_tenors_m:
+        if m in anchor_set:
+            continue
+        # Composite: per probe, works for 1-12, 15, 18, 21, 1Y, 2Y. For NDF,
+        # null for 4,5,7,8,10,11. Always include — broker fills the gap.
+        if cfg.kind == "NDF":
+            # Only request composite for months we know it works.
+            if m in (1, 2, 3, 6, 9, 12, 24):
+                rics.append(cfg.swap_points_ric(m))
+        else:
+            rics.append(cfg.swap_points_ric(m))
+        # FMD broker (NDF) or first broker (deliverable) fallback
+        preferred = "FMD" if "FMD" in cfg.brokers else (cfg.brokers[0] if cfg.brokers else None)
+        if preferred:
+            rics.append(cfg.broker_ric(m, preferred))
+    return rics
+
+
+def all_weekly_rics(ccy: str) -> List[str]:
+    cfg = CURRENCIES[ccy]
+    return list(cfg.weekly_rics().values())
+
+
 def all_broker_rics(ccy: str) -> List[str]:
     """All broker-tenor swap-point RICs for this ccy."""
     cfg = CURRENCIES[ccy]
@@ -575,41 +667,57 @@ def all_funding_rics(ccy: str) -> List[str]:
 
 
 def get_spread_pack(ccy: str):
-    """Back-compat flat list (all packs concatenated)."""
+    """Back-compat flat list (all packs concatenated, deduped by label)."""
     packs = get_spread_packs(ccy)
     seen = set()
     out = []
-    for key in ("funding", "interbankAnchors", "spotStart", "m1Chain", "m3Chain"):
-        for row in packs.get(key, []):
-            if row[0] in seen:
-                continue
-            seen.add(row[0])
-            out.append(row)
+    for group in (packs.get("fullCurve") or {}, packs.get("spreadsRolls") or {}):
+        for key, rows in group.items():
+            for row in rows:
+                if row[0] in seen:
+                    continue
+                seen.add(row[0])
+                out.append(row)
     return out
 
 
-def get_spread_packs(ccy: str) -> Dict[str, list]:
+def get_spread_packs(ccy: str) -> Dict[str, Dict[str, list]]:
     """
-    Named spread packs for frontend. Each pack = list of tuples:
-        (label, near, far, near_label, far_label)
-    where near/far are months (int/float) for curve rows, or tenor-code
-    strings ("ON", "TN", "SP", "SN") for funding rows.
+    Named spread packs for frontend, grouped by tab.
 
-    NDF:          interbankAnchors, m1Chain, m3Chain
-    DELIVERABLE:  funding, spotStart, m1Chain, m3Chain
+    NDF:
+      fullCurve:    {spotStart, m1Chain, m3Chain}
+      spreadsRolls: {interbankAnchors, imm}
+
+    DELIVERABLE:
+      fullCurve:    {spotStart, m1Chain, m3Chain}
+      spreadsRolls: {imm}
+
+    Each pack = list of tuples (label, near, far, near_label, far_label)
+    where near/far are months (int/float) or string tokens for funding rows.
     """
     cfg = CURRENCIES[ccy]
     if cfg.kind == "NDF":
         return {
-            "interbankAnchors": list(NDF_INTERBANK_ANCHORS),
-            "m1Chain":          list(NDF_1M_CHAIN),
-            "m3Chain":          list(NDF_3M_CHAIN),
+            "fullCurve": {
+                "spotStart": list(NDF_SPOT_START),
+                "m1Chain":   list(NDF_1M_CHAIN),
+                "m3Chain":   list(NDF_3M_CHAIN),
+            },
+            "spreadsRolls": {
+                "interbankAnchors": list(NDF_INTERBANK_ANCHORS),
+                "imm":              [],  # populated by frontend from IMM_DATES
+            },
         }
     return {
-        "funding":   list(DEL_FUNDING),
-        "spotStart": list(DEL_SPOT_START),
-        "m1Chain":   list(DEL_1M_CHAIN),
-        "m3Chain":   list(DEL_3M_CHAIN),
+        "fullCurve": {
+            "spotStart": list(DEL_SPOT_START),
+            "m1Chain":   list(DEL_1M_CHAIN),
+            "m3Chain":   list(DEL_3M_CHAIN),
+        },
+        "spreadsRolls": {
+            "imm": [],
+        },
     }
 
 

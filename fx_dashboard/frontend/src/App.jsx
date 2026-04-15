@@ -966,10 +966,13 @@ export default function Dashboard(){
 
   const{rows,immR,anchors,qFF,spSpr,immSpr,cfg,ff1M,ff3M,ibAnchor,spreadPacks:packs}=ad;
   const pk=packs||{};
-  const pkFunding=pk.funding||[];
-  const pkAnchors=cfg.kind==="NDF"?(pk.interbankAnchors||[]):(pk.spotStart||[]);
-  const pkM1=pk.m1Chain||[];
-  const pkM3=pk.m3Chain||[];
+  // Nested packs: fullCurve + spreadsRolls
+  const pkFull=pk.fullCurve||{spotStart:pk.spotStart||[],m1Chain:pk.m1Chain||[],m3Chain:pk.m3Chain||[]};
+  const pkSR=pk.spreadsRolls||{interbankAnchors:pk.interbankAnchors||[],imm:[]};
+  const pkSpotStart=pkFull.spotStart||[];
+  const pkM1=pkFull.m1Chain||[];
+  const pkM3=pkFull.m3Chain||[];
+  const pkInterbank=pkSR.interbankAnchors||[];
   // Main anchor table: only Spot + anchorTenorsM rows (backbone curve).
   const anchorMs = new Set([0, ...(snap.anchorTenorsM || snap.tenorsM || [1,2,3,6,9,12,18,24])]);
   const filt=(showI?rows:rows.filter(r=>!r.interp)).filter(r => anchorMs.has(r.month));
@@ -1127,27 +1130,36 @@ export default function Dashboard(){
                 <td style={{...cS(r.rollP>=0?"#A78BFA":"#F472B6"),background:r.month<2?"transparent":HB(r.rollP,mRP)}}>{r.month<2?"—":FP(r.rollP,pdp)}</td>
                 <td style={cS(r.rollY>=0?"#A78BFA":"#F472B6")}>{r.month<2?"—":FP(r.rollY,2)}</td>
               </tr>);})}</tbody></table></div>
-      </>)}
 
-      {/* SPREADS & ROLLS TAB — ordered:
-          1. Funding (deliverable only) · 2. Interbank anchors · 3. 1M fwd-fwd chain · 4. 3M fwd-fwd chain */}
-      {tab==="spreads"&&(<div>
-        {cfg.kind==="DELIVERABLE"&&pkFunding.length>0&&(<>
-          <SprChart rows={pkFunding} title={`${cfg.pair} Funding (ONxTN / TNxSP / SPxSN)`} color="#FB923C"/>
-          <SprTbl spreads={pkFunding} title={`${cfg.pair} FUNDING`} color="#FB923C" mx={mSC} onDbl={dblR} pdp={pdp}/>
-        </>)}
-        {pkAnchors.length>0&&(<>
-          <SprChart rows={pkAnchors} title={`${cfg.pair} ${cfg.kind==="NDF"?"Interbank Anchors":"Spot-Start Spreads"}`} color="#10B981"/>
-          <SprTbl spreads={pkAnchors} title={`${cfg.pair} ${cfg.kind==="NDF"?"INTERBANK ANCHOR SPREADS":"SPOT-START SPREADS"}`} color="#10B981" mx={mSC} onDbl={dblR} pdp={pdp}/>
+        {/* Full-curve ladders: spot-start, 1M chain, 3M chain */}
+        {pkSpotStart.length>0&&(<>
+          <SprChart rows={pkSpotStart} title={`${cfg.pair} Spot-Start Ladder`} color="#10B981"/>
+          <SprTbl spreads={pkSpotStart} title={`${cfg.pair} SPOT-START LADDER`} color="#10B981" mx={mSC} onDbl={dblR} pdp={pdp}/>
         </>)}
         {pkM1.length>0&&(<>
-          <SprChart rows={pkM1} title={`${cfg.pair} 1M Forward-Forward chain`} color="#22D3EE"/>
+          <SprChart rows={pkM1} title={`${cfg.pair} 1M Forward-Forward chain`} color="#22D3EE" height={180}/>
           <SprTbl spreads={pkM1} title={`${cfg.pair} 1M FWD-FWD CHAIN`} color="#22D3EE" mx={mSC} onDbl={dblR} pdp={pdp}/>
         </>)}
         {pkM3.length>0&&(<>
           <SprChart rows={pkM3} title={`${cfg.pair} 3M Forward-Forward chain`} color="#8B5CF6"/>
           <SprTbl spreads={pkM3} title={`${cfg.pair} 3M FWD-FWD CHAIN`} color="#8B5CF6" mx={mSC} onDbl={dblR} pdp={pdp}/>
         </>)}
+      </>)}
+
+      {/* SPREADS & ROLLS TAB — now only interbank anchors (NDF) + IMM rolls.
+          Full-curve ladders (spot-start / 1M chain / 3M chain) live on Full Curve tab. */}
+      {tab==="spreads"&&(<div>
+        {cfg.kind==="NDF"&&pkInterbank.length>0&&(<>
+          <SprChart rows={pkInterbank} title={`${cfg.pair} Interbank Anchors`} color="#10B981"/>
+          <SprTbl spreads={pkInterbank} title={`${cfg.pair} INTERBANK ANCHOR SPREADS`} color="#10B981" mx={mSC} onDbl={dblR} pdp={pdp}/>
+        </>)}
+        {immSpr.length>0&&(<>
+          <SprChart rows={immSpr} title={`${cfg.pair} IMM Roll Spreads`} color="#F59E0B"/>
+          <SprTbl spreads={immSpr} title={`${cfg.pair} IMM ROLL SPREADS`} color="#F59E0B" mx={mSC} onDbl={dblR} pdp={pdp}/>
+        </>)}
+        {cfg.kind==="DELIVERABLE"&&pkInterbank.length===0&&immSpr.length===0&&(
+          <div style={{color:"#64748B",padding:20,fontSize:10}}>No interbank anchor spreads or IMM rolls available for this currency.</div>
+        )}
       </div>)}
 
       {/* IMM TAB */}

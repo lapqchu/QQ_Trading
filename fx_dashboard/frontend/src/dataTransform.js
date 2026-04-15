@@ -178,8 +178,16 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
   const PF = snap.pipFactor || 1e3;
   const dp = snap.outrightDp || 3;
   const pipDp = snap.pipDp || 1;
-  const knownM = snap.tenorsM || [1, 2, 3, 6, 9, 12, 18, 24];
-  const maxT = snap.maxDisplayM || knownM[knownM.length - 1] || 24;
+  const anchorM = snap.anchorTenorsM || snap.tenorsM || [1, 2, 3, 6, 9, 12, 18, 24];
+  // Include extended tenors that actually came back with data so the days-indexed
+  // curve has more anchor points (less reliance on interpolation for 4M, 5M, etc.).
+  const extendedM = (snap.extendedTenorsM || []).filter(m => {
+    if (anchorM.includes(m)) return false;
+    const t = snap.tenors?.[m] || snap.tenors?.[String(m)];
+    return !!(t && t.hasAnyData);
+  });
+  const knownM = [...anchorM, ...extendedM].sort((a, b) => a - b);
+  const maxT = snap.maxDisplayM || anchorM[anchorM.length - 1] || 24;
   const ccyCode = snap.ccy;
   const isNDF = snap.kind === "NDF";
   const deriveFromOutrights = !!snap.deriveFromOutrights;
@@ -492,9 +500,43 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
   };
 
   const rows = [getRow(0)];
+  // Weekly real-RIC overlay: snap.weekly = {SW,2W,3W: {bid,ask,mid,hasData,...}}
+  // For NDF only SW exists (=1W). For deliverable all three (SW=1W, 2W, 3W).
+  const weeklyBlock = snap.weekly || {};
+  const weeklyRicKey = (w) => {
+    if (Math.abs(w - 0.25) < 1e-6) return "SW";
+    if (Math.abs(w - 0.5) < 1e-6) return "2W";
+    if (Math.abs(w - 0.75) < 1e-6) return "3W";
+    return null;
+  };
   for (const w of weeklyTenors) {
     const wr = getRow(w, Math.round(w * 30), weekLabel(w));
-    wr.interp = true; wr.isWeekly = true;
+    wr.isWeekly = true;
+    // Try live weekly RIC data; valueMode follows snap.valueMode.
+    const wk = weeklyBlock[weeklyRicKey(w)];
+    if (wk && wk.hasData && wk.ric) {
+      // live override
+      const lq = liveQuotes[wk.ric];
+      const raw_b = lq?.bid ?? wk.bid;
+      const raw_a = lq?.ask ?? wk.ask;
+      const raw_m = lq?.mid ?? wk.mid ?? mid(raw_b, raw_a);
+      const mul = (wk.valueMode === "outright") ? PF : 1;
+      const spB = raw_b != null ? raw_b * mul : null;
+      const spA = raw_a != null ? raw_a * mul : null;
+      const spM = raw_m != null ? raw_m * mul : null;
+      if (spM != null) {
+        wr.spB = spB; wr.spM = spM; wr.spA = spA;
+        wr.bT = spotT.m != null && spB != null ? spotT.m + spB / PF : wr.bT;
+        wr.aT = spotT.m != null && spA != null ? spotT.m + spA / PF : wr.aT;
+        wr.mT = spotT.m != null && spM != null ? spotT.m + spM / PF : wr.mT;
+        wr.interp = false;
+        wr.dataSource = "weeklyRIC";
+      } else {
+        wr.interp = true;
+      }
+    } else {
+      wr.interp = true;
+    }
     rows.push(wr);
   }
   for (let m = 1; m <= maxT; m++) rows.push(getRow(m));
@@ -777,10 +819,10 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
     };
   }
 
-  // Build named spread packs from backend snap.spreadPacks. Each pack = array
-  // of row-shaped entries compatible with SprTbl.
-  const spreadPacks = {};
-  const packsIn = snap.spreadPacks || {};
+  // Build named spread packs from backend snap.spreadPacks. New nested shape:
+  //   { fullCurve: {spotStart, m1Chain, m3Chain},
+  //     spreadsRolls: {interbankAnchors?, imm} }
+  // Each pack = array of row-shaped entries compatible with SprTbl.
   function mkRowForDef(def) {
     // Funding rows: near/far are tenor-code strings (e.g. "ON","TN","SP","SN").
     if (typeof def.near === "string") {
@@ -788,13 +830,41 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
     }
     return mkSpr(def.near, def.far, def.label, { nearLabel: def.nearLabel, farLabel: def.farLabel });
   }
-  for (const [packKey, defs] of Object.entries(packsIn)) {
-    const out = [];
-    for (const def of defs) {
-      const row = mkRowForDef(def);
-      if (row) out.push(row);
+  function buildGroup(group) {
+    const out = {};
+    for (const [packKey, defs] of Object.entries(group || {})) {
+      const arr = [];
+      for (const def of defs) {
+        const row = mkRowForDef(def);
+        if (row) arr.push(row);
+      }
+      out[packKey] = arr;
     }
-    spreadPacks[packKey] = out;
+    return out;
+  }
+  const packsIn = snap.spreadPacks || {};
+  // Support both new nested shape AND the legacy flat shape {interbankAnchors, m1Chain,...}
+  const isNested = packsIn && (packsIn.fullCurve || packsIn.spreadsRolls);
+  let spreadPacks;
+  if (isNested) {
+    spreadPacks = {
+      fullCurve:    buildGroup(packsIn.fullCurve),
+      spreadsRolls: buildGroup(packsIn.spreadsRolls),
+    };
+    // Flat mirror (back-compat with any older consumers).
+    for (const [k, v] of Object.entries(spreadPacks.fullCurve || {})) spreadPacks[k] = v;
+    for (const [k, v] of Object.entries(spreadPacks.spreadsRolls || {})) spreadPacks[k] = v;
+  } else {
+    spreadPacks = buildGroup(packsIn);
+    spreadPacks.fullCurve = {
+      spotStart: spreadPacks.spotStart || spreadPacks.interbankAnchors || [],
+      m1Chain:   spreadPacks.m1Chain   || [],
+      m3Chain:   spreadPacks.m3Chain   || [],
+    };
+    spreadPacks.spreadsRolls = {
+      interbankAnchors: spreadPacks.interbankAnchors || [],
+      imm: [],
+    };
   }
 
   // Resolve spread pack from snapshot.spreadDefs (backend is source of truth).
