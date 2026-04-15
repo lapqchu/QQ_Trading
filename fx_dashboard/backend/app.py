@@ -129,6 +129,19 @@ def get_history(
         raise HTTPException(500, str(e))
 
 
+@app.post("/api/t1-backfill")
+def t1_backfill(rics: str = Query(..., description="comma-separated RICs")) -> Dict[str, Any]:
+    """Lazy T-1 fetch for a specific set of RICs (one Workspace call per
+    uncached RIC, cached per-date). Called by frontend when a new broker
+    source is ticked."""
+    if not market:
+        raise HTTPException(503, "market service not ready")
+    ric_list = [r.strip() for r in rics.split(",") if r.strip()]
+    if not ric_list:
+        return {}
+    return market.backfill_t1(ric_list)
+
+
 @app.get("/api/history-custom/{ccy}")
 def get_history_custom(
     ccy: str,

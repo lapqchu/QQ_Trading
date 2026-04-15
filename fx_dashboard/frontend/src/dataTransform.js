@@ -38,6 +38,48 @@ export function pickSource(tenor, selection) {
   return null;
 }
 
+// Merge a T-1 backfill response `{ric: {bid, ask, last} | null}` into a snapshot,
+// writing into `source.T1` for any matching RIC in `tenors[m].sources` or
+// `funding[T].sources`. Returns a NEW snapshot object (does not mutate input).
+export function mergeT1(snap, t1Map) {
+  if (!snap || !t1Map) return snap;
+  const keys = Object.keys(t1Map);
+  if (!keys.length) return snap;
+  // Only copy branches we touch; preserve object identity elsewhere for React.
+  const patchSources = (sources) => {
+    if (!sources) return sources;
+    let out = null;
+    for (const [name, s] of Object.entries(sources)) {
+      if (!s || !s.ric) continue;
+      if (!(s.ric in t1Map)) continue;
+      const t1 = t1Map[s.ric];
+      if (!t1) continue;
+      const mid_ = t1.mid != null ? t1.mid : (t1.bid != null && t1.ask != null ? (t1.bid + t1.ask) / 2 : null);
+      const newT1 = { bid: t1.bid ?? null, ask: t1.ask ?? null, mid: mid_, last: t1.last ?? null };
+      if (!out) out = { ...sources };
+      out[name] = { ...s, T1: newT1 };
+    }
+    return out || sources;
+  };
+  const patchBundleMap = (bundleMap) => {
+    if (!bundleMap) return bundleMap;
+    let out = null;
+    for (const [k, bundle] of Object.entries(bundleMap)) {
+      if (!bundle || !bundle.sources) continue;
+      const newSources = patchSources(bundle.sources);
+      if (newSources !== bundle.sources) {
+        if (!out) out = { ...bundleMap };
+        out[k] = { ...bundle, sources: newSources };
+      }
+    }
+    return out || bundleMap;
+  };
+  const newTenors = patchBundleMap(snap.tenors);
+  const newFunding = patchBundleMap(snap.funding);
+  if (newTenors === snap.tenors && newFunding === snap.funding) return snap;
+  return { ...snap, tenors: newTenors, funding: newFunding };
+}
+
 export function displayPtsFromSource(source, pipFactor) {
   if (!source) return { b: null, m: null, a: null };
   const mul = source.valueMode === "outright" ? pipFactor : 1;

@@ -184,16 +184,14 @@ class MarketService:
             self._quotes[ric] = Quote(bid=bid, ask=ask, last=last, ts=now,
                                       timact=timact_str, timact_ts=timact_ts)
 
-        # T1 (prev close) — spot + composite swap pts + SOFR + broker swap pts +
-        # outrights + funding composites. Funding-broker RICs intentionally excluded
-        # (too many, low marginal value). Cached per (ric, date).
+        # T1 MINIMAL on cold snapshot: spot + composite swap pts + SOFR only.
+        # Broker/outright/funding T-1 is fetched lazily via /api/t1-backfill
+        # (when user ticks a new broker) or folded in from the History response
+        # (penultimate daily bar contains T-1 for free). Cached per (ric, date).
         t1_rics = (
             [cfg.spot_ric]
             + [r for r in composite_rics if r != cfg.spot_ric]
             + sofr_rics
-            + list(broker_rics)
-            + list(outright_rics)
-            + [r for r in funding_rics if r and r.endswith("=")]  # composites only (TWDON= etc.)
         )
         t1_rics = list(dict.fromkeys(t1_rics))
         today_iso = date.today().isoformat()
@@ -246,6 +244,50 @@ class MarketService:
                  ccy, len(t1_rics), len(t1_rics) - len(uncached), len(uncached))
 
         return self._serialize(cfg, t1, ipa_data, ndf_1m_out_ric, tomfix_pl)
+
+    def backfill_t1(self, rics: List[str]) -> Dict[str, Any]:
+        """Lazy T-1 fetch for a specific set of RICs. Uses the per-(ric,date)
+        cache so repeat calls are instant. Returns {ric: {bid,ask,last} | null}."""
+        today_iso = date.today().isoformat()
+        out: Dict[str, Any] = {}
+        uncached: List[str] = []
+        for r in rics:
+            hit = self._t1_cache.get(f"{r}@{today_iso}")
+            if hit is not None:
+                out[r] = {"bid": hit.bid, "ask": hit.ask, "last": hit.last}
+            else:
+                uncached.append(r)
+        if uncached:
+            try:
+                hist = self.lseg.get_history(uncached, ["BID", "ASK", "TRDPRC_1"],
+                                             interval="daily", count=2)
+            except Exception as e:
+                log.warning("backfill_t1 history failed: %s", e)
+                hist = {}
+            for ric, bars in hist.items():
+                if not bars:
+                    continue
+                bar = bars[-1] if len(bars) == 1 else bars[-2]
+                q = Quote(bid=_num(bar.get("BID")), ask=_num(bar.get("ASK")),
+                          last=_num(bar.get("TRDPRC_1")))
+                self._t1_cache[f"{ric}@{today_iso}"] = q
+                out[ric] = {"bid": q.bid, "ask": q.ask, "last": q.last}
+        for r in rics:
+            out.setdefault(r, None)
+        return out
+
+    def absorb_history_as_t1(self, hist: Dict[str, List[Dict[str, Any]]]):
+        """Opportunistic: when a history response passes through, its penultimate
+        daily bar IS today's T-1. Folded into the T-1 cache so later IY D/D
+        lookups don't require a second call."""
+        today_iso = date.today().isoformat()
+        for ric, bars in (hist or {}).items():
+            if not bars or len(bars) < 1:
+                continue
+            bar = bars[-1] if len(bars) == 1 else bars[-2]
+            q = Quote(bid=_num(bar.get("BID")), ask=_num(bar.get("ASK")),
+                      last=_num(bar.get("TRDPRC_1")))
+            self._t1_cache.setdefault(f"{ric}@{today_iso}", q)
 
     def _fetch_ipa_tenors(self, cfg: CurrencyConfig) -> Dict[str, Any]:
         """
@@ -656,6 +698,11 @@ class MarketService:
         if start is not None:
             kwargs["start"] = start.isoformat()
         hist = self.lseg.get_history(**kwargs)
+        # Opportunistic: every RIC in this daily history carries T-1 as its
+        # penultimate bar — absorb into t1 cache so future IY D/D lookups
+        # don't re-fetch.
+        if interval == "daily":
+            self.absorb_history_as_t1(hist)
 
         return {
             "ccy": ccy, "pair": cfg.pair, "kind": cfg.kind,

@@ -41,6 +41,16 @@ export async function getHistoryCustom({ ccy, near, far, period = "1Y", contribu
   return r.json();
 }
 
+export async function t1Backfill(rics) {
+  const list = Array.isArray(rics) ? rics : [rics];
+  if (!list.length) return {};
+  const params = new URLSearchParams();
+  params.set("rics", list.join(","));
+  const r = await fetch(`${API}/t1-backfill?${params.toString()}`, { method: "POST" });
+  if (!r.ok) throw new Error(`t1-backfill: ${r.status}`);
+  return r.json();
+}
+
 export async function liveStart(ccy) {
   const r = await fetch(`${API}/live/start?ccy=${ccy}`, { method: "POST" });
   return r.json();

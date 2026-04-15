@@ -1,8 +1,8 @@
 // FX Dashboard — full port from v1, backend-driven
 import React, { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import Plot from "react-plotly.js";
-import { getCurrencies, getHistory, getHistoryCustom, getSnapshot, liveStart, liveStop, openChannel, getIpaForward } from "./api.js";
-import { buildAllData, calcCustom, valueModeForSource } from "./dataTransform.js";
+import { getCurrencies, getHistory, getHistoryCustom, getSnapshot, liveStart, liveStop, openChannel, getIpaForward, t1Backfill } from "./api.js";
+import { buildAllData, calcCustom, valueModeForSource, mergeT1 } from "./dataTransform.js";
 import { F, FP, CC, HB, cS, tS, sS, mid, implYld, fwdFwdIy, mcI, calcSMA, calcEMA, calcRSI, calcBB, calcMACD, calcStats, calcZDev, backtest, STRAT_DESCS } from "./calc.js";
 import { fD, daysBtwn } from "./dates.js";
 
@@ -844,6 +844,28 @@ export default function Dashboard(){
   const[reloadMsg,setReloadMsg]=useState(null);
   const[liveTick,setLiveTick]=useState(0);
   const channelsRef=useRef([]);
+  // Dedupe T-1 backfill requests — key = `${ccy}|${sortedRics}`.
+  const t1RequestedRef=useRef(new Set());
+
+  // Fire T-1 backfill in background and merge into snapshot state.
+  const backfillT1=useCallback((rics)=>{
+    if(!rics||!rics.length)return;
+    const uniq=Array.from(new Set(rics.filter(Boolean)));
+    if(!uniq.length)return;
+    const key=`${ccy}|${uniq.slice().sort().join(",")}`;
+    if(t1RequestedRef.current.has(key))return;
+    t1RequestedRef.current.add(key);
+    t1Backfill(uniq).then(map=>{
+      if(!map)return;
+      setSnap(prev=>prev?mergeT1(prev,map):prev);
+    }).catch(()=>{
+      // silent — IY D/D simply stays blank
+      t1RequestedRef.current.delete(key);
+    });
+  },[ccy]);
+
+  // Reset dedupe cache when ccy changes.
+  useEffect(()=>{t1RequestedRef.current=new Set();},[ccy]);
 
   useEffect(()=>{getCurrencies().then(setMeta).catch(e=>setErr(e.message));},[]);
   useEffect(()=>{
@@ -888,6 +910,29 @@ export default function Dashboard(){
     },1000);
     return()=>clearInterval(iv);
   },[liveOn]);
+
+  // Task 2: on Auto mode selection, warm T-1 for ALL broker sources in snapshot
+  // (once per ccy visit; backend caches so revisits are free).
+  useEffect(()=>{
+    if(!snap||mode!=="Auto")return;
+    const rics=[];
+    const seen=new Set();
+    for(const m of Object.keys(snap.tenors||{})){
+      const t=snap.tenors[m];
+      for(const [name,src] of Object.entries(t.sources||{})){
+        if(name==="composite")continue;
+        if(src&&src.ric&&!seen.has(src.ric)){seen.add(src.ric);rics.push(src.ric);}
+      }
+    }
+    for(const k of Object.keys(snap.funding||{})){
+      const b=snap.funding[k];
+      for(const [name,src] of Object.entries(b.sources||{})){
+        if(name==="composite")continue;
+        if(src&&src.ric&&!seen.has(src.ric)){seen.add(src.ric);rics.push(src.ric);}
+      }
+    }
+    if(rics.length)backfillT1(rics);
+  },[ccy,mode,snap,backfillT1]);
 
   const ad=useMemo(()=>buildAllData(snap,liveQuotes,selection),[snap,liveQuotes,liveTick,selection]);
   const refreshSnap=useCallback(()=>{
@@ -969,7 +1014,21 @@ export default function Dashboard(){
                 for(const code of (snap.brokers||[]))opts.push({code,label:snap.brokersMeta?.[code]?.label||code});
                 return opts.map(({code,label})=>{const on=(manualSelection||[]).includes(code);return(<button key={code} onClick={()=>{
                   if(on&&(manualSelection||[]).length===1)return;
+                  const turningOn=!on;
                   setSourcesByCcy(prev=>({...prev,[ccy]:on?(prev[ccy]||[]).filter(x=>x!==code):[...(prev[ccy]||[]),code]}));
+                  // Task 1: when a broker source is toggled ON, backfill T-1 for its RICs across all tenors.
+                  if(turningOn&&code!=="composite"&&snap){
+                    const rics=[];
+                    for(const m of Object.keys(snap.tenors||{})){
+                      const src=snap.tenors[m]?.sources?.[code];
+                      if(src&&src.ric)rics.push(src.ric);
+                    }
+                    for(const k of Object.keys(snap.funding||{})){
+                      const src=snap.funding[k]?.sources?.[code];
+                      if(src&&src.ric)rics.push(src.ric);
+                    }
+                    if(rics.length)backfillT1(rics);
+                  }
                 }} title={label} style={{fontSize:7,padding:"1px 4px",borderRadius:2,border:"none",cursor:"pointer",fontWeight:600,background:on?"#3B82F6":"#0F172A",color:on?"#FFF":"#64748B"}}>{label}</button>);});
               })()}
             </>)}
