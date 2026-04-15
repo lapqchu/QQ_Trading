@@ -27,6 +27,10 @@ const PLOT_LAYOUT = {
 };
 const PLOT_CFG={responsive:true,displayModeBar:true,modeBarButtonsToRemove:["lasso2d","select2d","toImage"],displaylogo:false,scrollZoom:true};
 
+// Sticky first column: freeze the tenor label while horizontally scrolling wide tables.
+const STICKY_TH = { position: "sticky", left: 0, zIndex: 4, background: "#0F172A" };
+const stickyTd = (rowBg) => ({ position: "sticky", left: 0, zIndex: 1, background: rowBg });
+
 function PChart({traces,layout,height=190}){
   const mergedX={...PLOT_LAYOUT.xaxis,...(layout?.xaxis||{})};
   const mergedY={...PLOT_LAYOUT.yaxis,...(layout?.yaxis||{})};
@@ -359,25 +363,6 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
       .catch(()=>{if(!cancelled)setCustomSeries(null);});
     return()=>{cancelled=true;};
   },[ccy,customNear,customFar,period,contributor]);
-  // View-aware history (swap/iy/ppd) for stats+indicators. Use hist for structure + replace value.
-  const vHist=useMemo(()=>{
-    if(!hist)return null;
-    if(viewMode==="swap")return hist;
-    const out=[];
-    for(let i=0;i<hist.length;i++){const v=(typeof vals[i]==="number"&&isFinite(vals[i]))?vals[i]:null;if(v!=null)out.push({date:hist[i].date,value:v});}
-    return out.length>5?out:null;
-  },[hist,viewMode,vals]);
-  const stats=useMemo(()=>vHist?calcStats(vHist,sigN):null,[vHist,sigN]);
-  const rsiD=useMemo(()=>vHist?calcRSI(vHist):[],[vHist]);
-  const macdD=useMemo(()=>vHist?calcMACD(vHist):{line:[],signal:[],hist:[]},[vHist]);
-  const bb=useMemo(()=>vHist?calcBB(vHist):{upper:[],lower:[],mid:[]},[vHist]);
-  const s20=useMemo(()=>vHist?calcSMA(vHist,20):[],[vHist]);
-  const s50=useMemo(()=>vHist?calcSMA(vHist,50):[],[vHist]);
-  const zDev=useMemo(()=>vHist?calcZDev(vHist,sigN):[],[vHist,sigN]);
-  const[btPeriod,setBtPeriod]=useState(252);
-  const btRes=useMemo(()=>vHist?backtest(vHist,btPeriod):[],[vHist,btPeriod]);
-  const[selSt,setSelSt]=useState(null);const[hovSt,setHovSt]=useState(null);
-  const dates=hist?hist.map(h=>h.date):[];
   // Tenor days heuristic for IY/PPD
   const tenorDays=(()=>{
     if(fundingTenor==="ON")return 1; if(fundingTenor==="TN")return 1; if(fundingTenor==="SN")return 1;
@@ -391,7 +376,7 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
     const r=ad.rows.find(x=>x.month===(monthHint||Math.round(tenorDays/30)));
     return r?.sofT??null;
   })();
-  // Build series per viewMode
+  // Build series per viewMode (computed before vHist so vHist can reference vals).
   let vals=[];
   if(hist){
     if(viewMode==="swap"){vals=hist.map(h=>h.value);}
@@ -420,6 +405,26 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
       });
     }
   }
+  // View-aware history (swap/iy/ppd) for stats+indicators. Declared AFTER vals to avoid TDZ.
+  const vHist=useMemo(()=>{
+    if(!hist)return null;
+    if(viewMode==="swap")return hist;
+    const out=[];
+    for(let i=0;i<hist.length;i++){const v=(typeof vals[i]==="number"&&isFinite(vals[i]))?vals[i]:null;if(v!=null)out.push({date:hist[i].date,value:v});}
+    return out.length>5?out:null;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[hist,viewMode]);
+  const stats=useMemo(()=>vHist?calcStats(vHist,sigN):null,[vHist,sigN]);
+  const rsiD=useMemo(()=>vHist?calcRSI(vHist):[],[vHist]);
+  const macdD=useMemo(()=>vHist?calcMACD(vHist):{line:[],signal:[],hist:[]},[vHist]);
+  const bb=useMemo(()=>vHist?calcBB(vHist):{upper:[],lower:[],mid:[]},[vHist]);
+  const s20=useMemo(()=>vHist?calcSMA(vHist,20):[],[vHist]);
+  const s50=useMemo(()=>vHist?calcSMA(vHist,50):[],[vHist]);
+  const zDev=useMemo(()=>vHist?calcZDev(vHist,sigN):[],[vHist,sigN]);
+  const[btPeriod,setBtPeriod]=useState(252);
+  const btRes=useMemo(()=>vHist?backtest(vHist,btPeriod):[],[vHist,btPeriod]);
+  const[selSt,setSelSt]=useState(null);const[hovSt,setHovSt]=useState(null);
+  const dates=hist?hist.map(h=>h.date):[];
   const yLabel=viewMode==="swap"?(isSwapPts?"Swap Points (pips)":"Level")
     :viewMode==="iy"?"Implied Yield (%)":"PPD";
   const priceTraces=[
@@ -489,22 +494,22 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
           </div>
           <div style={{background:"#131C2E",borderRadius:5,padding:6,overflow:"auto",maxHeight:460}}>
             <div style={{fontSize:8,fontWeight:800,color:"#60A5FA",marginBottom:3,letterSpacing:".1em"}}>HIGH / LOW</div>
-            {Object.entries(stats.ranges).map(([k,v])=>(<div key={k} style={{display:"flex",justifyContent:"space-between",padding:"1px 0",fontSize:8.5,borderBottom:"1px solid #1E293B"}}><span style={{color:"#64748B",width:22}}>{k}</span><span style={{color:"#4ADE80",fontFamily:"monospace"}}>{v.low.toFixed(isSwapPts?1:3)}</span><span style={{color:"#64748B"}}>—</span><span style={{color:"#F87171",fontFamily:"monospace"}}>{v.high.toFixed(isSwapPts?1:3)}</span></div>))}
+            {stats&&Object.entries(stats.ranges).map(([k,v])=>(<div key={k} style={{display:"flex",justifyContent:"space-between",padding:"1px 0",fontSize:8.5,borderBottom:"1px solid #1E293B"}}><span style={{color:"#64748B",width:22}}>{k}</span><span style={{color:"#4ADE80",fontFamily:"monospace"}}>{v.low.toFixed(isSwapPts?1:3)}</span><span style={{color:"#64748B"}}>—</span><span style={{color:"#F87171",fontFamily:"monospace"}}>{v.high.toFixed(isSwapPts?1:3)}</span></div>))}
             <div style={{fontSize:8,fontWeight:800,color:"#10B981",marginTop:5,marginBottom:3,letterSpacing:".1em"}}>STATISTICS</div>
-            <SR l="Current" v={stats.current} dp={isSwapPts?1:(dpOverride||3)}/><SR l="Mean" v={stats.mean} dp={isSwapPts?1:(dpOverride||3)}/><SR l="Std Dev" v={stats.sd} dp={isSwapPts?1:4}/><SR l="Skewness" v={stats.skew} dp={2}/><SR l="Kurtosis" v={stats.kurt} dp={2}/><SR l="Pctl Rank" v={`${stats.pctR.toFixed(0)}%`}/>
+            {stats&&<><SR l="Current" v={stats.current} dp={isSwapPts?1:(dpOverride||3)}/><SR l="Mean" v={stats.mean} dp={isSwapPts?1:(dpOverride||3)}/><SR l="Std Dev" v={stats.sd} dp={isSwapPts?1:4}/><SR l="Skewness" v={stats.skew} dp={2}/><SR l="Kurtosis" v={stats.kurt} dp={2}/><SR l="Pctl Rank" v={`${stats.pctR.toFixed(0)}%`}/></>}
             <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginTop:5,marginBottom:3}}>
               <span style={{fontSize:8,fontWeight:800,color:"#F87171",letterSpacing:".1em"}}>SIGMA-MOVE</span>
               <div style={{display:"flex",alignItems:"center",gap:2}}><span style={{fontSize:7,color:"#64748B"}}>N:</span>
                 <input type="number" value={sigN} onChange={e=>setSigN(Math.max(5,Math.min(252,+e.target.value||20)))} style={{background:"#0F172A",border:"1px solid #334155",color:"#E2E8F0",borderRadius:3,padding:"0 3px",fontSize:8,width:34,fontFamily:"monospace"}}/></div>
             </div>
-            <SR l="Today's Δ" v={stats.dayChg!=null?stats.dayChg:"—"} dp={isSwapPts?1:4}/>
+            {stats&&<><SR l="Today's Δ" v={stats.dayChg!=null?stats.dayChg:"—"} dp={isSwapPts?1:4}/>
             <SR l={`${sigN}d σ(Δ)`} v={stats.rollSd!=null?stats.rollSd:"—"} dp={isSwapPts?2:5}/>
-            <div style={{display:"flex",justifyContent:"space-between",padding:"1px 0",borderBottom:"1px solid #1E293B",fontSize:8.5}}><span style={{color:"#64748B"}}>σ-Move</span><span style={{color:stats.sigmaMove==null?"#475569":(Math.abs(stats.sigmaMove)>=2?"#F87171":Math.abs(stats.sigmaMove)>=1?"#FBBF24":"#4ADE80"),fontFamily:"monospace",fontWeight:700}}>{stats.sigmaMove!=null?stats.sigmaMove.toFixed(2)+"σ":"—"}</span></div>
+            <div style={{display:"flex",justifyContent:"space-between",padding:"1px 0",borderBottom:"1px solid #1E293B",fontSize:8.5}}><span style={{color:"#64748B"}}>σ-Move</span><span style={{color:stats.sigmaMove==null?"#475569":(Math.abs(stats.sigmaMove)>=2?"#F87171":Math.abs(stats.sigmaMove)>=1?"#FBBF24":"#4ADE80"),fontFamily:"monospace",fontWeight:700}}>{stats.sigmaMove!=null?stats.sigmaMove.toFixed(2)+"σ":"—"}</span></div></>}
             <div style={{fontSize:8,fontWeight:800,color:"#FBBF24",marginTop:5,marginBottom:3,letterSpacing:".1em"}}>INDICATORS</div>
             <SR l="SMA(20)" v={s20[s20.length-1]} dp={isSwapPts?1:(dpOverride||3)}/><SR l="SMA(50)" v={s50[s50.length-1]} dp={isSwapPts?1:(dpOverride||3)}/><SR l="RSI(14)" v={rsiD[rsiD.length-1]} dp={1}/><SR l="MACD" v={macdD.line[macdD.line.length-1]} dp={4}/><SR l="BB Upper" v={bb.upper[bb.upper.length-1]} dp={isSwapPts?1:(dpOverride||3)}/><SR l="BB Lower" v={bb.lower[bb.lower.length-1]} dp={isSwapPts?1:(dpOverride||3)}/>
-            <SR l={`SMA(${sigN})`} v={stats.smaN!=null?stats.smaN:"—"} dp={isSwapPts?1:(dpOverride||3)}/>
+            {stats&&<><SR l={`SMA(${sigN})`} v={stats.smaN!=null?stats.smaN:"—"} dp={isSwapPts?1:(dpOverride||3)}/>
             <SR l="Dev from MA" v={stats.devMA!=null?stats.devMA:"—"} dp={isSwapPts?1:4}/>
-            <div style={{display:"flex",justifyContent:"space-between",padding:"1px 0",borderBottom:"1px solid #1E293B",fontSize:8.5}}><span style={{color:"#64748B"}}>Z(Dev,{sigN})</span><span style={{color:stats.zDev==null?"#475569":(Math.abs(stats.zDev)>=2?"#F472B6":Math.abs(stats.zDev)>=1?"#FBBF24":"#4ADE80"),fontFamily:"monospace",fontWeight:700}}>{stats.zDev!=null?stats.zDev.toFixed(2):"—"}</span></div>
+            <div style={{display:"flex",justifyContent:"space-between",padding:"1px 0",borderBottom:"1px solid #1E293B",fontSize:8.5}}><span style={{color:"#64748B"}}>Z(Dev,{sigN})</span><span style={{color:stats.zDev==null?"#475569":(Math.abs(stats.zDev)>=2?"#F472B6":Math.abs(stats.zDev)>=1?"#FBBF24":"#4ADE80"),fontFamily:"monospace",fontWeight:700}}>{stats.zDev!=null?stats.zDev.toFixed(2):"—"}</span></div></>}
           </div>
         </div>
         {customSeries&&customSeries.series&&customSeries.series.length>0&&(
@@ -563,11 +568,11 @@ function FundingTbl({ad,brokersMeta,onDbl}){
   return(<div style={{background:"#131C2E",borderRadius:5,padding:6,marginBottom:6}}>
     <div style={{fontSize:9.5,fontWeight:800,color:"#FB923C",marginBottom:3,letterSpacing:".05em"}}>{ad.cfg.pair} FUNDING (ON / TN / SN)</div>
     <div style={{overflowX:"auto"}}><table style={{borderCollapse:"collapse",width:"100%",fontSize:9,minWidth:600}}>
-      <thead><tr><th style={{...tS(),textAlign:"left"}}>Tenor</th>
+      <thead><tr><th style={{...tS(),textAlign:"left",...STICKY_TH}}>Tenor</th>
         {sources.map(s=><React.Fragment key={s}><th style={tS("#4ADE80")}>{labelFor(s)} B</th><th style={tS("#FBBF24")}>{labelFor(s)} M</th><th style={tS("#F87171")}>{labelFor(s)} A</th></React.Fragment>)}
       </tr></thead>
-      <tbody>{tenors.map((t,i)=>{const bySource=funding[t]?.bySource||{};return(<tr key={t} style={{background:i%2===0?"#0F172A":"#131C2E",cursor:"pointer"}} title="Double-click for history" onDoubleClick={()=>onDbl&&onDbl(`${t} Funding`,funding[t]?.T?.mid||0,true,null,null,null,null,null,t)}>
-        <td style={{...cS("#CBD5E1",true),textAlign:"left"}}>{t}</td>
+      <tbody>{tenors.map((t,i)=>{const bySource=funding[t]?.bySource||{};const rowBg=i%2===0?"#0F172A":"#131C2E";return(<tr key={t} style={{background:rowBg,cursor:"pointer"}} title="Double-click for history" onDoubleClick={()=>onDbl&&onDbl(`${t} Funding`,funding[t]?.T?.mid||0,true,null,null,null,null,null,t)}>
+        <td style={{...cS("#CBD5E1",true),textAlign:"left",...stickyTd(rowBg)}}>{t}</td>
         {sources.map(s=>{const v=bySource[s];const has=v&&v.hasData&&(v.T.bid!=null||v.T.mid!=null||v.T.ask!=null);const op=has?(FRESH_OPACITY[v.freshness]??1):1;
           return<React.Fragment key={s}>
             <td style={{...cS(has?"#4ADE80":"#334155"),opacity:op}}>{has?FP(v.T.bid,pdp):"—"}</td>
@@ -583,9 +588,9 @@ function SprTbl({spreads,title,color,mx,onDbl,pdp=1}){
   return(<div style={{background:"#131C2E",borderRadius:5,padding:6,marginBottom:6}}>
     <div style={{fontSize:9.5,fontWeight:800,color,marginBottom:3,letterSpacing:".05em"}}>{title}</div>
     <div style={{overflowX:"auto"}}><table style={{borderCollapse:"collapse",width:"100%",minWidth:1000,fontSize:9}}>
-      <thead><tr><th style={{...tS(),textAlign:"left",minWidth:60}}>Spread</th><th style={tS()}>Near Val</th><th style={tS()}>Near Fix</th><th style={tS()}>Far Val</th><th style={tS()}>Far Fix</th><th style={tS()}>Days</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#F87171")}>Ask</th><th style={tS()}>D/D</th><th style={tS()}>Pts/D</th><th style={tS("#22D3EE")} title="Static-curve carry (display pips). Spot-start: carry=fwdPts[T]. Fwd-fwd NxF: carry=fwdPts[F-N]-(fwdPts[F]-fwdPts[N]).">Carry</th><th style={tS("#4ADE80")}>Iy Bid</th><th style={tS("#34D399")}>Iy Mid</th><th style={tS("#F87171")}>Iy Ask</th><th style={tS()}>Iy D/D</th><th style={tS()}>Iy bp/d</th><th style={tS("#FB923C")}>SOFR%</th><th style={tS("#C084FC")}>Basis</th></tr></thead>
-      <tbody>{spreads.map((s,i)=>{const iso=d=>{if(!d)return null;const x=d instanceof Date?d:new Date(d);if(isNaN(x))return null;return x.toISOString().slice(0,10);};const ndIso=iso(s.nrVD),fdIso=iso(s.frVD);return(<tr key={i} style={{background:i%2===0?"#0F172A":"#131C2E",cursor:s.unavailable?"default":"pointer",opacity:s.unavailable?.55:1}} onDoubleClick={()=>!s.unavailable&&onDbl&&onDbl(s.label,Math.abs(s.pM)||1,true,null,s.nrM,s.frM,ndIso,fdIso)}>
-        <td style={{...cS(color,true),textAlign:"left"}} title={s.unavailable?s.unavailableReason:undefined}>{s.label}{s.unavailable?" *":""}</td>
+      <thead><tr><th style={{...tS(),textAlign:"left",minWidth:60,...STICKY_TH}}>Spread</th><th style={tS()}>Near Val</th><th style={tS()}>Near Fix</th><th style={tS()}>Far Val</th><th style={tS()}>Far Fix</th><th style={tS()}>Days</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#F87171")}>Ask</th><th style={tS()}>D/D</th><th style={tS()}>Pts/D</th><th style={tS("#22D3EE")} title="Static-curve carry (display pips). Spot-start: carry=fwdPts[T]. Fwd-fwd NxF: carry=fwdPts[F-N]-(fwdPts[F]-fwdPts[N]).">Carry</th><th style={tS("#4ADE80")}>Iy Bid</th><th style={tS("#34D399")}>Iy Mid</th><th style={tS("#F87171")}>Iy Ask</th><th style={tS()}>Iy D/D</th><th style={tS()}>Iy bp/d</th><th style={tS("#FB923C")}>SOFR%</th><th style={tS("#C084FC")}>Basis</th></tr></thead>
+      <tbody>{spreads.map((s,i)=>{const iso=d=>{if(!d)return null;const x=d instanceof Date?d:new Date(d);if(isNaN(x))return null;return x.toISOString().slice(0,10);};const ndIso=iso(s.nrVD),fdIso=iso(s.frVD);const rowBg=i%2===0?"#0F172A":"#131C2E";return(<tr key={i} style={{background:rowBg,cursor:s.unavailable?"default":"pointer",opacity:s.unavailable?.55:1}} onDoubleClick={()=>!s.unavailable&&onDbl&&onDbl(s.label,Math.abs(s.pM)||1,true,null,s.nrM,s.frM,ndIso,fdIso)}>
+        <td style={{...cS(color,true),textAlign:"left",...stickyTd(rowBg)}} title={s.unavailable?s.unavailableReason:undefined}>{s.label}{s.unavailable?" *":""}</td>
         <td style={cS("#475569")}>{fD(s.nrVD)}</td><td style={cS("#475569")}>{fD(s.nrFxD)}</td><td style={cS("#475569")}>{fD(s.frVD)}</td><td style={cS("#475569")}>{fD(s.frFxD)}</td><td style={cS("#475569",false,true)}>{s.days}</td>
         <td style={cS("#4ADE80")}>{FP(s.pB,pdp)}</td><td style={cS("#FBBF24",true)}>{FP(s.pM,pdp)}</td><td style={cS("#F87171")}>{FP(s.pA,pdp)}</td>
         <td style={{...cS(CC(s.chg)),background:HB(s.chg,mx)}}>{FP(s.chg,pdp)}</td><td style={cS("#64748B",false,true)}>{F(s.ppd,2)}</td>
@@ -669,6 +674,7 @@ function ToolsPanel({ad,onDbl,ccy}){
           <div><span style={{color:"#64748B"}}>Mid: </span><span style={{color:"#FBBF24",fontFamily:"monospace"}}>{FP(custom.pM,1)}</span></div>
           <div><span style={{color:"#64748B"}}>Ask: </span><span style={{color:"#F87171",fontFamily:"monospace"}}>{FP(custom.pA,1)}</span></div>
           <div><span style={{color:"#64748B"}}>Days: </span><span style={{color:"#E2E8F0",fontFamily:"monospace"}}>{custom.days}</span></div>
+          <div><span style={{color:"#64748B"}}>PPD: </span><span style={{color:"#22D3EE",fontFamily:"monospace"}}>{custom.ppd!=null?F(custom.ppd,2):"—"}</span></div>
           <div><span style={{color:"#64748B"}}>Fwd Impl: </span><span style={{color:"#10B981",fontFamily:"monospace"}}>{custom.fIy!=null?F(custom.fIy,2)+"%":"—"}</span></div>
           <div><span style={{color:"#64748B"}}>Near Val: </span><span style={{color:"#E2E8F0",fontFamily:"monospace"}}>{fD(custom.nrVD)}</span></div>
           <div><span style={{color:"#64748B"}}>Near Fix: </span><span style={{color:"#E2E8F0",fontFamily:"monospace"}}>{fD(custom.nrFxD)}</span></div>
@@ -758,10 +764,10 @@ function BrokerMon({ad,liveOn=false}){
     <div style={{fontSize:10,fontWeight:800,color:"#60A5FA",marginBottom:6,letterSpacing:".05em"}}>REUTERS DEFAULT (COMPOSITE) RUN — {cfg.pair} ({ccy})</div>
     <div style={{background:"#131C2E",borderRadius:5,padding:6,marginBottom:6}}>
       <table style={{borderCollapse:"collapse",width:"100%",fontSize:9,marginBottom:4}}><thead><tr>
-        <th style={{...tS(),textAlign:"left"}}>Tenor</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#F87171")}>Ask</th><th style={tS()}>Width</th>
+        <th style={{...tS(),textAlign:"left",...STICKY_TH}}>Tenor</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#F87171")}>Ask</th><th style={tS()}>Width</th>
       </tr></thead><tbody>
-        {allT.map((t,idx)=>{const v=getSpreadVal(t);return(<tr key={idx} style={{background:idx%2===0?"#0F172A":"#131C2E"}}>
-          <td style={{...cS("#CBD5E1",true),textAlign:"left"}}>{t.label}</td>
+        {allT.map((t,idx)=>{const v=getSpreadVal(t);const rowBg=idx%2===0?"#0F172A":"#131C2E";return(<tr key={idx} style={{background:rowBg}}>
+          <td style={{...cS("#CBD5E1",true),textAlign:"left",...stickyTd(rowBg)}}>{t.label}</td>
           <td style={cS(v?"#4ADE80":"#475569")}>{v?FP(v.bid,pdp):"—"}</td>
           <td style={cS(v?"#FBBF24":"#475569",true)}>{v?FP(v.mid,pdp):"—"}</td>
           <td style={cS(v?"#F87171":"#475569")}>{v?FP(v.ask,pdp):"—"}</td>
@@ -790,8 +796,9 @@ function BrokerMon({ad,liveOn=false}){
           const avgMid=withData.length>0?withData.reduce((s,x)=>s+x.v.mid,0)/withData.length:null;
           const avgBid=withData.length>0?withData.reduce((s,x)=>s+(x.v.bid??x.v.mid),0)/withData.length:null;
           const avgAsk=withData.length>0?withData.reduce((s,x)=>s+(x.v.ask??x.v.mid),0)/withData.length:null;
-          return(<tr key={idx} style={{background:idx%2===0?"#0F172A":"#131C2E"}}>
-          <td style={{...cS("#CBD5E1",true),textAlign:"left"}}>{t.label}</td>
+          const rowBg2=idx%2===0?"#0F172A":"#131C2E";
+          return(<tr key={idx} style={{background:rowBg2}}>
+          <td style={{...cS("#CBD5E1",true),textAlign:"left",...stickyTd(rowBg2)}}>{t.label}</td>
           {selBrokers.map(b=>{const v=getBrokerVal(t,b);const hasV=v&&(v.bid!=null||v.mid!=null||v.ask!=null);const op=hasV?(FRESH_OPACITY[v.freshness]??1):1;const stale=hasV&&v.freshness&&v.freshness!=='fresh';
             const badge=stale?<span style={{fontSize:6,color:"#F59E0B",marginLeft:2}}>{v.freshness==='very_stale'?'⏸':''}{v.timact||''}</span>:null;
             return<React.Fragment key={b}>
@@ -895,8 +902,10 @@ export default function Dashboard(){
   if(err)return <div style={{padding:20,color:"#F87171"}}>Backend error: {err}</div>;
   if(!meta||!snap||!ad||!selection)return <div style={{padding:20,color:"#64748B"}}>Loading…</div>;
 
-  const{rows,immR,anchors,qFF,spSpr,immSpr,cfg}=ad;
-  const filt=showI?rows:rows.filter(r=>!r.interp);
+  const{rows,immR,anchors,qFF,spSpr,immSpr,cfg,ff1M,ff3M,ibAnchor}=ad;
+  // Main anchor table: only Spot + anchorTenorsM rows (backbone curve).
+  const anchorMs = new Set([0, ...(snap.anchorTenorsM || snap.tenorsM || [1,2,3,6,9,12,18,24])]);
+  const filt=(showI?rows:rows.filter(r=>!r.interp)).filter(r => anchorMs.has(r.month));
   const mr=rows.filter(r=>r.month>0);
   const mPC=Math.max(...mr.map(r=>Math.abs(r.pipChg||0)),1);
   const mIC=Math.max(...mr.map(r=>Math.abs(r.iyChg||0)),.01);
@@ -1005,7 +1014,7 @@ export default function Dashboard(){
               <td colSpan={2} style={sS("#FB923C")}>SOFR</td><td colSpan={2} style={sS("#C084FC")}>BASIS</td>
               <td colSpan={2} style={sS("#38BDF8")}>CARRY</td><td colSpan={2} style={sS("#A78BFA")}>ROLL-DOWN</td>
             </tr><tr>
-              <th style={{...tS(),textAlign:"left",minWidth:36}}>Tnr</th><th style={tS()}>Val</th><th style={tS()}>Fix</th><th style={{...tS(),borderRight:"1px solid #334155"}}>D</th>
+              <th style={{...tS(),textAlign:"left",minWidth:36,...STICKY_TH}}>Tnr</th><th style={tS()}>Val</th><th style={tS()}>Fix</th><th style={{...tS(),borderRight:"1px solid #334155"}}>D</th>
               <th style={tS("#4ADE80")}>Bid</th><th style={tS("#F87171")}>Ask</th><th style={{...tS("#FBBF24"),borderRight:"1px solid #334155"}}>Mid</th>
               <th style={tS("#4ADE80")}>Bid</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#F87171")}>Ask</th><th style={{...tS(),borderRight:"1px solid #334155"}}>D/D</th>
               <th style={tS("#4ADE80")}>Bid</th><th style={tS("#34D399")}>Mid</th><th style={tS("#F87171")}>Ask</th><th style={{...tS(),borderRight:"1px solid #334155"}}>D/D</th>
@@ -1016,7 +1025,7 @@ export default function Dashboard(){
             </tr></thead>
             <tbody>{filt.map((r,i)=>{const sp=r.month===0,mj=[0,1,2,3,6,9,12,24].includes(r.month);const bg=sp?"#1a2744":(i%2===0?"#0F172A":"#111827");const tc=r.interp?"#475569":(mj?"#F8FAFC":"#94A3B8");
               return(<tr key={r.tenor} style={{background:bg,borderBottom:[3,6,9,12].includes(r.month)?"1px solid #334155":"none",cursor:"pointer"}} onDoubleClick={()=>dblR(r.tenor,r.spM,true,r.month)}>
-                <td style={{...cS(tc,mj),textAlign:"left",borderRight:"1px solid #1E293B"}}>{r.tenor}{r.interp?"*":""}</td>
+                <td style={{...cS(tc,mj),textAlign:"left",borderRight:"1px solid #1E293B",...stickyTd(bg)}}>{r.tenor}{r.interp?"*":""}</td>
                 <td style={cS("#475569")}>{fD(r.valDate)}</td><td style={cS("#475569")}>{fD(r.fixDate)}</td><td style={{...cS("#475569"),borderRight:"1px solid #334155"}}>{r.dT||"—"}</td>
                 <td style={cS("#4ADE80")}>{F(r.bT,dp)}</td><td style={cS("#F87171")}>{F(r.aT,dp)}</td><td style={{...cS("#FBBF24",true),borderRight:"1px solid #334155"}}>{F(r.mT,dp)}</td>
                 <td style={cS("#4ADE80")}>{sp?"—":FP(r.spB,pdp)}</td><td style={cS("#FBBF24",true)}>{sp?"—":FP(r.spM,pdp)}</td><td style={cS("#F87171")}>{sp?"—":FP(r.spA,pdp)}</td>
@@ -1032,27 +1041,19 @@ export default function Dashboard(){
                 <td style={cS(r.rollY>=0?"#A78BFA":"#F472B6")}>{r.month<2?"—":FP(r.rollY,2)}</td>
               </tr>);})}</tbody></table></div>
 
-        <div style={{fontSize:8.5,fontWeight:700,color:"#F8FAFC",marginBottom:2}}>1M FORWARD-FORWARD CHAIN</div>
-        <div style={{overflowX:"auto",overflowY:"auto",maxHeight:"28vh",borderRadius:5,border:"1px solid #1E293B"}}>
-          <table style={{borderCollapse:"collapse",width:"100%",minWidth:1200}}>
-            <thead><tr><th style={{...tS(),textAlign:"left",minWidth:55}}>Period</th><th style={tS()}>Near Val</th><th style={tS()}>Far Val</th><th style={tS()}>Days</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#F87171")}>Ask</th><th style={tS()}>D/D</th><th style={tS()}>Pts/D</th><th style={tS("#22D3EE")} title="Static-curve carry (display pips)">Carry</th><th style={tS("#4ADE80")}>Iy Bid</th><th style={tS("#34D399")}>Iy Mid</th><th style={tS("#F87171")}>Iy Ask</th><th style={tS()}>Iy D/D</th><th style={tS()}>Iy bp/d</th><th style={tS("#FB923C")}>Fwd SOFR</th><th style={tS("#C084FC")}>Basis</th></tr></thead>
-            <tbody>{filt.filter(r=>r.month>0).map((r,i)=>{const p=i>0?filt.filter(x=>x.month>0)[i-1]:null;const label=r.month===1?"SP×1M":p?`${p.tenor}×${r.tenor}`:`SP×${r.tenor}`;const fwdD=p?r.dT-p.dT:r.dT;const ppd=fwdD>0?r.ffM/fwdD:0;const mj=[1,2,3,6,9,12,24].includes(r.month);
-              // Row-level carry: spot-start → r.spM; fwd-fwd → fwdPts[F-N] − (fwdPts[F]−fwdPts[N]). Use r.ffM as approximation for F-N→r.spM legacy; r.carryP already = r.ffM from buildAllData.
-              const rowCarry = p == null ? r.spM : (r.ffM != null ? r.ffM : null);
-              return(<tr key={r.tenor} style={{background:i%2===0?"#0F172A":"#111827",borderBottom:[3,6,9,12].includes(r.month)?"1px solid #334155":"none",cursor:"pointer"}} onDoubleClick={()=>dblR(label,r.ffM,true,r.month)}>
-                <td style={{...cS(r.interp?"#475569":(mj?"#F8FAFC":"#94A3B8"),mj),textAlign:"left"}}>{label}{r.interp?"*":""}</td>
-                <td style={cS("#475569")}>{fD(p?p.valDate:ad.TENOR_DATES[0]?.valDate)}</td><td style={cS("#475569")}>{fD(r.valDate)}</td><td style={cS("#475569",false,true)}>{fwdD}</td>
-                <td style={cS("#4ADE80")}>{FP(r.ffB,pdp)}</td><td style={cS("#FBBF24",true)}>{FP(r.ffM,pdp)}</td><td style={cS("#F87171")}>{FP(r.ffA,pdp)}</td>
-                <td style={{...cS(CC(r.ffChg)),background:HB(r.ffChg,mFC)}}>{FP(r.ffChg,pdp)}</td><td style={cS("#64748B",false,true)}>{F(ppd,2)}</td>
-                <td style={cS(rowCarry!=null&&rowCarry>=0?"#22D3EE":"#F472B6",true)}>{rowCarry!=null?FP(rowCarry,pdp):"—"}</td>
-                <td style={cS("#4ADE80")}>{F(r.ffIyB,2)}</td><td style={cS("#34D399",true)}>{F(r.ffIyM,2)}</td><td style={cS("#F87171")}>{F(r.ffIyA,2)}</td>
-                <td style={{...cS(CC(r.ffIyChg)),background:HB(r.ffIyChg,.1)}}>{FP(r.ffIyChg,2)}</td><td style={cS("#64748B")}>{r.ffIyBpD!=null?F(r.ffIyBpD,2):"—"}</td>
-                <td style={cS("#FB923C")}>{r.ffSofr!=null?F(r.ffSofr,2):"—"}</td><td style={cS(r.ffBasis!=null&&r.ffBasis>=0?"#C084FC":"#F472B6")}>{r.ffBasis!=null?FP(r.ffBasis*100,1):"—"}</td>
-              </tr>);})}</tbody></table></div>
-      </>)}
+        {/* 1M FwdFwd chain: spreads with near===1 */}
+        {ff1M&&ff1M.length>0&&<div style={{marginBottom:6}}><PChart traces={[{x:ff1M.map(s=>s.label),y:ff1M.map(s=>s.pM),type:"bar",marker:{color:"#22D3EE"}}]} layout={{title:{text:`${cfg.pair} 1M Forward-Forward chain`,font:{size:10}}}} height={150}/></div>}
+        {ff1M&&ff1M.length>0&&<SprTbl spreads={ff1M} title={`${cfg.pair} 1M FWD-FWD CHAIN`} color="#22D3EE" mx={mSC} onDbl={dblR} pdp={pdp}/>}
 
-      {/* Funding (deliverables only) */}
-      {tab==="main"&&cfg.kind!=="NDF"&&<FundingTbl ad={ad} brokersMeta={cfg.brokersMeta} onDbl={dblR}/>}
+        {/* 3M FwdFwd chain: spreads with near===3 */}
+        {ff3M&&ff3M.length>0&&<div style={{marginBottom:6}}><PChart traces={[{x:ff3M.map(s=>s.label),y:ff3M.map(s=>s.pM),type:"bar",marker:{color:"#8B5CF6"}}]} layout={{title:{text:`${cfg.pair} 3M Forward-Forward chain`,font:{size:10}}}} height={150}/></div>}
+        {ff3M&&ff3M.length>0&&<SprTbl spreads={ff3M} title={`${cfg.pair} 3M FWD-FWD CHAIN`} color="#8B5CF6" mx={mSC} onDbl={dblR} pdp={pdp}/>}
+
+        {/* Interbank anchor spreads: other fwd-fwd (6Mx9M, 9Mx12M, 12Mx18M, 12Mx24M, 1Wx1M, TOMFIXx(1M+1bd))
+            For deliverables also includes SPxON/TN/SN/1W. */}
+        {ibAnchor&&ibAnchor.length>0&&<div style={{marginBottom:6}}><PChart traces={[{x:ibAnchor.map(s=>s.label),y:ibAnchor.map(s=>s.pM),type:"bar",marker:{color:"#10B981"}}]} layout={{title:{text:`${cfg.pair} Interbank Anchor spreads`,font:{size:10}}}} height={150}/></div>}
+        {ibAnchor&&ibAnchor.length>0&&<SprTbl spreads={ibAnchor} title={`${cfg.pair} INTERBANK ANCHOR SPREADS`} color="#10B981" mx={mSC} onDbl={dblR} pdp={pdp}/>}
+      </>)}
 
       {/* SPREADS TAB */}
       {tab==="spreads"&&(<div>

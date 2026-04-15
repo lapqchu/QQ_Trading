@@ -12,6 +12,19 @@
 import { mcI, mid, implYld, fwdFwdIy } from "./calc.js";
 import { buildIMMDates, buildTenorDates, computeSpotDate, bizBefore, dateFromSpot, daysBtwn, fD } from "./dates.js";
 
+// ── Curve-days policy ───────────────────────────────────────────────────
+// NDFs price to fixDate (settlement-date curve math uses daysFix).
+// Deliverables price to valueDate (days).
+// Returns the days-to-use for curve interpolation at tenor-month `m`.
+export function daysForCurve(snap, m) {
+  if (!snap || !snap.tenors) return null;
+  const t = snap.tenors[m] || snap.tenors[String(m)];
+  if (!t) return null;
+  const isNDF = snap.kind === "NDF";
+  if (isNDF && t.daysFix != null) return t.daysFix;
+  return t.days ?? null;
+}
+
 // ── Source-level helpers (exported) ─────────────────────────────────────
 const FRESHNESS_RANK = { fresh: 0, stale: 1, very_stale: 2, unknown: 3 };
 
@@ -279,7 +292,9 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
       const p = getPts(m, dk);
       if (p.b == null && p.a == null && p.m == null) return;
       mo.push(m);
-      days.push((snap.tenors?.[m] || snap.tenors?.[String(m)])?.days || m * 30);
+      // Use fixDate-based days for NDFs (when available), valueDate for deliverables.
+      const d = daysForCurve(snap, m);
+      days.push(d != null ? d : m * 30);
       pM.push(p.m); pB.push(p.b); pA.push(p.a);
     });
     return { mo, days, pM, pB, pA };
@@ -303,7 +318,10 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
   function getRow(month, daysOvr, label, immVD) {
     const isK = (month === 0 || knownM.includes(month)) && !daysOvr;
     const ipaD = IPA[month];
-    const dT = daysOvr || (ipaD?.days != null ? Math.round(ipaD.days) : Math.round(iDT(month)));
+    // For anchor tenors on NDFs, prefer backend fixDate-based days so curve math
+    // and displayed D are consistent with the interpolated curve.
+    const anchorD = isK && month > 0 ? daysForCurve(snap, month) : null;
+    const dT = daysOvr || (anchorD != null ? anchorD : (ipaD?.days != null ? Math.round(ipaD.days) : Math.round(iDT(month))));
     const dT1 = daysOvr ? Math.round(iDT1(month) + (daysOvr - iDT(month))) : Math.round(iDT1(month));
     let dataSource = month === 0 ? "spot" : isK ? "RIC" : (ipaD ? "IPA" : "interp");
 
@@ -328,16 +346,11 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
       spM1 = iPtMT1(dT1); spB1 = iPtBT1(dT1); spA1 = iPtAT1(dT1);
     }
 
-    // Outrights
+    // Outrights — ALWAYS computed from spot + display-pts / PF for a single pipeline.
+    // (NDF 1M outright RIC is used only to DERIVE the spot; the row's outright is
+    // reconstructed so it equals spot + pts/PF — matching every other tenor.)
     let bT, aT, mT, bT1, aT1, mT1;
-    if (isNDF && month === 1 && ndf1m) {
-      const oT = ndf1m.T || {}, oT1 = ndf1m.T1 || {};
-      const lqOut = ndf1mOutRic ? liveQuotes[ndf1mOutRic] : null;
-      const om = lqOut?.mid ?? oT.mid ?? mid(lqOut?.bid ?? oT.bid, lqOut?.ask ?? oT.ask);
-      bT = lqOut?.bid ?? oT.bid ?? om; aT = lqOut?.ask ?? oT.ask ?? om; mT = om;
-      const om1 = oT1.mid ?? mid(oT1.bid, oT1.ask);
-      bT1 = oT1.bid ?? om1; aT1 = oT1.ask ?? om1; mT1 = om1;
-    } else if (month === 0) {
+    if (month === 0) {
       bT = spotT.b; aT = spotT.a; mT = spotT.m;
       bT1 = spotT1.b; aT1 = spotT1.a; mT1 = spotT1.m;
     } else if (deriveFromOutrights && isK) {
@@ -470,7 +483,16 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
     r.sofChg = r.sofT != null && r.sofT1 != null ? r.sofT - r.sofT1 : null;
     r.basChg = r.basisT != null && r.basisT1 != null ? r.basisT - r.basisT1 : null;
     r.ffIyChg = r.ffIyM != null && r.ffIyM1 != null ? r.ffIyM - r.ffIyM1 : null;
-    r.carryP = r.ffM;
+    // Row-level carry (spot-start SPxT): 1-month roll.
+    // carry = fwdPts[T-30d] - fwdPts[T]; at month===0 (spot) carry is undefined.
+    if (r.month === 0) { r.carryP = null; }
+    else {
+      const td = r.dT || 0;
+      const shifted = td - 30;
+      const ptsShift = shifted <= 0 ? 0 : iPtMT(shifted);
+      const ptsF = r.spM != null ? r.spM : iPtMT(td);
+      r.carryP = (ptsShift != null && ptsF != null) ? (ptsShift - ptsF) : null;
+    }
     r.carryY = r.ffIyM;
     r.rollP = i >= 2 && r.ffM != null && p?.ffM != null ? r.ffM - p.ffM : (i === 1 ? r.ffM : null);
     r.rollY = i >= 2 && r.ffIyM != null && p?.ffIyM != null ? r.ffIyM - p.ffIyM : (i === 1 ? r.ffIyM : null);
@@ -570,27 +592,32 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
     return null;
   }
 
-  // Carry = static-curve P&L over the life of the swap.
-  //   Spot-start NxF where N==0:        carry = fwdPts[F]            (in display pips)
-  //   Fwd-fwd NxF (N>0):                carry = fwdPts[F-N] − (fwdPts[F] − fwdPts[N])
-  // All fwdPts lookups use the same aggregated curve displayed elsewhere
-  // (iPtMT operates on display-pip curve values).
+  // Carry = static-curve P&L over the horizon of the trade.
+  //   Spot-start SPxT:       horizon = 1 month (30d). carry = fwdPts_days[T-30] - fwdPts_days[T]
+  //                          (for SPx1M → fwdPts[0]-fwdPts[30d] = -fwdPts[30d])
+  //   Fwd-fwd NxF (N>0):     horizon = N days (near.days). carry = fwdPts[F-N] - (fwdPts[F]-fwdPts[N])
+  // All fwdPts lookups use the aggregated curve via days-indexed iPtMT.
   function computeCarry(nr, fr) {
     if (!nr || !fr) return null;
     const nearDays = nr.dT || 0;
     const farDays = fr.dT || 0;
     if (farDays <= 0) return null;
-    // Spot-start
+    const ptsF = fr.spM != null ? fr.spM : iPtMT(farDays);
+    if (ptsF == null) return null;
+    // Spot-start: 1-month (30-day) roll.
     if (nearDays === 0) {
-      return fr.spM != null ? fr.spM : (iPtMT(farDays) ?? null);
+      const horizon = 30;
+      const shifted = farDays - horizon;
+      const ptsShift = shifted <= 0 ? 0 : iPtMT(shifted);
+      if (ptsShift == null) return null;
+      return ptsShift - ptsF;
     }
-    // Fwd-fwd
+    // Fwd-fwd: horizon = nearDays.
     const diffDays = farDays - nearDays;
     if (diffDays <= 0) return null;
     const ptsDiff = iPtMT(diffDays);
-    const ptsF = fr.spM != null ? fr.spM : iPtMT(farDays);
     const ptsN = nr.spM != null ? nr.spM : iPtMT(nearDays);
-    if (ptsDiff == null || ptsF == null || ptsN == null) return null;
+    if (ptsDiff == null || ptsN == null) return null;
     return ptsDiff - (ptsF - ptsN);
   }
 
@@ -669,8 +696,16 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
       else qFF.push(s);
     }
     // For NDF, also compute 3M rolling fwd-fwd extras not in backend pack.
+    // Ensure 3Mx6M, 3Mx9M, 3Mx12M are available for the 3M FwdFwd chain table.
     if (snap.spreadPack === "NDF") {
-      for (let n = 3; n <= 21; n += 3) {
+      const extras = [[3,6,"3Mx6M"],[3,9,"3Mx9M"],[3,12,"3Mx12M"]];
+      for (const [n,f,lbl] of extras) {
+        if (f <= maxT && !qFF.find(x => x.label === lbl)) {
+          const s = mkSpr(n, f, lbl);
+          if (s) qFF.push(s);
+        }
+      }
+      for (let n = 6; n <= 21; n += 3) {
         const f = n + 3;
         if (f <= maxT) {
           const lbl = `${n}M×${f <= 12 ? f+"M" : f===24 ? "2Y" : f+"M"}`;
@@ -782,8 +817,36 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
     freshnessThresholdsSec: snap.freshnessThresholdsSec || { fresh: 600, stale: 3600 },
     valueMode: snap.valueMode,
   };
+  // Categorize fwd-fwd rolls for the per-table layout:
+  //   ff1M:      rows with near===1 (1M FwdFwd chain)
+  //   ff3M:      rows with near===3 (3M FwdFwd chain)
+  //   ibAnchor:  everything else in qFF + non-spot anchors in `anchors`
+  //              For deliverables: also include funding spot-start (SPxON/TN/SN/1W).
+  const ff1M = qFF.filter(s => s && s.nrM === 1);
+  const ff3M = qFF.filter(s => s && s.nrM === 3);
+  const ff1MLabels = new Set(ff1M.map(s => s.label));
+  const ff3MLabels = new Set(ff3M.map(s => s.label));
+  const ibAnchor = [];
+  for (const s of qFF) {
+    if (!s) continue;
+    if (ff1MLabels.has(s.label) || ff3MLabels.has(s.label)) continue;
+    ibAnchor.push(s);
+  }
+  // Deliverable funding spot-start spreads (SPxON/TN/SN/1W) come from `anchors` (near=0).
+  if (!isNDF) {
+    for (const s of anchors) {
+      if (!s) continue;
+      const nl = (s.nearLabel || "").toUpperCase();
+      const fl = (s.farLabel  || "").toUpperCase();
+      if (["ON","TN","SN","1W"].includes(fl) || ["ON","TN","SN","1W"].includes(nl)) {
+        ibAnchor.unshift(s);
+      }
+    }
+  }
+
   return {
     rows, immR, anchors, qFF, spSpr, immSpr, funding: fundingOut,
+    ff1M, ff3M, ibAnchor,
     sMT, sMT1, sBT, sAT, cfg, ccy: snap.ccy, maxT,
     SPOT_DATE, TENOR_DATES,
     lastReloadTs: snap.lastReloadTs,
@@ -823,6 +886,7 @@ export function calcCustom(ad, nearM, farM, nearDate, farDate, ipaCustom) {
         nrFxD: parseD(ipaN.fixDate), frFxD: parseD(ipaF.fixDate),
         nrDT: nDays, frDT: fDays,
         source: "IPA",
+        ppd: ds > 0 && pM != null ? pM / ds : null,
       };
     }
   }
@@ -844,5 +908,6 @@ export function calcCustom(ad, nearM, farM, nearDate, farDate, ipaCustom) {
     nrFxD: nr.fixDate, frFxD: fr.fixDate,
     nrDT: nr.dT, frDT: fr.dT,
     source: "interp",
+    ppd: ds > 0 && pM != null ? pM / ds : null,
   };
 }

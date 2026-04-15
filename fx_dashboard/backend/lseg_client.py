@@ -532,13 +532,21 @@ class LsegClient:
         kind: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
-        Return TOMFIX x (1M+1bd) near/far legs with IPA business-day-adjusted dates.
-          near = TN-tenor leg (TOMFIX value date)
-          far  = 1M-leg-endDate + 1 calendar day, snapped to next business day by IPA
+        TOMFIX near/far dates per spec:
+          near: fixDate = T+1 business day (today + 1bd), valueDate = IPA(TN).endDate
+          far:  valueDate = IPA(1M).endDate + 1 business day
+                 (query IPA with start=1M.startDate, end=(1M.endDate + 1 calendar day).isoformat()
+                  — IPA snaps to the next valid business day).
+                fixDate = far.endDate − ccy fixLag, where
+                  fixLag = IPA(1M).endDate − IPA(1M).fixDate (in days).
 
-        Returns {near: {startDate,endDate,days}, far: {startDate,endDate,days}} or None.
+        Returns keys:
+          near:{startDate,endDate,fixDate,days}, far:{startDate,endDate,fixDate,days},
+          nearDays, farDays, nearDate, farDate, nearFixDate, farFixDate, fixLagDays.
         """
-        # Step 1: resolve TN + 1M
+        from datetime import date as _date, timedelta as _td
+
+        # Step 1: TN + 1M via batch
         first = self._fwd_batch(
             ccy_pair,
             [{"key": "TN", "tenor": "TN"}, {"key": "1M", "tenor": "1M"}],
@@ -548,9 +556,20 @@ class LsegClient:
         onem = first.get("1M")
         if not tn or not onem or not onem.get("startDate") or not onem.get("endDate"):
             return None
+
+        # Compute fix lag from 1M: endDate - fixDate
+        fix_lag_days = None
+        if onem.get("endDate") and onem.get("fixDate"):
+            try:
+                fix_lag_days = (
+                    _date.fromisoformat(onem["endDate"]) -
+                    _date.fromisoformat(onem["fixDate"])
+                ).days
+            except Exception:
+                fix_lag_days = None
+
         # Step 2: far leg = start=1M.startDate, end=1M.endDate+1 calendar day
         try:
-            from datetime import date as _date, timedelta as _td
             end1m = _date.fromisoformat(onem["endDate"])
             target_end = (end1m + _td(days=1)).isoformat()
         except Exception:
@@ -563,8 +582,6 @@ class LsegClient:
         if not far:
             return None
 
-        # near_days measured from today; far_days likewise (backend valuation date)
-        from datetime import date as _date
         today = _date.today()
         def _d_from_today(iso):
             try:
@@ -572,22 +589,43 @@ class LsegClient:
             except Exception:
                 return None
 
+        # Near fixDate = T+1 business day (Mon-Fri approximation)
+        def _next_bd(d: _date) -> _date:
+            nxt = d + _td(days=1)
+            while nxt.weekday() >= 5:  # 5=Sat,6=Sun
+                nxt = nxt + _td(days=1)
+            return nxt
+        near_fix_date = _next_bd(today).isoformat()
+
+        # Far fixDate = far.endDate - fix_lag_days
+        far_fix_date = None
+        if far.get("endDate") and fix_lag_days is not None:
+            try:
+                far_fix_date = (
+                    _date.fromisoformat(far["endDate"]) - _td(days=fix_lag_days)
+                ).isoformat()
+            except Exception:
+                far_fix_date = None
+
         return {
             "near": {
                 "startDate": tn.get("startDate"),
                 "endDate": tn.get("endDate"),
+                "fixDate": near_fix_date,
                 "days": tn.get("days"),
-                "nearDays": _d_from_today(tn.get("endDate")),
             },
             "far": {
                 "startDate": far.get("startDate"),
                 "endDate": far.get("endDate"),
+                "fixDate": far_fix_date,
                 "days": far.get("days"),
-                "farDays": _d_from_today(far.get("endDate")),
             },
             "nearDays": _d_from_today(tn.get("endDate")),
             "farDays": _d_from_today(far.get("endDate")),
             "nearDate": tn.get("endDate"),
             "farDate": far.get("endDate"),
+            "nearFixDate": near_fix_date,
+            "farFixDate": far_fix_date,
+            "fixLagDays": fix_lag_days,
         }
 

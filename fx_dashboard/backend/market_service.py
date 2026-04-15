@@ -184,9 +184,18 @@ class MarketService:
             self._quotes[ric] = Quote(bid=bid, ask=ask, last=last, ts=now,
                                       timact=timact_str, timact_ts=timact_ts)
 
-        # T1 (prev close) — composite swap pts + spot + SOFR only; cached per
-        # (ric, date) since prev-close doesn't change intraday.
-        t1_rics = [cfg.spot_ric] + [r for r in composite_rics if r != cfg.spot_ric] + sofr_rics
+        # T1 (prev close) — spot + composite swap pts + SOFR + broker swap pts +
+        # outrights + funding composites. Funding-broker RICs intentionally excluded
+        # (too many, low marginal value). Cached per (ric, date).
+        t1_rics = (
+            [cfg.spot_ric]
+            + [r for r in composite_rics if r != cfg.spot_ric]
+            + sofr_rics
+            + list(broker_rics)
+            + list(outright_rics)
+            + [r for r in funding_rics if r and r.endswith("=")]  # composites only (TWDON= etc.)
+        )
+        t1_rics = list(dict.fromkeys(t1_rics))
         today_iso = date.today().isoformat()
         t1: Dict[str, Quote] = {}
         uncached: List[str] = []
@@ -196,25 +205,45 @@ class MarketService:
                 t1[r] = cached
             else:
                 uncached.append(r)
-        if uncached:
-            try:
-                hist = self.lseg.get_history(uncached, ["BID", "ASK", "TRDPRC_1"],
-                                             interval="daily", count=2)
-                for ric, bars in hist.items():
-                    if not bars:
-                        continue
-                    bar = bars[-1] if len(bars) == 1 else bars[-2]
-                    q = Quote(bid=_num(bar.get("BID")), ask=_num(bar.get("ASK")),
-                              last=_num(bar.get("TRDPRC_1")))
-                    t1[ric] = q
-                    self._t1_cache[f"{ric}@{today_iso}"] = q
-            except Exception as e:
-                log.warning("T1 fetch failed: %s", e)
+        # Run T1 history + IPA tenors + tomfix concurrently — they hit
+        # different Workspace endpoints (history vs IPA) so they overlap.
+        from concurrent.futures import ThreadPoolExecutor
+        def _do_t1():
+            if not uncached:
+                return {}
+            CHUNK = 20
+            chunks = [uncached[i:i+CHUNK] for i in range(0, len(uncached), CHUNK)]
+            def _fetch(chunk):
+                try:
+                    return self.lseg.get_history(chunk, ["BID", "ASK", "TRDPRC_1"],
+                                                 interval="daily", count=2)
+                except Exception as e:
+                    log.warning("T1 chunk fetch failed (%d RICs): %s", len(chunk), e)
+                    return {}
+            merged: Dict[str, Any] = {}
+            with ThreadPoolExecutor(max_workers=min(8, len(chunks))) as ex:
+                for hist in ex.map(_fetch, chunks):
+                    merged.update(hist)
+            return merged
 
-        # IPA enrichment (non-anchor tenors, fix/value dates)
-        ipa_data = self._fetch_ipa_tenors(cfg)
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            fut_t1 = ex.submit(_do_t1)
+            fut_ipa = ex.submit(self._fetch_ipa_tenors, cfg)
+            fut_tom = ex.submit(self._fetch_tomfix_cached, cfg)
+            hist_merged = fut_t1.result()
+            ipa_data = fut_ipa.result()
+            tomfix_pl = fut_tom.result()
 
-        tomfix_pl = self._fetch_tomfix_cached(cfg)
+        for ric, bars in hist_merged.items():
+            if not bars:
+                continue
+            bar = bars[-1] if len(bars) == 1 else bars[-2]
+            q = Quote(bid=_num(bar.get("BID")), ask=_num(bar.get("ASK")),
+                      last=_num(bar.get("TRDPRC_1")))
+            t1[ric] = q
+            self._t1_cache[f"{ric}@{today_iso}"] = q
+        log.info("Snapshot %s T1 history: %d RICs (cached=%d, fetched=%d)",
+                 ccy, len(t1_rics), len(t1_rics) - len(uncached), len(uncached))
 
         return self._serialize(cfg, t1, ipa_data, ndf_1m_out_ric, tomfix_pl)
 
@@ -364,10 +393,25 @@ class MarketService:
             fix_date = ipa_entry.get("fixDate")
         if days is None:
             days = _days_for_tenor(m)  # IPA-approx: fallback when IPA unreachable
+        # daysFix: calendar days from today to fixDate (null if IPA didn't return one)
+        days_fix = None
+        fix_lag_days = None
+        if fix_date:
+            try:
+                days_fix = (date.fromisoformat(fix_date) - date.today()).days
+            except Exception:
+                days_fix = None
+        if val_date and fix_date:
+            try:
+                fix_lag_days = (date.fromisoformat(val_date) - date.fromisoformat(fix_date)).days
+            except Exception:
+                fix_lag_days = None
         return {
             "days": days,
+            "daysFix": days_fix,
             "valueDate": val_date,
             "fixDate": fix_date,
+            "fixLagDays": fix_lag_days,
             "sources": sources,
             "hasAnyData": any(s.get("hasData") for s in sources.values()),
         }
