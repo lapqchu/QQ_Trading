@@ -606,8 +606,8 @@ function SprTbl({spreads,title,color,mx,onDbl,pdp=1}){
     <div style={{fontSize:9.5,fontWeight:800,color,marginBottom:3,letterSpacing:".05em"}}>{title}</div>
     <div style={{overflowX:"auto"}}><table style={{borderCollapse:"collapse",width:"100%",minWidth:1000,fontSize:9}}>
       <thead><tr><th style={{...tS(),textAlign:"left",minWidth:60,...STICKY_TH}}>Spread</th><th style={tS()}>Near Val</th><th style={tS()}>Near Fix</th><th style={tS()}>Far Val</th><th style={tS()}>Far Fix</th><th style={tS()}>Days</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#F87171")}>Ask</th><th style={tS()}>D/D</th><th style={tS()}>Pts/D</th><th style={tS("#22D3EE")} title="Static-curve carry (display pips). Spot-start: carry=fwdPts[T]. Fwd-fwd NxF: carry=fwdPts[F-N]-(fwdPts[F]-fwdPts[N]).">Carry</th><th style={tS("#4ADE80")}>Iy Bid</th><th style={tS("#34D399")}>Iy Mid</th><th style={tS("#F87171")}>Iy Ask</th><th style={tS()}>Iy D/D</th><th style={tS()}>Iy bp/d</th><th style={tS("#FB923C")}>SOFR%</th><th style={tS("#C084FC")}>Basis</th></tr></thead>
-      <tbody>{spreads.map((s,i)=>{const iso=d=>{if(!d)return null;const x=d instanceof Date?d:new Date(d);if(isNaN(x))return null;return x.toISOString().slice(0,10);};const ndIso=iso(s.nrVD),fdIso=iso(s.frVD);const rowBg=i%2===0?"#0F172A":"#131C2E";return(<tr key={i} style={{background:rowBg,cursor:s.unavailable?"default":"pointer",opacity:s.unavailable?.55:1}} onDoubleClick={()=>!s.unavailable&&onDbl&&onDbl(s.label,Math.abs(s.pM)||1,true,null,s.nrM,s.frM,ndIso,fdIso,s.fundingTenor||null)}>
-        <td style={{...cS(color,true),textAlign:"left",...stickyTd(rowBg)}} title={s.unavailable?s.unavailableReason:undefined}>{s.label}{s.unavailable?" *":""}</td>
+      <tbody>{spreads.map((s,i)=>{const iso=d=>{if(!d)return null;const x=d instanceof Date?d:new Date(d);if(isNaN(x))return null;return x.toISOString().slice(0,10);};const ndIso=iso(s.nrVD),fdIso=iso(s.frVD);const rowBg=i%2===0?"#0F172A":"#131C2E";const isInterp=s.interp||s.dataSource==="interpolated";return(<tr key={i} style={{background:rowBg,cursor:s.unavailable?"default":"pointer",opacity:s.unavailable?.55:(isInterp?.78:1)}} onDoubleClick={()=>!s.unavailable&&onDbl&&onDbl(s.label,Math.abs(s.pM)||1,true,null,s.nrM,s.frM,ndIso,fdIso,s.fundingTenor||null)}>
+        <td style={{...cS(isInterp?"#64748B":color,true),textAlign:"left",...stickyTd(rowBg)}} title={s.unavailable?s.unavailableReason:(isInterp?"interpolated — no direct RIC data":undefined)}>{s.label}{s.unavailable?" *":(isInterp?" ⁱ":"")}</td>
         <td style={cS("#475569")}>{fD(s.nrVD)}</td><td style={cS("#475569")}>{fD(s.nrFxD)}</td><td style={cS("#475569")}>{fD(s.frVD)}</td><td style={cS("#475569")}>{fD(s.frFxD)}</td><td style={cS("#475569",false,true)}>{s.days}</td>
         <td style={cS("#4ADE80")}>{FP(s.pB,pdp)}</td><td style={cS("#FBBF24",true)}>{FP(s.pM,pdp)}</td><td style={cS("#F87171")}>{FP(s.pA,pdp)}</td>
         <td style={{...cS(CC(s.chg)),background:HB(s.chg,mx)}}>{FP(s.chg,pdp)}</td><td style={cS("#64748B",false,true)}>{F(s.ppd,2)}</td>
@@ -997,7 +997,7 @@ export default function Dashboard(){
   const sofrVals=chartRows.map(r=>r.sofT);
   const basVals=chartRows.map(r=>r.basisT!=null?r.basisT*100:null);
 
-  const tabs=[{id:"main",label:"Full Curve"},{id:"spreads",label:"Spreads & Rolls"},{id:"imm",label:"IMM Dates"},{id:"tools",label:"Tools"},{id:"broker",label:"Broker Monitor"}];
+  const tabs=[{id:"main",label:"Full Curve"},{id:"spreads",label:"Spreads & Rolls"},{id:"tools",label:"Tools"},{id:"broker",label:"Broker Monitor"}];
   const SprChart=({rows,title,color,height=150})=>(
     <div style={{marginBottom:6}}>
       <PChart traces={[{x:rows.map(s=>s.label),y:rows.map(s=>s.pM),type:"bar",marker:{color}}]}
@@ -1146,44 +1146,38 @@ export default function Dashboard(){
         </>)}
       </>)}
 
-      {/* SPREADS & ROLLS TAB — now only interbank anchors (NDF) + IMM rolls.
+      {/* SPREADS & ROLLS TAB — interbank anchors (NDF only) + IMM outrights + IMM rolls.
           Full-curve ladders (spot-start / 1M chain / 3M chain) live on Full Curve tab. */}
       {tab==="spreads"&&(<div>
         {cfg.kind==="NDF"&&pkInterbank.length>0&&(<>
           <SprChart rows={pkInterbank} title={`${cfg.pair} Interbank Anchors`} color="#10B981"/>
           <SprTbl spreads={pkInterbank} title={`${cfg.pair} INTERBANK ANCHOR SPREADS`} color="#10B981" mx={mSC} onDbl={dblR} pdp={pdp}/>
         </>)}
-        {immSpr.length>0&&(<>
-          <SprChart rows={immSpr} title={`${cfg.pair} IMM Roll Spreads`} color="#F59E0B"/>
-          <SprTbl spreads={immSpr} title={`${cfg.pair} IMM ROLL SPREADS`} color="#F59E0B" mx={mSC} onDbl={dblR} pdp={pdp}/>
+        {immR.length>0&&(<>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginTop:6,marginBottom:6}}>
+            <PChart traces={[{x:immR.map(r=>r.tenor.split(" ")[1]),y:immR.map(r=>r.spM),type:"bar",name:"SwPts",marker:{color:"#3B82F6"}},{x:immR.map(r=>r.tenor.split(" ")[1]),y:immR.map(r=>r.iyM),type:"scatter",mode:"lines+markers",name:"Impl%",line:{color:"#10B981"},yaxis:"y2"}]}
+              layout={{title:{text:`${cfg.pair} IMM Outrights`,font:{size:10}},yaxis:{title:"Pips"},yaxis2:{title:"%",overlaying:"y",side:"right",gridcolor:"transparent"}}} height={185}/>
+            <PChart traces={[{x:immSpr.map(s=>s.label),y:immSpr.map(s=>s.pM),type:"bar",name:"Roll Pips",marker:{color:"#F59E0B"}}]}
+              layout={{title:{text:`${cfg.pair} IMM Roll Spreads`,font:{size:10}}}} height={185}/>
+          </div>
+          <div style={{background:"#131C2E",borderRadius:5,padding:6,marginBottom:6}}>
+            <div style={{fontSize:9.5,fontWeight:800,color:"#FB923C",marginBottom:3}}>{cfg.pair} IMM OUTRIGHTS</div>
+            <div style={{overflowX:"auto"}}><table style={{borderCollapse:"collapse",width:"100%",minWidth:1200,fontSize:9}}>
+              <thead><tr><th style={{...tS(),textAlign:"left"}}>IMM</th><th style={tS()}>Val Date</th><th style={tS()}>Fix Date</th><th style={tS()}>Days</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#F87171")}>Ask</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#FBBF24")}>Pips</th><th style={tS()}>D/D</th><th style={tS("#34D399")}>Iy Mid</th><th style={tS()}>Iy D/D</th><th style={tS("#FB923C")}>SOFR</th><th style={tS("#C084FC")}>Basis</th><th style={tS("#A78BFA")}>FF</th><th style={tS()}>FF D/D</th><th style={tS("#34D399")}>FF Iy</th></tr></thead>
+              <tbody>{immR.map((r,i)=>(<tr key={i} style={{background:i%2===0?"#0F172A":"#131C2E",cursor:"pointer"}} onDoubleClick={()=>dblR(r.tenor,r.spM,true,r.month)}>
+                <td style={{...cS("#FB923C",true),textAlign:"left"}}>{r.tenor}</td><td style={cS("#475569")}>{fD(r.valDate)}</td><td style={cS("#475569")}>{fD(r.fixDate)}</td><td style={cS("#475569")}>{r.dT}</td>
+                <td style={cS("#4ADE80")}>{F(r.bT,dp)}</td><td style={cS("#F87171")}>{F(r.aT,dp)}</td><td style={cS("#FBBF24",true)}>{F(r.mT,dp)}</td>
+                <td style={cS("#FBBF24",true)}>{FP(r.spM,pdp)}</td><td style={{...cS(CC(r.pipChg)),background:HB(r.pipChg,mPC)}}>{FP(r.pipChg,pdp)}</td>
+                <td style={cS("#34D399",true)}>{F(r.iyM,2)}</td><td style={{...cS(CC(r.iyChg)),background:HB(r.iyChg,mIC)}}>{FP(r.iyChg,2)}</td>
+                <td style={cS("#FB923C")}>{F(r.sofT,2)}</td><td style={cS(r.basisT!=null&&r.basisT>=0?"#C084FC":"#F472B6")}>{r.basisT!=null?FP(r.basisT*100,1):"—"}</td>
+                <td style={cS(r.ffM>=0?"#A78BFA":"#F472B6")}>{FP(r.ffM,pdp)}</td><td style={{...cS(CC(r.ffChg)),background:HB(r.ffChg,mFC)}}>{FP(r.ffChg,pdp)}</td>
+                <td style={cS("#34D399")}>{F(r.ffIyM,2)}</td>
+              </tr>))}</tbody></table></div></div>
+          {immSpr.length>0&&<SprTbl spreads={immSpr} title={`${cfg.pair} IMM ROLL SPREADS`} color="#F59E0B" mx={mSC} onDbl={dblR} pdp={pdp}/>}
         </>)}
-        {cfg.kind==="DELIVERABLE"&&pkInterbank.length===0&&immSpr.length===0&&(
-          <div style={{color:"#64748B",padding:20,fontSize:10}}>No interbank anchor spreads or IMM rolls available for this currency.</div>
+        {cfg.kind==="DELIVERABLE"&&pkInterbank.length===0&&immR.length===0&&(
+          <div style={{color:"#64748B",padding:20,fontSize:10}}>No interbank anchors or IMM data available for this currency.</div>
         )}
-      </div>)}
-
-      {/* IMM TAB */}
-      {tab==="imm"&&(<div>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:6}}>
-          <PChart traces={[{x:immR.map(r=>r.tenor.split(" ")[1]),y:immR.map(r=>r.spM),type:"bar",name:"SwPts",marker:{color:"#3B82F6"}},{x:immR.map(r=>r.tenor.split(" ")[1]),y:immR.map(r=>r.iyM),type:"scatter",mode:"lines+markers",name:"Impl%",line:{color:"#10B981"},yaxis:"y2"}]}
-            layout={{title:{text:`${cfg.pair} IMM Outrights`,font:{size:10}},yaxis:{title:"Pips"},yaxis2:{title:"%",overlaying:"y",side:"right",gridcolor:"transparent"}}} height={185}/>
-          <PChart traces={[{x:immSpr.map(s=>s.label),y:immSpr.map(s=>s.pM),type:"bar",name:"Roll Pips",marker:{color:"#F59E0B"}}]}
-            layout={{title:{text:`${cfg.pair} IMM Roll Spreads`,font:{size:10}}}} height={185}/>
-        </div>
-        <div style={{background:"#131C2E",borderRadius:5,padding:6,marginBottom:6}}>
-          <div style={{fontSize:9.5,fontWeight:800,color:"#FB923C",marginBottom:3}}>{cfg.pair} IMM OUTRIGHTS</div>
-          <div style={{overflowX:"auto"}}><table style={{borderCollapse:"collapse",width:"100%",minWidth:1200,fontSize:9}}>
-            <thead><tr><th style={{...tS(),textAlign:"left"}}>IMM</th><th style={tS()}>Val Date</th><th style={tS()}>Fix Date</th><th style={tS()}>Days</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#F87171")}>Ask</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#FBBF24")}>Pips</th><th style={tS()}>D/D</th><th style={tS("#34D399")}>Iy Mid</th><th style={tS()}>Iy D/D</th><th style={tS("#FB923C")}>SOFR</th><th style={tS("#C084FC")}>Basis</th><th style={tS("#A78BFA")}>FF</th><th style={tS()}>FF D/D</th><th style={tS("#34D399")}>FF Iy</th></tr></thead>
-            <tbody>{immR.map((r,i)=>(<tr key={i} style={{background:i%2===0?"#0F172A":"#131C2E",cursor:"pointer"}} onDoubleClick={()=>dblR(r.tenor,r.spM,true,r.month)}>
-              <td style={{...cS("#FB923C",true),textAlign:"left"}}>{r.tenor}</td><td style={cS("#475569")}>{fD(r.valDate)}</td><td style={cS("#475569")}>{fD(r.fixDate)}</td><td style={cS("#475569")}>{r.dT}</td>
-              <td style={cS("#4ADE80")}>{F(r.bT,dp)}</td><td style={cS("#F87171")}>{F(r.aT,dp)}</td><td style={cS("#FBBF24",true)}>{F(r.mT,dp)}</td>
-              <td style={cS("#FBBF24",true)}>{FP(r.spM,pdp)}</td><td style={{...cS(CC(r.pipChg)),background:HB(r.pipChg,mPC)}}>{FP(r.pipChg,pdp)}</td>
-              <td style={cS("#34D399",true)}>{F(r.iyM,2)}</td><td style={{...cS(CC(r.iyChg)),background:HB(r.iyChg,mIC)}}>{FP(r.iyChg,2)}</td>
-              <td style={cS("#FB923C")}>{F(r.sofT,2)}</td><td style={cS(r.basisT!=null&&r.basisT>=0?"#C084FC":"#F472B6")}>{r.basisT!=null?FP(r.basisT*100,1):"—"}</td>
-              <td style={cS(r.ffM>=0?"#A78BFA":"#F472B6")}>{FP(r.ffM,pdp)}</td><td style={{...cS(CC(r.ffChg)),background:HB(r.ffChg,mFC)}}>{FP(r.ffChg,pdp)}</td>
-              <td style={cS("#34D399")}>{F(r.ffIyM,2)}</td>
-            </tr>))}</tbody></table></div></div>
-        <SprTbl spreads={immSpr} title={`${cfg.pair} IMM ROLL SPREADS`} color="#F59E0B" mx={mSC} onDbl={dblR} pdp={pdp}/>
       </div>)}
 
       {tab==="tools"&&<ToolsPanel ad={ad} onDbl={dblR} ccy={ccy}/>}
