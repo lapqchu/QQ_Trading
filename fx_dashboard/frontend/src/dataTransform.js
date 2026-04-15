@@ -599,7 +599,7 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
       const r = rows.find(r => Math.abs(r.month - 0.25) < 1e-6);
       return r || null;
     }
-    if (key === "SPOT") {
+    if (key === "SPOT" || key === "SP") {
       return rows.find(r => r.month === 0);
     }
     if (key === "TOMFIX" || key === "1M+1BD") {
@@ -716,6 +716,85 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
       iyBpD: fIy != null ? fIy / 360 * 100 : null,
       nearLabel: opts.nearLabel || null, farLabel: opts.farLabel || null,
     };
+  }
+
+  // ── Funding row builder (deliverable ONxTN / TNxSP / SPxSN) ──────────
+  // Each row's pts = the dedicated RIC's live value (funding.{ON|TN|SN}).
+  // Near/far dates + days come from snap.fundingDates (IPA-resolved).
+  function mkFundingRow(def) {
+    const label = def.label;
+    const farKey = (def.farLabel || "").toUpperCase();
+    // Which RIC's value drives this row:
+    //   ONxTN → ON  (today→T+1 swap)
+    //   TNxSP → TN  (T+1→T+2 swap)
+    //   SPxSN → SN  (T+2→T+3 swap)
+    const ricKey =
+      label === "ONxTN" ? "ON" :
+      label === "TNxSP" ? "TN" :
+      label === "SPxSN" ? "SN" : farKey;
+    const bundle = snap.funding?.[ricKey];
+    const src = bundle ? (pickSource(applyLiveToTenor(bundle), selection)
+                          || pickSource(applyLiveToTenor(bundle), ["composite"])
+                          || (bundle.sources ? pickSource(applyLiveToTenor(bundle), Object.keys(bundle.sources)) : null)) : null;
+    let pB = null, pM = null, pA = null, pB1 = null, pM1 = null, pA1 = null;
+    let freshness = null, timact = null, ric = null, sourceName = null;
+    if (src && src.source) {
+      const s = src.source;
+      const dpT = displayPtsFromSource(s, PF);
+      const dpT1 = displayPtsFromSourceT1(s, PF);
+      pB = dpT.b; pM = dpT.m; pA = dpT.a;
+      pB1 = dpT1.b; pM1 = dpT1.m; pA1 = dpT1.a;
+      freshness = s.freshness; timact = s.timact; ric = s.ric; sourceName = src.name;
+    }
+    // Dates from IPA (funding bundle resolves to single tenor — use endpoints of the range)
+    const fd = snap.fundingDates?.[ricKey] || {};
+    const nrVD = fd.startDate ? new Date(fd.startDate) : null;
+    const frVD = fd.endDate   ? new Date(fd.endDate)   : null;
+    const days = fd.days != null ? fd.days : 1;
+    // Carry on funding rows: 1-bd formula using days-indexed curve.
+    // horizon = days, carry = iPtMT(max(farDays-days, 0)) - iPtMT(farDays) + spM
+    //                     = pts value over the span when rolled back 1 period.
+    // Simpler and per spec: use computeCarry on virtual near/far rows.
+    const nearDays = days > 0 ? 0 : 0; // funding rows are effectively 1-bd spans
+    const farDays = Math.max(days, 1);
+    const spotStartLike = label === "TNxSP" ? false : label === "SPxSN" ? false : true;
+    // Generic: static-curve 1bd carry = -pts (holding the 1bd position over 1 day).
+    const carry = pM != null ? -pM : null;
+    return {
+      label, nrM: null, frM: null, pB, pM, pA, pB1, pM1, pA1,
+      chg: pM != null && pM1 != null ? pM - pM1 : null,
+      days,
+      nrVD, frVD, nrFxD: null, frFxD: null,
+      nrDT: 0, frDT: farDays,
+      fIyB: null, fIy: null, fIyA: null, fIy1: null,
+      iyChg: null, fSof: null, fSof1: null, sofChg: null, bas: null, basChg: null,
+      ppd: days > 0 && pM != null ? pM / days : null,
+      carry,
+      iyBpD: null,
+      nearLabel: def.nearLabel || null, farLabel: def.farLabel || null,
+      isFunding: true, fundingTenor: ricKey,
+      source: sourceName, freshness, timact, ric,
+    };
+  }
+
+  // Build named spread packs from backend snap.spreadPacks. Each pack = array
+  // of row-shaped entries compatible with SprTbl.
+  const spreadPacks = {};
+  const packsIn = snap.spreadPacks || {};
+  function mkRowForDef(def) {
+    // Funding rows: near/far are tenor-code strings (e.g. "ON","TN","SP","SN").
+    if (typeof def.near === "string") {
+      return mkFundingRow(def);
+    }
+    return mkSpr(def.near, def.far, def.label, { nearLabel: def.nearLabel, farLabel: def.farLabel });
+  }
+  for (const [packKey, defs] of Object.entries(packsIn)) {
+    const out = [];
+    for (const def of defs) {
+      const row = mkRowForDef(def);
+      if (row) out.push(row);
+    }
+    spreadPacks[packKey] = out;
   }
 
   // Resolve spread pack from snapshot.spreadDefs (backend is source of truth).
@@ -889,6 +968,7 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
   return {
     rows, immR, anchors, qFF, spSpr, immSpr, funding: fundingOut,
     ff1M, ff3M, ibAnchor,
+    spreadPacks,
     sMT, sMT1, sBT, sAT, cfg, ccy: snap.ccy, maxT,
     SPOT_DATE, TENOR_DATES,
     lastReloadTs: snap.lastReloadTs,

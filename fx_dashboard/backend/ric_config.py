@@ -61,51 +61,73 @@ WEEKLY_TENORS = [0.25, 0.5, 0.75]
 
 FUNDING_TENORS = ["ON", "TN", "SN"]
 
-# Anchor spread packs (labels + near/far months)
-NDF_SPREAD_PACK = [
-    # TOMFIX x (1M+1bd) — TOM-NEXT fixing vs 1M+1 business day forward.
-    # near_months ≈ 1/30 (T+1bd), far ≈ 1M+1bd ≈ 1 + 1/30. Values are approximate —
-    # frontend prefers IPA-resolved fwdPoints/dates when available.
-    ("TOMFIXx(1M+1bd)", 1/30, 1 + 1/30, "TOMFIX", "1M+1bd"),
-    ("1Wx1M", 0.25, 1, "1W", "1M"),
-    ("1Mx2M", 1, 2, "1M", "2M"),
-    ("1Mx3M", 1, 3, "1M", "3M"),
-    ("1Mx6M", 1, 6, "1M", "6M"),
-    ("1Mx9M", 1, 9, "1M", "9M"),
-    ("1Mx12M", 1, 12, "1M", "12M"),
-    ("3Mx6M", 3, 6, "3M", "6M"),
-    ("6Mx9M", 6, 9, "6M", "9M"),
-    ("9Mx12M", 9, 12, "9M", "12M"),
-    ("12Mx18M", 12, 18, "12M", "18M"),
-    ("12Mx24M", 12, 24, "12M", "24M"),
+# ─────────────────────────────────────────────────────────────
+# SPREAD PACKS — named, per-kind. Row tuple: (label, near_months, far_months,
+# near_label, far_label). Fractional months allowed for sub-monthly rows.
+# ─────────────────────────────────────────────────────────────
+
+# NDF: interbank-tradable spot-start spreads (1M-anchored) — these are the
+# spreads dealers actually quote.
+NDF_INTERBANK_ANCHORS = [
+    ("1Wx1M",              0.25,       1,           "1W",     "1M"),
+    ("TOMFIXx(1M+1bd)",    1/30,       1 + 1/30,    "TOMFIX", "1M+1bd"),
+    ("1Mx2M",              1,          2,           "1M",     "2M"),
+    ("1Mx3M",              1,          3,           "1M",     "3M"),
+    ("1Mx6M",              1,          6,           "1M",     "6M"),
+    ("1Mx9M",              1,          9,           "1M",     "9M"),
+    ("1Mx12M",             1,          12,          "1M",     "12M"),
 ]
 
-DELIVERABLE_ANCHOR_SPREADS = [
-    # Funding fwd-fwds (near_months = 0, far near-day precise). Fractional months used
-    # purely as ordering / interpolation hints; backend uses funding snapshot values.
-    ("SPxON", 0, 1/30,  "Spot", "ON"),
-    ("SPxTN", 0, 2/30,  "Spot", "TN"),
-    ("SPxSN", 0, 3/30,  "Spot", "SN"),
-    ("SPx1W", 0, 0.25,  "Spot", "1W"),
-    ("SPx1M", 0, 1, "Spot", "1M"),
-    ("SPx2M", 0, 2, "Spot", "2M"),
-    ("SPx3M", 0, 3, "Spot", "3M"),
-    ("SPx6M", 0, 6, "Spot", "6M"),
-    ("SPx9M", 0, 9, "Spot", "9M"),
-    ("SPx12M", 0, 12, "Spot", "12M"),
-    ("SPx18M", 0, 18, "Spot", "18M"),
-    ("SPx24M", 0, 24, "Spot", "24M"),
-]
-
-DELIVERABLE_FWDFWD = [
-    ("1Mx2M", 1, 2, "1M", "2M"),
-    ("2Mx3M", 2, 3, "2M", "3M"),
-    ("3Mx6M", 3, 6, "3M", "6M"),
-    ("6Mx9M", 6, 9, "6M", "9M"),
-    ("9Mx12M", 9, 12, "9M", "12M"),
+# 1M rolling chain: anchor-to-next.
+NDF_1M_CHAIN = [
+    ("1Mx2M",   1,  2,  "1M",  "2M"),
+    ("2Mx3M",   2,  3,  "2M",  "3M"),
+    ("3Mx6M",   3,  6,  "3M",  "6M"),
+    ("6Mx9M",   6,  9,  "6M",  "9M"),
+    ("9Mx12M",  9,  12, "9M",  "12M"),
     ("12Mx18M", 12, 18, "12M", "18M"),
     ("18Mx24M", 18, 24, "18M", "24M"),
 ]
+
+# 3M rolling chain: step-3 anchor chain. 15M/21M are interpolated from curve.
+NDF_3M_CHAIN = [
+    ("3Mx6M",   3,  6,  "3M",  "6M"),
+    ("6Mx9M",   6,  9,  "6M",  "9M"),
+    ("9Mx12M",  9,  12, "9M",  "12M"),
+    ("12Mx15M", 12, 15, "12M", "15M"),
+    ("15Mx18M", 15, 18, "15M", "18M"),
+    ("18Mx21M", 18, 21, "18M", "21M"),
+    ("21Mx24M", 21, 24, "21M", "24M"),
+]
+
+# Deliverable: spot-start ladder — how deliverables actually trade.
+DEL_SPOT_START = [
+    ("SPx1M",   0, 1,   "Spot", "1M"),
+    ("SPx2M",   0, 2,   "Spot", "2M"),
+    ("SPx3M",   0, 3,   "Spot", "3M"),
+    ("SPx6M",   0, 6,   "Spot", "6M"),
+    ("SPx9M",   0, 9,   "Spot", "9M"),
+    ("SPx12M",  0, 12,  "Spot", "12M"),
+    ("SPx18M",  0, 18,  "Spot", "18M"),
+    ("SPx24M",  0, 24,  "Spot", "24M"),
+]
+
+# Deliverable funding: single-source rows. pts = dedicated {CCY}ON|TN|SN= RIC
+# value (already the 1-bd swap). Near/far dates come from IPA per-tenor.
+DEL_FUNDING = [
+    ("ONxTN", "ON", "TN", "ON", "TN"),
+    ("TNxSP", "TN", "SP", "TN", "SP"),
+    ("SPxSN", "SP", "SN", "SP", "SN"),
+]
+
+# Deliverables reuse the NDF chain shapes (the ladders are universal).
+DEL_1M_CHAIN = NDF_1M_CHAIN
+DEL_3M_CHAIN = NDF_3M_CHAIN
+
+# ── Back-compat aliases (older consumers) ───────────────────────────────
+NDF_SPREAD_PACK = NDF_INTERBANK_ANCHORS + NDF_1M_CHAIN + NDF_3M_CHAIN
+DELIVERABLE_ANCHOR_SPREADS = DEL_SPOT_START
+DELIVERABLE_FWDFWD = DEL_1M_CHAIN
 
 
 # ─────────────────────────────────────────────────────────────
@@ -553,10 +575,42 @@ def all_funding_rics(ccy: str) -> List[str]:
 
 
 def get_spread_pack(ccy: str):
+    """Back-compat flat list (all packs concatenated)."""
+    packs = get_spread_packs(ccy)
+    seen = set()
+    out = []
+    for key in ("funding", "interbankAnchors", "spotStart", "m1Chain", "m3Chain"):
+        for row in packs.get(key, []):
+            if row[0] in seen:
+                continue
+            seen.add(row[0])
+            out.append(row)
+    return out
+
+
+def get_spread_packs(ccy: str) -> Dict[str, list]:
+    """
+    Named spread packs for frontend. Each pack = list of tuples:
+        (label, near, far, near_label, far_label)
+    where near/far are months (int/float) for curve rows, or tenor-code
+    strings ("ON", "TN", "SP", "SN") for funding rows.
+
+    NDF:          interbankAnchors, m1Chain, m3Chain
+    DELIVERABLE:  funding, spotStart, m1Chain, m3Chain
+    """
     cfg = CURRENCIES[ccy]
-    if cfg.spread_pack == "NDF":
-        return NDF_SPREAD_PACK
-    return DELIVERABLE_ANCHOR_SPREADS + DELIVERABLE_FWDFWD
+    if cfg.kind == "NDF":
+        return {
+            "interbankAnchors": list(NDF_INTERBANK_ANCHORS),
+            "m1Chain":          list(NDF_1M_CHAIN),
+            "m3Chain":          list(NDF_3M_CHAIN),
+        }
+    return {
+        "funding":   list(DEL_FUNDING),
+        "spotStart": list(DEL_SPOT_START),
+        "m1Chain":   list(DEL_1M_CHAIN),
+        "m3Chain":   list(DEL_3M_CHAIN),
+    }
 
 
 # Back-compat: some callers import BROKER_CONTRIBUTORS. Emit the union.

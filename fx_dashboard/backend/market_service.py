@@ -301,6 +301,10 @@ class MarketService:
             return self._ipa_cache[cache_key]
 
         tenors = ["1W"] + [_ipa_tenor_code(m) for m in cfg.anchor_tenors_m]
+        # Deliverables: also resolve ON/TN/SN value dates so funding-pack rows
+        # have proper startDate/endDate/days without client-side guessing.
+        if cfg.kind == "DELIVERABLE":
+            tenors += ["ON", "TN", "SN"]
         try:
             out = {t: d for t, d in self.lseg.calc_fx_forward_batch(cfg.pair, tenors, kind=cfg.kind).items() if d}
         except Exception as e:
@@ -343,9 +347,18 @@ class MarketService:
 
         # Funding (deliverables)
         funding = {}
+        funding_dates: Dict[str, Any] = {}
         if cfg.kind == "DELIVERABLE":
             for tfund in FUNDING_TENORS:
                 funding[tfund] = self._funding_bundle(cfg, tfund, t1)
+                # IPA-resolved dates for the funding tenor (start/end/days).
+                ipa_entry = (ipa or {}).get(tfund) or {}
+                if ipa_entry:
+                    funding_dates[tfund] = {
+                        "startDate": ipa_entry.get("startDate") or ipa_entry.get("valueDate"),
+                        "endDate":   ipa_entry.get("endDate")   or ipa_entry.get("valueDate"),
+                        "days":      ipa_entry.get("days"),
+                    }
 
         # SOFR
         sofr = {m: {"ric": r, "T": self._ser_ric(r, "T"),
@@ -374,6 +387,7 @@ class MarketService:
             "ndf1mOutright": ndf_1m_out,
             "tenors": tenors,
             "funding": funding,
+            "fundingDates": funding_dates,
             "sofr": sofr,
             "brokers": [b for b in cfg.brokers],     # just the ordered list
             "brokersMeta": brokers_meta,

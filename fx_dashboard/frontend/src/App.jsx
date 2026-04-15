@@ -238,14 +238,23 @@ function buildSpreadHistory(data,nearM,farM){
 }
 
 // ══════════════════════ HIST MODAL ══════════════════════
-function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM,nrDate,frDate,brokersMeta,snap,fundingTenor,ad}){
+function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM,nrDate,frDate,brokersMeta,snap,fundingTenor,ad,selection,liveMid}){
   const[hist,setHist]=useState(null);
   const[histSource,setHistSource]=useState(null);
   const[loading,setLoading]=useState(true);
   const[unavailReason,setUnavailReason]=useState(null);
   const[sigN,setSigN]=useState(20);
   const[period,setPeriod]=useState("1Y");
-  const[contributor,setContributor]=useState(null);
+  // Default contributor from user's ticked source selection. Priority:
+  //   - If selection has exactly one item and it's a broker → use it.
+  //   - If selection contains "composite" → null (composite).
+  //   - If selection has multiple brokers (no composite) → first broker.
+  const defaultContributor=(()=>{
+    if(!selection||!selection.length)return null;
+    if(selection.includes("composite"))return null;
+    return selection.find(s=>s!=="composite")||null;
+  })();
+  const[contributor,setContributor]=useState(defaultContributor);
   const[viewMode,setViewMode]=useState("swap"); // swap|iy|ppd
   const[spotHist,setSpotHist]=useState(null); // map: Date(yyyy-mm-dd) → spot mid (for IY calc)
   const[sofrHist,setSofrHist]=useState(null); // map: yyyy-mm-dd → nearest-tenor SOFR% (for IY calc)
@@ -427,6 +436,14 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
   const dates=hist?hist.map(h=>h.date):[];
   const yLabel=viewMode==="swap"?(isSwapPts?"Swap Points (pips)":"Level")
     :viewMode==="iy"?"Implied Yield (%)":"PPD";
+  // Consistency indicator: last bar vs. live mid (swap-pts view only).
+  const lastBar=(vals&&vals.length)?vals[vals.length-1]:null;
+  const liveVsLast=(()=>{
+    if(viewMode!=="swap"||liveMid==null||lastBar==null||!isFinite(lastBar))return null;
+    const diff=Math.abs(lastBar-liveMid);
+    const tol=Math.max(1,Math.abs(liveMid)*0.05); // 5% or 1 pip, whichever is bigger
+    return{ok:diff<=tol,last:lastBar,live:liveMid,diff};
+  })();
   const priceTraces=[
     {x:dates,y:vals,type:"scatter",mode:"lines",name:tenor,line:{color:"#10B981",width:1.8}},
     {x:dates,y:s20,type:"scatter",mode:"lines",name:"SMA(20)",line:{color:"#FBBF24",width:1,dash:"dot"},opacity:.7},
@@ -470,7 +487,7 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
     <div style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,.85)",zIndex:100,display:"flex",justifyContent:"center",alignItems:"center",padding:8}} onClick={onClose}>
       <div style={{background:"#0F172A",border:"1px solid #334155",borderRadius:8,width:"96%",maxWidth:1300,maxHeight:"96vh",overflow:"auto",padding:12}} onClick={e=>e.stopPropagation()}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6,flexWrap:"wrap",gap:4}}>
-          <h2 style={{fontSize:13,fontWeight:800,color:"#F8FAFC",margin:0}}>{tenor} — Historical {isSwapPts?"(Swap Points)":""}{histSource==='interpolated'&&<span style={{color:"#60A5FA",fontWeight:400,fontSize:9,marginLeft:8}}>Interpolated from anchor data</span>}</h2>
+          <h2 style={{fontSize:13,fontWeight:800,color:"#F8FAFC",margin:0}}>{tenor} — Historical {isSwapPts?"(Swap Points)":""}{histSource==='interpolated'&&<span style={{color:"#60A5FA",fontWeight:400,fontSize:9,marginLeft:8}}>Interpolated from anchor data</span>}{liveVsLast&&<span style={{marginLeft:8,fontSize:9,fontWeight:600,padding:"1px 6px",borderRadius:3,background:liveVsLast.ok?"#14532D":"#78350F",color:liveVsLast.ok?"#4ADE80":"#FBBF24"}} title={`last bar=${liveVsLast.last.toFixed(2)} · live=${liveVsLast.live.toFixed(2)} · Δ=${liveVsLast.diff.toFixed(2)}`}>{liveVsLast.ok?`\u2713 live matches last bar`:`\u26A0 last: ${liveVsLast.last.toFixed(1)} · live: ${liveVsLast.live.toFixed(1)}`}</span>}</h2>
           <div style={{display:"flex",gap:4,alignItems:"center",flexWrap:"wrap"}}>
             <div style={{display:"flex",gap:2}}>{["1D","5D","1M","3M","6M","1Y","3Y","5Y","10Y","Max"].map(p=>(<button key={p} onClick={()=>setPeriod(p)} style={{fontSize:7.5,padding:"1px 5px",borderRadius:3,border:"none",cursor:"pointer",background:period===p?"#3B82F6":"#1E293B",color:period===p?"#FFF":"#94A3B8"}}>{p}</button>))}</div>
             <div style={{display:"flex",gap:2,borderLeft:"1px solid #334155",paddingLeft:4}}>{[["swap","Swap Pts"],["iy","Impl Yld"],["ppd","PPD"]].map(([k,l])=>(<button key={k} onClick={()=>setViewMode(k)} style={{fontSize:7.5,padding:"1px 5px",borderRadius:3,border:"none",cursor:"pointer",background:viewMode===k?"#8B5CF6":"#1E293B",color:viewMode===k?"#FFF":"#94A3B8"}}>{l}</button>))}</div>
@@ -589,7 +606,7 @@ function SprTbl({spreads,title,color,mx,onDbl,pdp=1}){
     <div style={{fontSize:9.5,fontWeight:800,color,marginBottom:3,letterSpacing:".05em"}}>{title}</div>
     <div style={{overflowX:"auto"}}><table style={{borderCollapse:"collapse",width:"100%",minWidth:1000,fontSize:9}}>
       <thead><tr><th style={{...tS(),textAlign:"left",minWidth:60,...STICKY_TH}}>Spread</th><th style={tS()}>Near Val</th><th style={tS()}>Near Fix</th><th style={tS()}>Far Val</th><th style={tS()}>Far Fix</th><th style={tS()}>Days</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#F87171")}>Ask</th><th style={tS()}>D/D</th><th style={tS()}>Pts/D</th><th style={tS("#22D3EE")} title="Static-curve carry (display pips). Spot-start: carry=fwdPts[T]. Fwd-fwd NxF: carry=fwdPts[F-N]-(fwdPts[F]-fwdPts[N]).">Carry</th><th style={tS("#4ADE80")}>Iy Bid</th><th style={tS("#34D399")}>Iy Mid</th><th style={tS("#F87171")}>Iy Ask</th><th style={tS()}>Iy D/D</th><th style={tS()}>Iy bp/d</th><th style={tS("#FB923C")}>SOFR%</th><th style={tS("#C084FC")}>Basis</th></tr></thead>
-      <tbody>{spreads.map((s,i)=>{const iso=d=>{if(!d)return null;const x=d instanceof Date?d:new Date(d);if(isNaN(x))return null;return x.toISOString().slice(0,10);};const ndIso=iso(s.nrVD),fdIso=iso(s.frVD);const rowBg=i%2===0?"#0F172A":"#131C2E";return(<tr key={i} style={{background:rowBg,cursor:s.unavailable?"default":"pointer",opacity:s.unavailable?.55:1}} onDoubleClick={()=>!s.unavailable&&onDbl&&onDbl(s.label,Math.abs(s.pM)||1,true,null,s.nrM,s.frM,ndIso,fdIso)}>
+      <tbody>{spreads.map((s,i)=>{const iso=d=>{if(!d)return null;const x=d instanceof Date?d:new Date(d);if(isNaN(x))return null;return x.toISOString().slice(0,10);};const ndIso=iso(s.nrVD),fdIso=iso(s.frVD);const rowBg=i%2===0?"#0F172A":"#131C2E";return(<tr key={i} style={{background:rowBg,cursor:s.unavailable?"default":"pointer",opacity:s.unavailable?.55:1}} onDoubleClick={()=>!s.unavailable&&onDbl&&onDbl(s.label,Math.abs(s.pM)||1,true,null,s.nrM,s.frM,ndIso,fdIso,s.fundingTenor||null)}>
         <td style={{...cS(color,true),textAlign:"left",...stickyTd(rowBg)}} title={s.unavailable?s.unavailableReason:undefined}>{s.label}{s.unavailable?" *":""}</td>
         <td style={cS("#475569")}>{fD(s.nrVD)}</td><td style={cS("#475569")}>{fD(s.nrFxD)}</td><td style={cS("#475569")}>{fD(s.frVD)}</td><td style={cS("#475569")}>{fD(s.frFxD)}</td><td style={cS("#475569",false,true)}>{s.days}</td>
         <td style={cS("#4ADE80")}>{FP(s.pB,pdp)}</td><td style={cS("#FBBF24",true)}>{FP(s.pM,pdp)}</td><td style={cS("#F87171")}>{FP(s.pA,pdp)}</td>
@@ -947,7 +964,12 @@ export default function Dashboard(){
   if(err)return <div style={{padding:20,color:"#F87171"}}>Backend error: {err}</div>;
   if(!meta||!snap||!ad||!selection)return <div style={{padding:20,color:"#64748B"}}>Loading…</div>;
 
-  const{rows,immR,anchors,qFF,spSpr,immSpr,cfg,ff1M,ff3M,ibAnchor}=ad;
+  const{rows,immR,anchors,qFF,spSpr,immSpr,cfg,ff1M,ff3M,ibAnchor,spreadPacks:packs}=ad;
+  const pk=packs||{};
+  const pkFunding=pk.funding||[];
+  const pkAnchors=cfg.kind==="NDF"?(pk.interbankAnchors||[]):(pk.spotStart||[]);
+  const pkM1=pk.m1Chain||[];
+  const pkM3=pk.m3Chain||[];
   // Main anchor table: only Spot + anchorTenorsM rows (backbone curve).
   const anchorMs = new Set([0, ...(snap.anchorTenorsM || snap.tenorsM || [1,2,3,6,9,12,18,24])]);
   const filt=(showI?rows:rows.filter(r=>!r.interp)).filter(r => anchorMs.has(r.month));
@@ -973,10 +995,16 @@ export default function Dashboard(){
   const basVals=chartRows.map(r=>r.basisT!=null?r.basisT*100:null);
 
   const tabs=[{id:"main",label:"Full Curve"},{id:"spreads",label:"Spreads & Rolls"},{id:"imm",label:"IMM Dates"},{id:"tools",label:"Tools"},{id:"broker",label:"Broker Monitor"}];
+  const SprChart=({rows,title,color,height=150})=>(
+    <div style={{marginBottom:6}}>
+      <PChart traces={[{x:rows.map(s=>s.label),y:rows.map(s=>s.pM),type:"bar",marker:{color}}]}
+        layout={{title:{text:title,font:{size:10}}}} height={height}/>
+    </div>
+  );
 
   return(
     <div style={{background:"#0F172A",color:"#E2E8F0",minHeight:"100vh",fontFamily:"'Inter',system-ui,sans-serif",padding:8}}>
-      {hm&&<HistModal tenor={hm.tenor} val={hm.value} isSwapPts={hm.isSP} dpOverride={dp} onClose={()=>setHm(null)} ccy={ccy} monthHint={hm.month} nrM={hm.nrM} frM={hm.frM} nrDate={hm.nrDate} frDate={hm.frDate} brokersMeta={snap.brokersMeta} snap={snap} fundingTenor={hm.fundingTenor} ad={ad}/>}
+      {hm&&<HistModal tenor={hm.tenor} val={hm.value} isSwapPts={hm.isSP} dpOverride={dp} onClose={()=>setHm(null)} ccy={ccy} monthHint={hm.month} nrM={hm.nrM} frM={hm.frM} nrDate={hm.nrDate} frDate={hm.frDate} brokersMeta={snap.brokersMeta} snap={snap} fundingTenor={hm.fundingTenor} ad={ad} selection={selection} liveMid={hm.value}/>}
       {/* Header */}
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6,paddingBottom:4,borderBottom:"1px solid #1E293B",flexWrap:"wrap",gap:4}}>
         <div><h1 style={{fontSize:14,fontWeight:800,margin:0,color:"#F8FAFC"}}>{cfg.pair} {cfg.kind==="NDF"?"NDF":"FWD"} Dashboard</h1>
@@ -1099,32 +1127,27 @@ export default function Dashboard(){
                 <td style={{...cS(r.rollP>=0?"#A78BFA":"#F472B6"),background:r.month<2?"transparent":HB(r.rollP,mRP)}}>{r.month<2?"—":FP(r.rollP,pdp)}</td>
                 <td style={cS(r.rollY>=0?"#A78BFA":"#F472B6")}>{r.month<2?"—":FP(r.rollY,2)}</td>
               </tr>);})}</tbody></table></div>
-
-        {/* 1M FwdFwd chain: spreads with near===1 */}
-        {ff1M&&ff1M.length>0&&<div style={{marginBottom:6}}><PChart traces={[{x:ff1M.map(s=>s.label),y:ff1M.map(s=>s.pM),type:"bar",marker:{color:"#22D3EE"}}]} layout={{title:{text:`${cfg.pair} 1M Forward-Forward chain`,font:{size:10}}}} height={150}/></div>}
-        {ff1M&&ff1M.length>0&&<SprTbl spreads={ff1M} title={`${cfg.pair} 1M FWD-FWD CHAIN`} color="#22D3EE" mx={mSC} onDbl={dblR} pdp={pdp}/>}
-
-        {/* 3M FwdFwd chain: spreads with near===3 */}
-        {ff3M&&ff3M.length>0&&<div style={{marginBottom:6}}><PChart traces={[{x:ff3M.map(s=>s.label),y:ff3M.map(s=>s.pM),type:"bar",marker:{color:"#8B5CF6"}}]} layout={{title:{text:`${cfg.pair} 3M Forward-Forward chain`,font:{size:10}}}} height={150}/></div>}
-        {ff3M&&ff3M.length>0&&<SprTbl spreads={ff3M} title={`${cfg.pair} 3M FWD-FWD CHAIN`} color="#8B5CF6" mx={mSC} onDbl={dblR} pdp={pdp}/>}
-
-        {/* Interbank anchor spreads: other fwd-fwd (6Mx9M, 9Mx12M, 12Mx18M, 12Mx24M, 1Wx1M, TOMFIXx(1M+1bd))
-            For deliverables also includes SPxON/TN/SN/1W. */}
-        {ibAnchor&&ibAnchor.length>0&&<div style={{marginBottom:6}}><PChart traces={[{x:ibAnchor.map(s=>s.label),y:ibAnchor.map(s=>s.pM),type:"bar",marker:{color:"#10B981"}}]} layout={{title:{text:`${cfg.pair} Interbank Anchor spreads`,font:{size:10}}}} height={150}/></div>}
-        {ibAnchor&&ibAnchor.length>0&&<SprTbl spreads={ibAnchor} title={`${cfg.pair} INTERBANK ANCHOR SPREADS`} color="#10B981" mx={mSC} onDbl={dblR} pdp={pdp}/>}
       </>)}
 
-      {/* SPREADS TAB */}
+      {/* SPREADS & ROLLS TAB — ordered:
+          1. Funding (deliverable only) · 2. Interbank anchors · 3. 1M fwd-fwd chain · 4. 3M fwd-fwd chain */}
       {tab==="spreads"&&(<div>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:6}}>
-          <PChart traces={[{x:anchors.map(s=>s.label),y:anchors.map(s=>s.pM),type:"bar",name:"Mid",marker:{color:"#10B981"}},{x:anchors.map(s=>s.label),y:anchors.map(s=>s.chg),type:"scatter",mode:"lines+markers",name:"D/D",line:{color:"#FBBF24"},yaxis:"y2"}]} layout={{title:{text:`${cfg.pair} Interbank Anchors`,font:{size:10}},yaxis2:{overlaying:"y",side:"right",gridcolor:"transparent",tickfont:{size:8}}}} height={185}/>
-          <PChart traces={[{x:qFF.map(s=>s.label),y:qFF.map(s=>s.pM),type:"bar",name:"Mid",marker:{color:"#8B5CF6"}}]} layout={{title:{text:`${cfg.pair} ${cfg.kind==="NDF"?"3M Fwd-Fwd":"Fwd-Fwd"} Rolls`,font:{size:10}}}} height={185}/>
-        </div>
-        {cfg.kind==="NDF"&&<SprTbl spreads={anchors} title={`${cfg.pair} INTERBANK ANCHOR SPREADS`} color="#10B981" mx={mSC} onDbl={dblR} pdp={pdp}/>}
-        {cfg.kind==="NDF"&&<SprTbl spreads={qFF} title={`${cfg.pair} 3M FORWARD-FORWARD GAPS`} color="#A78BFA" mx={mSC} onDbl={dblR} pdp={pdp}/>}
-        <SprTbl spreads={spSpr} title={`${cfg.pair} SPOT-START SPREADS`} color="#60A5FA" mx={mSC} onDbl={dblR} pdp={pdp}/>
-        {cfg.kind==="DELIVERABLE"&&<SprTbl spreads={qFF} title={`${cfg.pair} FWD-FWD SPREADS`} color="#A78BFA" mx={mSC} onDbl={dblR} pdp={pdp}/>}
-        <SprTbl spreads={immSpr} title={`${cfg.pair} IMM ROLL SPREADS`} color="#F59E0B" mx={mSC} onDbl={dblR} pdp={pdp}/>
+        {cfg.kind==="DELIVERABLE"&&pkFunding.length>0&&(<>
+          <SprChart rows={pkFunding} title={`${cfg.pair} Funding (ONxTN / TNxSP / SPxSN)`} color="#FB923C"/>
+          <SprTbl spreads={pkFunding} title={`${cfg.pair} FUNDING`} color="#FB923C" mx={mSC} onDbl={dblR} pdp={pdp}/>
+        </>)}
+        {pkAnchors.length>0&&(<>
+          <SprChart rows={pkAnchors} title={`${cfg.pair} ${cfg.kind==="NDF"?"Interbank Anchors":"Spot-Start Spreads"}`} color="#10B981"/>
+          <SprTbl spreads={pkAnchors} title={`${cfg.pair} ${cfg.kind==="NDF"?"INTERBANK ANCHOR SPREADS":"SPOT-START SPREADS"}`} color="#10B981" mx={mSC} onDbl={dblR} pdp={pdp}/>
+        </>)}
+        {pkM1.length>0&&(<>
+          <SprChart rows={pkM1} title={`${cfg.pair} 1M Forward-Forward chain`} color="#22D3EE"/>
+          <SprTbl spreads={pkM1} title={`${cfg.pair} 1M FWD-FWD CHAIN`} color="#22D3EE" mx={mSC} onDbl={dblR} pdp={pdp}/>
+        </>)}
+        {pkM3.length>0&&(<>
+          <SprChart rows={pkM3} title={`${cfg.pair} 3M Forward-Forward chain`} color="#8B5CF6"/>
+          <SprTbl spreads={pkM3} title={`${cfg.pair} 3M FWD-FWD CHAIN`} color="#8B5CF6" mx={mSC} onDbl={dblR} pdp={pdp}/>
+        </>)}
       </div>)}
 
       {/* IMM TAB */}

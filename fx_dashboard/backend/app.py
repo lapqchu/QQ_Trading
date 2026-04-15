@@ -32,7 +32,7 @@ from dotenv import load_dotenv
 
 from lseg_client import LsegClient
 from market_service import MarketService
-from ric_config import CURRENCIES, NDF_CURRENCIES, DELIVERABLE_CURRENCIES, get_spread_pack, FUNDING_TENORS
+from ric_config import CURRENCIES, NDF_CURRENCIES, DELIVERABLE_CURRENCIES, get_spread_pack, get_spread_packs, FUNDING_TENORS
 
 load_dotenv()
 logging.basicConfig(
@@ -102,6 +102,7 @@ def get_snapshot(ccy: str) -> Dict[str, Any]:
     try:
         snap = market.build_snapshot(ccy)
         snap["spreadDefs"] = _spread_defs_for(ccy)
+        snap["spreadPacks"] = _spread_packs_for(ccy)
         snap["lastReloadTs"] = time.time()
         return snap
     except Exception as e:
@@ -272,13 +273,24 @@ async def ws_brokers(ws: WebSocket):
 
 
 # ─────────────────────────── helpers ───────────────────────────
+def _row_to_dict(row):
+    label, near, far, nl, fl = row
+    return {"label": label, "near": near, "far": far, "nearLabel": nl, "farLabel": fl}
+
+
 def _spread_defs_for(ccy: str):
-    """Return JSON-friendly spread pack definitions."""
-    pack = get_spread_pack(ccy)
-    return [
-        {"label": label, "near": near, "far": far, "nearLabel": nl, "farLabel": fl}
-        for label, near, far, nl, fl in pack
-    ]
+    """Return JSON-friendly flat spread pack definitions (back-compat)."""
+    return [_row_to_dict(row) for row in get_spread_pack(ccy)]
+
+
+def _spread_packs_for(ccy: str):
+    """Return JSON-friendly named packs dict.
+
+    NDF:          {interbankAnchors, m1Chain, m3Chain}
+    DELIVERABLE:  {funding, spotStart, m1Chain, m3Chain}
+    """
+    packs = get_spread_packs(ccy)
+    return {k: [_row_to_dict(r) for r in v] for k, v in packs.items()}
 
 
 if __name__ == "__main__":
