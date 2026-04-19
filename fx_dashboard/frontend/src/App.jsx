@@ -2,9 +2,9 @@
 import React, { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import Plot from "react-plotly.js";
 import { getCurrencies, getHistory, getHistoryCustom, getSnapshot, liveStart, liveStop, openChannel, getIpaForward, t1Backfill } from "./api.js";
-import { buildAllData, calcCustom, valueModeForSource, mergeT1 } from "./dataTransform.js";
+import { buildAllData, calcCustom, valueModeForSource, mergeT1, sourceQuality } from "./dataTransform.js";
 import { F, FP, CC, HB, cS, tS, sS, mid, implYld, fwdFwdIy, mcI, calcSMA, calcEMA, calcRSI, calcBB, calcMACD, calcStats, calcZDev, backtest, STRAT_DESCS } from "./calc.js";
-import { fD, daysBtwn } from "./dates.js";
+import { fD, daysBtwn, buildIMMDates, computeSpotDate, addMon, bizBefore, dateFromSpot } from "./dates.js";
 
 // ── NDF / Deliverable spread templates ──
 const NDF_BROKER_TENORS = [
@@ -647,7 +647,12 @@ function ToolsPanel({ad,onDbl,ccy}){
 
   const custom=useMemo(()=>{
     if(mode==="date"&&nearDt&&farDt)return calcCustom(ad,0,0,new Date(nearDt),new Date(farDt),ipaCustom);
-    return calcCustom(ad,nearM,farM,null,null,null);
+    // Handle special near/far values: funding tenors (negative), weekly (fractional <1), IMM (fractional >1)
+    let effNear=nearM,effFar=farM;
+    // Funding tenors: map to approximate month values for calcCustom
+    if(nearM<0)effNear=0;  // ON/TN/SN ≈ near-spot
+    if(farM<0)effFar=0;
+    return calcCustom(ad,effNear,effFar,null,null,null);
   },[ad,mode,nearM,farM,nearDt,farDt,ipaCustom]);
   const[scMode,setScMode]=useState("pips");const[scIn,setScIn]=useState("");
   const[scTenorMode,setScTenorMode]=useState("month");
@@ -667,7 +672,35 @@ function ToolsPanel({ad,onDbl,ccy}){
         const r1=ad.rows.find(x=>x.month===Math.ceil(mApprox))||r0;const t=mApprox-i;
         return{dT:r0.dT+(r1.dT-r0.dT)*t,iyM:r0.iyM+(r1.iyM-r0.iyM)*t,spM:r0.spM+(r1.spM-r0.spM)*t,sofT:r0.sofT+(r1.sofT-r0.sofT)*t,_lbl:fD(dt)};
       }
-      const r=ad.rows.find(x=>x.month===mKey);if(!r)return null;return{...r,_lbl:mKey===0?"Spot":`${mKey}M`};
+      // Handle funding tenors (ON/TN/SN) with negative sentinel values
+      if(mKey<0){
+        const fundingKey=mKey===-0.03?"ON":mKey===-0.02?"TN":"SN";
+        const fd=ad.funding?.[fundingKey];
+        const days={ON:1,TN:2,SN:3}[fundingKey]||1;
+        const spM=fd?.T?.mid??0;
+        const iyM=fd?.T?.mid!=null?0:null;
+        const sofT=ad.rows.find(x=>x.month===1)?.sofT??null;
+        return{dT:days,iyM:iyM,spM:spM,sofT:sofT,_lbl:fundingKey};
+      }
+      // Handle fractional months (weekly 0.25/0.5/0.75 or IMM)
+      if(mKey>0&&mKey<1){
+        const r=ad.rows.find(x=>Math.abs(x.month-mKey)<0.01);
+        if(r)return{...r,_lbl:r.tenor||`${Math.round(mKey*4)}W`};
+      }
+      // IMM or non-integer months >1: find matching IMM row or interpolate
+      if(mKey>0&&!Number.isInteger(mKey)){
+        const opt=tenorOpts.find(o=>Math.abs(o.value-mKey)<0.001);
+        if(opt&&opt.kind==="imm"&&opt.immData){
+          const immRow=ad.immR?.find(r=>r.tenor===opt.label);
+          if(immRow)return{...immRow,_lbl:opt.label};
+        }
+        // Interpolate from nearest rows
+        const i=Math.floor(mKey);
+        const r0=ad.rows.find(x=>x.month===i);
+        const r1=ad.rows.find(x=>x.month===Math.ceil(mKey))||r0;
+        if(r0){const t=mKey-i;return{dT:r0.dT+(r1.dT-r0.dT)*t,iyM:r0.iyM!=null&&r1.iyM!=null?r0.iyM+(r1.iyM-r0.iyM)*t:null,spM:r0.spM!=null&&r1.spM!=null?r0.spM+(r1.spM-r0.spM)*t:null,sofT:r0.sofT!=null&&r1.sofT!=null?r0.sofT+(r1.sofT-r0.sofT)*t:null,_lbl:opt?.label||`${mKey.toFixed(1)}M`};}
+      }
+      const r=ad.rows.find(x=>x.month===mKey);if(!r)return null;return{...r,_lbl:mKey===0?"Spot":mKey<=12?`${mKey}M`:mKey===24?"2Y":`${mKey}M`};
     }
     const nr=resolveLeg(scN,scNDt),fr=resolveLeg(scF,scFDt);
     if(!nr||!fr)return null;const ds=fr.dT-nr.dT;if(ds<=0)return null;
@@ -675,7 +708,37 @@ function ToolsPanel({ad,onDbl,ccy}){
     else{const nearFac=1+(nr.iyM/100)*nr.dT/360;const farFac=nearFac*(1+(v/100)*ds/360);const farIy=(farFac-1)*360/fr.dT*100;const farNDF=ad.sMT*(farIy/100*fr.dT/360+1)/(1+fr.sofT/100*fr.dT/360);const sprPips=(farNDF-ad.sMT)*PF-nr.spM;return{label:`${nr._lbl}×${fr._lbl} @ ${v}% impl`,impl:v,pips:sprPips,days:ds};}
   },[scIn,scMode,scN,scF,scNDt,scFDt,scTenorMode,ad,PF]);
   const maxT=ad.maxT||24;
-  const sel=(v,set)=><select value={Math.min(v,maxT)} onChange={e=>set(+e.target.value)} style={{background:"#1E293B",border:"1px solid #334155",color:"#E2E8F0",borderRadius:3,padding:"2px 4px",fontSize:9}}>{Array.from({length:maxT+1},(_,i)=>i).map(m=><option key={m} value={m}>{m===0?"Spot":m<=12?`${m}M`:m===24?"2Y":`${m}M`}</option>)}</select>;
+  // Build enhanced tenor options: Spot, ON/TN/SN, 1W/2W/3W, then monthly with interleaved IMM dates
+  const tenorOpts=useMemo(()=>{
+    const opts=[{value:0,label:"Spot",kind:"spot"}];
+    // Short tenors: ON=-0.03, TN=-0.02, SN=-0.01, 1W=0.25, 2W=0.5, 3W=0.75
+    // Use small negative values for funding tenors to distinguish from Spot (0)
+    opts.push({value:-0.03,label:"ON",kind:"funding",fundingKey:"ON"});
+    opts.push({value:-0.02,label:"TN",kind:"funding",fundingKey:"TN"});
+    opts.push({value:-0.01,label:"SN",kind:"funding",fundingKey:"SN"});
+    opts.push({value:0.25,label:"1W",kind:"weekly"});
+    opts.push({value:0.5,label:"2W",kind:"weekly"});
+    opts.push({value:0.75,label:"3W",kind:"weekly"});
+    // Monthly tenors interleaved with IMM dates
+    const spotDate=ad.SPOT_DATE||computeSpotDate();
+    const immDates=buildIMMDates(spotDate);
+    for(let m=1;m<=maxT;m++){
+      opts.push({value:m,label:m===12?"1Y":m===24?"2Y":`${m}M`,kind:"month"});
+      // Insert any IMM dates that fall between this month and the next
+      const mValDate=addMon(spotDate,m);
+      const nextValDate=m<maxT?addMon(spotDate,m+1):null;
+      if(nextValDate){
+        for(const imm of immDates){
+          if(imm.valDate>mValDate&&imm.valDate<=nextValDate){
+            // Use a fractional month value based on days
+            opts.push({value:imm.days/30.44,label:imm.label,kind:"imm",immData:imm});
+          }
+        }
+      }
+    }
+    return opts;
+  },[maxT,ad.SPOT_DATE]);
+  const sel=(v,set)=><select value={v} onChange={e=>{const val=parseFloat(e.target.value);set(val);}} style={{background:"#1E293B",border:"1px solid #334155",color:"#E2E8F0",borderRadius:3,padding:"2px 4px",fontSize:9}}>{tenorOpts.map((o,i)=><option key={`${o.value}-${i}`} value={o.value}>{o.label}</option>)}</select>;
   return(<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
     <div style={{background:"#131C2E",borderRadius:5,padding:8}}>
       <div style={{fontSize:9.5,fontWeight:800,color:"#60A5FA",marginBottom:4,letterSpacing:".05em"}}>USER-DEFINED TENOR</div>
@@ -973,9 +1036,11 @@ export default function Dashboard(){
   const pkM1=pkFull.m1Chain||[];
   const pkM3=pkFull.m3Chain||[];
   const pkInterbank=pkSR.interbankAnchors||[];
-  // Main anchor table: only Spot + anchorTenorsM rows (backbone curve).
+  // Main anchor table: Spot + anchorTenorsM rows (backbone curve).
+  // Issue 6: For deliverables, extend to include ALL extended months (4M, 5M, 7M, 8M, etc.)
   const anchorMs = new Set([0, ...(snap.anchorTenorsM || snap.tenorsM || [1,2,3,6,9,12,18,24])]);
-  const filt=(showI?rows:rows.filter(r=>!r.interp)).filter(r => anchorMs.has(r.month));
+  const extendedMs = cfg.kind==="DELIVERABLE" ? new Set([...anchorMs, ...(snap.extendedTenorsM || [])]) : anchorMs;
+  const filt=(showI?rows:rows.filter(r=>!r.interp||r.interpolated)).filter(r => extendedMs.has(r.month));
   const mr=rows.filter(r=>r.month>0);
   const mPC=Math.max(...mr.map(r=>Math.abs(r.pipChg||0)),1);
   const mIC=Math.max(...mr.map(r=>Math.abs(r.iyChg||0)),.01);
@@ -1060,7 +1125,7 @@ export default function Dashboard(){
                     }
                     if(rics.length)backfillT1(rics);
                   }
-                }} title={label} style={{fontSize:7,padding:"1px 4px",borderRadius:2,border:"none",cursor:"pointer",fontWeight:600,background:on?"#3B82F6":"#0F172A",color:on?"#FFF":"#64748B"}}>{label}</button>);});
+                }} title={label} style={{fontSize:7,padding:"1px 4px",borderRadius:2,border:(()=>{const q=sourceQuality(snap,code);return q==="good"?"2px solid #22C55E":q==="bad"?"2px solid #EF4444":"1px solid #334155";})(),cursor:"pointer",fontWeight:600,background:on?"#3B82F6":"#0F172A",color:on?"#FFF":"#64748B"}}>{label}</button>);});
               })()}
             </>)}
             {mode==="Auto"&&<span style={{fontSize:7,color:"#475569",fontStyle:"italic"}}>avg of all sources w/ data per tenor</span>}
@@ -1115,7 +1180,7 @@ export default function Dashboard(){
             </tr></thead>
             <tbody>{filt.map((r,i)=>{const sp=r.month===0,mj=[0,1,2,3,6,9,12,24].includes(r.month);const bg=sp?"#1a2744":(i%2===0?"#0F172A":"#111827");const tc=r.interp?"#475569":(mj?"#F8FAFC":"#94A3B8");
               return(<tr key={r.tenor} style={{background:bg,borderBottom:[3,6,9,12].includes(r.month)?"1px solid #334155":"none",cursor:"pointer"}} onDoubleClick={()=>dblR(r.tenor,r.spM,true,r.month)}>
-                <td style={{...cS(tc,mj),textAlign:"left",borderRight:"1px solid #1E293B",...stickyTd(bg)}}>{r.tenor}{r.interp?"*":""}</td>
+                <td style={{...cS(tc,mj),textAlign:"left",borderRight:"1px solid #1E293B",...stickyTd(bg)}}>{r.tenor}{r.interpolated?"\u2071":(r.interp?"*":"")}</td>
                 <td style={cS("#475569")}>{fD(r.valDate)}</td><td style={cS("#475569")}>{fD(r.fixDate)}</td><td style={{...cS("#475569"),borderRight:"1px solid #334155"}}>{r.dT||"—"}</td>
                 <td style={cS("#4ADE80")}>{F(r.bT,dp)}</td><td style={cS("#F87171")}>{F(r.aT,dp)}</td><td style={{...cS("#FBBF24",true),borderRight:"1px solid #334155"}}>{F(r.mT,dp)}</td>
                 <td style={cS("#4ADE80")}>{sp?"—":FP(r.spB,pdp)}</td><td style={cS("#FBBF24",true)}>{sp?"—":FP(r.spM,pdp)}</td><td style={cS("#F87171")}>{sp?"—":FP(r.spA,pdp)}</td>
@@ -1131,8 +1196,9 @@ export default function Dashboard(){
                 <td style={cS(r.rollY>=0?"#A78BFA":"#F472B6")}>{r.month<2?"—":FP(r.rollY,2)}</td>
               </tr>);})}</tbody></table></div>
 
-        {/* Full-curve ladders: spot-start, 1M chain, 3M chain */}
-        {pkSpotStart.length>0&&(<>
+        {/* Full-curve ladders: spot-start (NDF only), 1M chain, 3M chain */}
+        {/* Issue 6: Deliverables remove spot-start ladder; NDFs keep it */}
+        {cfg.kind==="NDF"&&pkSpotStart.length>0&&(<>
           <SprChart rows={pkSpotStart} title={`${cfg.pair} Spot-Start Ladder`} color="#10B981"/>
           <SprTbl spreads={pkSpotStart} title={`${cfg.pair} SPOT-START LADDER`} color="#10B981" mx={mSC} onDbl={dblR} pdp={pdp}/>
         </>)}

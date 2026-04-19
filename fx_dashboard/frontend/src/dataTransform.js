@@ -28,6 +28,35 @@ export function daysForCurve(snap, m) {
 // ── Source-level helpers (exported) ─────────────────────────────────────
 const FRESHNESS_RANK = { fresh: 0, stale: 1, very_stale: 2, unknown: 3 };
 
+// Issue 3: Compute per-source data quality for Manual mode button borders.
+// Returns "good" | "bad" | "partial".
+export function sourceQuality(snap, brokerCode) {
+  if (!snap || !snap.tenors) return "partial";
+  const anchorM = snap.anchorTenorsM || snap.tenorsM || [1, 2, 3, 6, 9, 12, 18, 24];
+  let hasDataCount = 0, freshCount = 0, veryStaleCount = 0, total = 0;
+  for (const m of anchorM) {
+    const t = snap.tenors[m] || snap.tenors[String(m)];
+    if (!t || !t.sources) continue;
+    total++;
+    const s = t.sources[brokerCode];
+    if (!s) continue;
+    if (s.hasData) {
+      hasDataCount++;
+      const fr = s.freshness || "unknown";
+      if (fr === "fresh" || fr === "stale") freshCount++;
+      if (fr === "very_stale") veryStaleCount++;
+    }
+  }
+  if (total === 0) return "partial";
+  const hasDataPct = hasDataCount / total;
+  const freshPct = freshCount / total;
+  // Good: >50% have data AND are fresh/stale
+  if (hasDataPct > 0.5 && freshPct > 0.5) return "good";
+  // Bad: majority missing OR all data is very_stale
+  if (hasDataPct <= 0.5 || (hasDataCount > 0 && veryStaleCount === hasDataCount)) return "bad";
+  return "partial";
+}
+
 export function pickSource(tenor, selection) {
   // Return first selected source (in selection order) that has data. No silent substitution.
   if (!tenor || !tenor.sources) return null;
@@ -541,6 +570,54 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
   }
   for (let m = 1; m <= maxT; m++) rows.push(getRow(m));
 
+  // Issue 5: Interpolate through broker gaps in Manual mode.
+  // When selected sources leave gaps (spM == null for non-zero months), fill from
+  // the selected sources' own sparse curve via monotone-cubic interpolation.
+  {
+    const sparseXs = [], sparseYsM = [], sparseYsB = [], sparseYsA = [];
+    for (const r of rows) {
+      if (r.month > 0 && r.spM != null && !r.isWeekly) {
+        const d = r.dT || r.month * 30;
+        sparseXs.push(d);
+        sparseYsM.push(r.spM);
+        sparseYsB.push(r.spB ?? r.spM);
+        sparseYsA.push(r.spA ?? r.spM);
+      }
+    }
+    if (sparseXs.length >= 2) {
+      const gapInterpM = mcI(sparseXs, sparseYsM);
+      const gapInterpB = mcI(sparseXs, sparseYsB);
+      const gapInterpA = mcI(sparseXs, sparseYsA);
+      for (const r of rows) {
+        if (r.month > 0 && r.spM == null && !r.isWeekly) {
+          const d = r.dT || r.month * 30;
+          // Only interpolate within the range of available data (no extrapolation)
+          if (d >= sparseXs[0] && d <= sparseXs[sparseXs.length - 1]) {
+            r.spM = gapInterpM(d);
+            r.spB = gapInterpB(d);
+            r.spA = gapInterpA(d);
+            r.interp = true;
+            r.interpolated = true;
+            r.dataSource = "broker_interp";
+            // Recompute outright from interpolated pts
+            if (spotT.m != null) {
+              r.bT = spotT.m + r.spB / PF;
+              r.aT = spotT.m + r.spA / PF;
+              r.mT = spotT.m + r.spM / PF;
+            }
+            // Recompute IY
+            const sofTR = sTa.mo.length > 0 ? iST(Math.min(r.month, 24)) : null;
+            if (r.dT > 0 && r.mT != null && sMT != null && sofTR != null) {
+              r.iyM = implYld(r.mT, sMT, sofTR, r.dT);
+              r.iyB = implYld(r.bT, sAT, sofTR, r.dT);
+              r.iyA = implYld(r.aT, sBT, sofTR, r.dT);
+            }
+          }
+        }
+      }
+    }
+  }
+
   const immR = IMM_DATES.filter(im => im.days <= maxT * 31)
     .map(im => getRow(im.days / 30.44, im.days, im.label, im.valDate));
 
@@ -1052,6 +1129,41 @@ export function calcCustom(ad, nearM, farM, nearDate, farDate, ipaCustom) {
   if (nearDate) { nM = daysBtwn(SPOT_DATE, nearDate) / 30.44; nVD = nearDate; }
   if (farDate) { fM = daysBtwn(SPOT_DATE, farDate) / 30.44; fVD = farDate; }
   if (fM <= nM) return null;
+
+  // Issue 2: Snap to anchor tenor when custom dates land within 1 calendar day
+  // of an existing anchor tenor's value date. This avoids discrepancies between
+  // the custom IPA/interp path and the live aggregated source.
+  function snapToAnchor(date, monthApprox) {
+    if (!date) return null;
+    for (const r of rows) {
+      if (r.month === 0) continue;
+      if (!r.valDate) continue;
+      const vd = r.valDate instanceof Date ? r.valDate : new Date(r.valDate);
+      if (Math.abs(daysBtwn(date, vd)) <= 1) return r;
+    }
+    return null;
+  }
+  if (nearDate && farDate) {
+    const snapNr = snapToAnchor(nearDate, nM);
+    const snapFr = snapToAnchor(farDate, fM);
+    if (snapNr && snapFr && snapNr !== snapFr) {
+      // Both legs match anchors — use live aggregated values directly
+      const pM = snapFr.spM != null && snapNr.spM != null ? snapFr.spM - snapNr.spM : null;
+      const pB = snapFr.spB != null && snapNr.spA != null ? snapFr.spB - snapNr.spA : null;
+      const pA = snapFr.spA != null && snapNr.spB != null ? snapFr.spA - snapNr.spB : null;
+      const ds = snapFr.dT - snapNr.dT;
+      const fIy = fwdFwdIy(snapNr.iyM, snapNr.dT, snapFr.iyM, snapFr.dT);
+      return {
+        label: `${fD(nearDate)} × ${fD(farDate)}`,
+        pB, pM, pA, days: ds, fIy,
+        nrVD: snapNr.valDate, frVD: snapFr.valDate,
+        nrFxD: snapNr.fixDate, frFxD: snapFr.fixDate,
+        nrDT: snapNr.dT, frDT: snapFr.dT,
+        source: "snapped",
+        ppd: ds > 0 && pM != null ? pM / ds : null,
+      };
+    }
+  }
 
   if (ipaCustom && ipaCustom.near && ipaCustom.far) {
     const ipaN = ipaCustom.near, ipaF = ipaCustom.far;

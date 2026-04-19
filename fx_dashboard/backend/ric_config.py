@@ -97,6 +97,7 @@ NDF_SPOT_START = [
 # 1M chain (NDF) — includes weekly leg rolls then every month 1-24.
 def _ndf_1m_chain():
     rows = [
+        ("SPx1W", 0,    0.25, "Spot", "1W"),
         ("1Wx2W", 0.25, 0.5,  "1W", "2W"),
         ("2Wx3W", 0.5,  0.75, "2W", "3W"),
         ("3Wx1M", 0.75, 1,    "3W", "1M"),
