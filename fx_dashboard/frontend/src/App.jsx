@@ -262,7 +262,11 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
   const[customNear,setCustomNear]=useState(nrDate||"");
   const[customFar,setCustomFar]=useState(frDate||"");
   const[customSeries,setCustomSeries]=useState(null);
-  const useBackendCustom=!!(nrDate&&frDate);
+  // Issue 4: if both legs are anchor tenors, use the standard getHistory path (direct RICs)
+  // instead of the interpolation path, even when IPA dates are available.
+  const anchorSet=new Set(snap?.anchorTenorsM||snap?.tenorsM||[1,2,3,6,9,12,18,24]);
+  const bothLegsAnchor=nrM!=null&&frM!=null&&(nrM===0||anchorSet.has(nrM))&&anchorSet.has(frM);
+  const useBackendCustom=!!(nrDate&&frDate)&&!bothLegsAnchor;
   // Pip-convention transform: raw history values → displayed (pip) values.
   const PF=snap?.pipFactor||1e3;
   const vm=valueModeForSource(snap,contributor);
@@ -1039,7 +1043,10 @@ export default function Dashboard(){
   // Main anchor table: Spot + anchorTenorsM rows (backbone curve).
   // Issue 6: For deliverables, extend to include ALL extended months (4M, 5M, 7M, 8M, etc.)
   const anchorMs = new Set([0, ...(snap.anchorTenorsM || snap.tenorsM || [1,2,3,6,9,12,18,24])]);
-  const extendedMs = cfg.kind==="DELIVERABLE" ? new Set([...anchorMs, ...(snap.extendedTenorsM || [])]) : anchorMs;
+  // Issue 5: extend outright curve to include ALL extended tenors (4M, 5M, 7M, etc.) for both NDFs and deliverables.
+  // Also include weekly tenors (0.25=1W, etc.) when they exist in the rows.
+  const extendedMs = new Set([...anchorMs, ...(snap.extendedTenorsM || [])]);
+  for (const wt of (snap.weeklyTenors || [])) extendedMs.add(wt);
   const filt=(showI?rows:rows.filter(r=>!r.interp||r.interpolated)).filter(r => extendedMs.has(r.month));
   const mr=rows.filter(r=>r.month>0);
   const mPC=Math.max(...mr.map(r=>Math.abs(r.pipChg||0)),1);
@@ -1141,6 +1148,7 @@ export default function Dashboard(){
               <span style={{color:"#F87171"}}>{F(rows.find(r=>r.month===1)?.aT,dp)}</span>
               <span style={{color:"#334155"}}> | </span>
               <span style={{color:"#FBBF24",fontWeight:700}}>{F(rows.find(r=>r.month===1)?.mT,dp)}</span>
+              {!snap.deriveFromOutrights&&snap.ndf1mOutright?.sourceLabel&&<span style={{color:"#475569",fontSize:7,marginLeft:3}}>({snap.ndf1mOutright.sourceLabel})</span>}
             </div>
           )}
         </div>
@@ -1178,9 +1186,9 @@ export default function Dashboard(){
               <th style={tS("#38BDF8")}>Pip</th><th style={{...tS("#38BDF8"),borderRight:"1px solid #334155"}}>IY</th>
               <th style={tS("#A78BFA")}>Pip</th><th style={tS("#A78BFA")}>IY</th>
             </tr></thead>
-            <tbody>{filt.map((r,i)=>{const sp=r.month===0,mj=[0,1,2,3,6,9,12,24].includes(r.month);const bg=sp?"#1a2744":(i%2===0?"#0F172A":"#111827");const tc=r.interp?"#475569":(mj?"#F8FAFC":"#94A3B8");
-              return(<tr key={r.tenor} style={{background:bg,borderBottom:[3,6,9,12].includes(r.month)?"1px solid #334155":"none",cursor:"pointer"}} onDoubleClick={()=>dblR(r.tenor,r.spM,true,r.month)}>
-                <td style={{...cS(tc,mj),textAlign:"left",borderRight:"1px solid #1E293B",...stickyTd(bg)}}>{r.tenor}{r.interpolated?"\u2071":(r.interp?"*":"")}</td>
+            <tbody>{filt.map((r,i)=>{const sp=r.month===0,mj=[0,1,2,3,6,9,12,24].includes(r.month);const bg=sp?"#1a2744":(i%2===0?"#0F172A":"#111827");const tc=r.suspect?"#78350F":(r.interp?"#475569":(mj?"#F8FAFC":"#94A3B8"));
+              return(<tr key={r.tenor} style={{background:bg,borderBottom:[3,6,9,12].includes(r.month)?"1px solid #334155":"none",cursor:"pointer",opacity:r.suspect?0.5:1}} onDoubleClick={()=>dblR(r.tenor,r.spM,true,r.month)} title={r.suspect?r.suspectReason:undefined}>
+                <td style={{...cS(tc,mj),textAlign:"left",borderRight:"1px solid #1E293B",...stickyTd(bg)}}>{r.suspect?"\u26A0 ":""}{r.tenor}{r.interpolated?"\u2071":(r.interp?"*":"")}</td>
                 <td style={cS("#475569")}>{fD(r.valDate)}</td><td style={cS("#475569")}>{fD(r.fixDate)}</td><td style={{...cS("#475569"),borderRight:"1px solid #334155"}}>{r.dT||"—"}</td>
                 <td style={cS("#4ADE80")}>{F(r.bT,dp)}</td><td style={cS("#F87171")}>{F(r.aT,dp)}</td><td style={{...cS("#FBBF24",true),borderRight:"1px solid #334155"}}>{F(r.mT,dp)}</td>
                 <td style={cS("#4ADE80")}>{sp?"—":FP(r.spB,pdp)}</td><td style={cS("#FBBF24",true)}>{sp?"—":FP(r.spM,pdp)}</td><td style={cS("#F87171")}>{sp?"—":FP(r.spA,pdp)}</td>
@@ -1196,12 +1204,7 @@ export default function Dashboard(){
                 <td style={cS(r.rollY>=0?"#A78BFA":"#F472B6")}>{r.month<2?"—":FP(r.rollY,2)}</td>
               </tr>);})}</tbody></table></div>
 
-        {/* Full-curve ladders: spot-start (NDF only), 1M chain, 3M chain */}
-        {/* Issue 6: Deliverables remove spot-start ladder; NDFs keep it */}
-        {cfg.kind==="NDF"&&pkSpotStart.length>0&&(<>
-          <SprChart rows={pkSpotStart} title={`${cfg.pair} Spot-Start Ladder`} color="#10B981"/>
-          <SprTbl spreads={pkSpotStart} title={`${cfg.pair} SPOT-START LADDER`} color="#10B981" mx={mSC} onDbl={dblR} pdp={pdp}/>
-        </>)}
+        {/* Full-curve ladders: 1M chain, 3M chain. Issue 5: spot-start ladder removed for NDFs (same as deliverables). */}
         {pkM1.length>0&&(<>
           <SprChart rows={pkM1} title={`${cfg.pair} 1M Forward-Forward chain`} color="#22D3EE" height={180}/>
           <SprTbl spreads={pkM1} title={`${cfg.pair} 1M FWD-FWD CHAIN`} color="#22D3EE" mx={mSC} onDbl={dblR} pdp={pdp}/>

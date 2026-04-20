@@ -161,9 +161,13 @@ class MarketService:
 
         # Also fetch 1M NDF outright for implied-spot derivation
         ndf_1m_out_ric = None
+        ndf_1m_out_broker_rics: List[str] = []  # Issue 2: BGCP+FMD avg
         if cfg.kind == "NDF" and not cfg.derive_from_outrights:
             ndf_1m_out_ric = f"{cfg.code}1MNDFOR="
-        extra = [ndf_1m_out_ric] if ndf_1m_out_ric else []
+            # Fetch per-broker 1M outright RICs for BGCP/FMD avg
+            for bk in ("BGCP", "FMD"):
+                ndf_1m_out_broker_rics.append(f"{cfg.code}1MNDFOR={bk}")
+        extra = ([ndf_1m_out_ric] if ndf_1m_out_ric else []) + ndf_1m_out_broker_rics
 
         all_rics = list({*composite_rics, *outright_rics, *broker_rics,
                          *sofr_rics, *funding_rics, *extended_rics,
@@ -247,7 +251,8 @@ class MarketService:
         log.info("Snapshot %s T1 history: %d RICs (cached=%d, fetched=%d)",
                  ccy, len(t1_rics), len(t1_rics) - len(uncached), len(uncached))
 
-        return self._serialize(cfg, t1, ipa_data, ndf_1m_out_ric, tomfix_pl)
+        return self._serialize(cfg, t1, ipa_data, ndf_1m_out_ric, tomfix_pl,
+                               ndf_1m_out_broker_rics=ndf_1m_out_broker_rics)
 
     def backfill_t1(self, rics: List[str]) -> Dict[str, Any]:
         """Lazy T-1 fetch for a specific set of RICs. Uses the per-(ric,date)
@@ -334,16 +339,53 @@ class MarketService:
     # ────────────────── serialise ──────────────────
     def _serialize(self, cfg: CurrencyConfig, t1: Dict[str, Quote],
                    ipa: Dict[str, Any], ndf_1m_out_ric: Optional[str],
-                   tomfix_pl: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                   tomfix_pl: Optional[Dict[str, Any]] = None,
+                   ndf_1m_out_broker_rics: Optional[List[str]] = None) -> Dict[str, Any]:
         spot_t = self._ser_ric(cfg.spot_ric, "T")
         spot_t1 = self._ser_ric(cfg.spot_ric, "T", t1=t1)
 
         ndf_1m_out = None
         if ndf_1m_out_ric:
+            comp_t = self._ser_ric(ndf_1m_out_ric, "T")
+            comp_t1 = self._ser_ric(ndf_1m_out_ric, "T", t1=t1)
+            # Issue 2: compute avg of BGCP + FMD outright RICs
+            broker_sources = {}
+            avg_bids, avg_asks, avg_mids = [], [], []
+            avg_bids_t1, avg_asks_t1, avg_mids_t1 = [], [], []
+            for bric in (ndf_1m_out_broker_rics or []):
+                bk_suffix = bric.rsplit("=", 1)[-1] if "=" in bric else "composite"
+                bt = self._ser_ric(bric, "T")
+                bt1 = self._ser_ric(bric, "T", t1=t1)
+                has_data = bt.get("bid") is not None or bt.get("ask") is not None or bt.get("mid") is not None
+                broker_sources[bk_suffix] = {"ric": bric, "T": bt, "T1": bt1, "hasData": has_data}
+                if has_data:
+                    if bt.get("bid") is not None: avg_bids.append(bt["bid"])
+                    if bt.get("ask") is not None: avg_asks.append(bt["ask"])
+                    m = bt.get("mid")
+                    if m is None and bt.get("bid") is not None and bt.get("ask") is not None:
+                        m = (bt["bid"] + bt["ask"]) / 2
+                    if m is not None: avg_mids.append(m)
+                    # T1
+                    if bt1.get("bid") is not None: avg_bids_t1.append(bt1["bid"])
+                    if bt1.get("ask") is not None: avg_asks_t1.append(bt1["ask"])
+                    m1 = bt1.get("mid")
+                    if m1 is None and bt1.get("bid") is not None and bt1.get("ask") is not None:
+                        m1 = (bt1["bid"] + bt1["ask"]) / 2
+                    if m1 is not None: avg_mids_t1.append(m1)
+            def _avg(lst): return sum(lst) / len(lst) if lst else None
+            # Use broker avg if available, else fall back to composite
+            avg_t = {
+                "bid": _avg(avg_bids), "ask": _avg(avg_asks), "mid": _avg(avg_mids),
+            } if avg_mids else comp_t
+            avg_t1 = {
+                "bid": _avg(avg_bids_t1), "ask": _avg(avg_asks_t1), "mid": _avg(avg_mids_t1),
+            } if avg_mids_t1 else comp_t1
             ndf_1m_out = {
                 "ric": ndf_1m_out_ric,
-                "T":  self._ser_ric(ndf_1m_out_ric, "T"),
-                "T1": self._ser_ric(ndf_1m_out_ric, "T", t1=t1),
+                "T":  avg_t,
+                "T1": avg_t1,
+                "sources": {"composite": {"T": comp_t, "T1": comp_t1}, **broker_sources},
+                "sourceLabel": "BGCP/FMD avg" if avg_mids else "composite",
             }
 
         # Per-tenor per-source bundle (pass IPA data so days reflect real calendar).

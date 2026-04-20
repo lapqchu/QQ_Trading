@@ -356,11 +356,23 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
       if (agg.n === 0) return { b: null, m: null, a: null, n: 0, total: agg.total, picked: null };
       return { b: agg.b, m: agg.m, a: agg.a, n: agg.n, total: agg.total, picked: agg.includedSources[0] };
     }
-    // T1: pick first selected with T1 (prev-day — no live override needed)
+    // T1: pick first selected with T1 that has actual data (prev-day — no live override needed).
+    // Issue 3 fix: T1 is always an object — check that it contains non-null values before accepting.
     for (const name of selection) {
       const s = rawTenor.sources[name];
       if (!s || !s.hasData || !s.T1) continue;
-      return { ...displayPtsFromSourceT1(s, PF), n: 1, total: 1, picked: name };
+      const dp = displayPtsFromSourceT1(s, PF);
+      if (dp.m != null || dp.b != null || dp.a != null) {
+        return { ...dp, n: 1, total: 1, picked: name };
+      }
+    }
+    // Fallback: try ALL sources (not just selected) for T1 data
+    for (const [name, s] of Object.entries(rawTenor.sources || {})) {
+      if (!s || !s.T1) continue;
+      const dp = displayPtsFromSourceT1(s, PF);
+      if (dp.m != null || dp.b != null || dp.a != null) {
+        return { ...dp, n: 1, total: 1, picked: name };
+      }
     }
     return { b: null, m: null, a: null, n: 0, total: 0, picked: null };
   }
@@ -554,12 +566,24 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
       const spA = raw_a != null ? raw_a * mul : null;
       const spM = raw_m != null ? raw_m * mul : null;
       if (spM != null) {
-        wr.spB = spB; wr.spM = spM; wr.spA = spA;
-        wr.bT = spotT.m != null && spB != null ? spotT.m + spB / PF : wr.bT;
-        wr.aT = spotT.m != null && spA != null ? spotT.m + spA / PF : wr.aT;
-        wr.mT = spotT.m != null && spM != null ? spotT.m + spM / PF : wr.mT;
-        wr.interp = false;
-        wr.dataSource = "weeklyRIC";
+        // Issue 6: sanity check — if weekly magnitude > 5x the 1M anchor, flag as suspect
+        const anchor1M = getPts(1, "T");
+        const anchor1MMag = anchor1M.m != null ? Math.abs(anchor1M.m) : null;
+        const weeklyMag = Math.abs(spM);
+        const isSuspect = anchor1MMag != null && anchor1MMag > 0 && weeklyMag > 5 * anchor1MMag;
+        if (isSuspect) {
+          wr.suspect = true;
+          wr.suspectReason = "weekly value inconsistent with 1M";
+          wr.interp = true; // fall back to interpolation
+          wr.dataSource = "weeklyRIC_suspect";
+        } else {
+          wr.spB = spB; wr.spM = spM; wr.spA = spA;
+          wr.bT = spotT.m != null && spB != null ? spotT.m + spB / PF : wr.bT;
+          wr.aT = spotT.m != null && spA != null ? spotT.m + spA / PF : wr.aT;
+          wr.mT = spotT.m != null && spM != null ? spotT.m + spM / PF : wr.mT;
+          wr.interp = false;
+          wr.dataSource = "weeklyRIC";
+        }
       } else {
         wr.interp = true;
       }
@@ -740,14 +764,17 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
       const sof1 = sT1a.mo.length ? iST1(Math.min(Math.max(d / 30, 1), 24)) : null;
       const mT = sMT != null && spM != null ? sMT + spM / PF : null;
       const iyM = implYld(mT, sMT, sof, d);
+      // Issue 7: wire fixing dates from backend tomfixPlus1bd
+      const fixDateStr = key === "TOMFIX" ? tp?.nearFixDate : tp?.farFixDate;
+      const valDateStr = key === "TOMFIX" ? tp?.nearValueDate : tp?.farValueDate;
       return {
         month: d / 30, dT: d, dT1: d,
         spM: spM ?? 0, spB: spB ?? spM ?? 0, spA: spA ?? spM ?? 0,
         spM1: spM1 ?? 0, spB1: spB1 ?? spM1 ?? 0, spA1: spA1 ?? spM1 ?? 0,
         iyM, iyB: iyM, iyA: iyM, iyM1: null,
         sofT: sof, sofT1: sof1,
-        valDate: dateFromSpot(SPOT_DATE, d),
-        fixDate: null,
+        valDate: valDateStr ? new Date(valDateStr) : dateFromSpot(SPOT_DATE, d),
+        fixDate: fixDateStr ? new Date(fixDateStr) : null,
       };
     }
     return null;

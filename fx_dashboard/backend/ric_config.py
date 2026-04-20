@@ -438,8 +438,8 @@ CURRENCIES: Dict[str, CurrencyConfig] = {
         [1,3,6,9,12,18,24], 24, "EGP=", "NDF",
         value_mode="pips",
         brokers=["FMD","TDS","TRDS","TRDL","GMGM"],
-        # EGP composite all-null → use broker feeds directly; no single fallback
-        composite_18m_fallback_brokers=["FMD","TDS"]),
+        derive_from_outrights=True,
+        outright_source_brokers=["FMD","TDS"]),
 
     "CLP": CurrencyConfig("CLP","USDCLP","NDF", 1e0, 2, 2,
         [1,3,6,9,12,18,24], 24, "CLP=", "NDF",
