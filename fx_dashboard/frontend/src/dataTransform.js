@@ -406,6 +406,33 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
   const iDT = mcI(ptT.mo, ptT.days), iDT1 = mcI(ptT1.mo, ptT1.days);
   const iST = mcI(sTa.mo, sTa.va), iST1 = mcI(sT1a.mo, sT1a.va);
 
+  // Issue 3: For deriveFromOutrights ccys, build outright interpolation curves.
+  // Interpolate outrights directly (smoother for EGP/NGN), then derive swap points.
+  let iOutMT = null, iOutBT = null, iOutAT = null;
+  if (deriveFromOutrights && sMT != null) {
+    const outDays = [0], outM = [sMT], outB = [sMT], outA = [sMT];
+    knownM.forEach(m => {
+      const rawT = snap.tenors?.[m] || snap.tenors?.[String(m)];
+      if (!rawT) return;
+      const picked = pickSource(applyLiveToTenor(rawT), selection);
+      if (picked && picked.source.outright) {
+        const o = picked.source.outright;
+        const d = daysForCurve(snap, m);
+        if (d != null && o.mid != null) {
+          outDays.push(d);
+          outM.push(o.mid);
+          outB.push(o.bid ?? o.mid);
+          outA.push(o.ask ?? o.mid);
+        }
+      }
+    });
+    if (outDays.length >= 2) {
+      iOutMT = mcI(outDays, outM);
+      iOutBT = mcI(outDays, outB);
+      iOutAT = mcI(outDays, outA);
+    }
+  }
+
   function getRow(month, daysOvr, label, immVD) {
     const isK = (month === 0 || knownM.includes(month)) && !daysOvr;
     const ipaD = IPA[month];
@@ -424,6 +451,20 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
       const p = getPts(month, "T"), p1 = getPts(month, "T1");
       spB = p.b; spM = p.m; spA = p.a;
       spB1 = p1.b; spM1 = p1.m; spA1 = p1.a;
+    } else if (deriveFromOutrights && !isK && month > 0) {
+      // Issue 3: For outright-derived ccys (EGP, NGN), interpolate the OUTRIGHT curve
+      // first, then derive swap points = (outright - spot) * pipFactor.
+      const interpOutM = iOutMT ? iOutMT(dT) : null;
+      const interpOutB = iOutBT ? iOutBT(dT) : null;
+      const interpOutA = iOutAT ? iOutAT(dT) : null;
+      if (interpOutM != null && sMT != null) {
+        spM = (interpOutM - sMT) * PF;
+        spB = interpOutB != null ? (interpOutB - sMT) * PF : spM;
+        spA = interpOutA != null ? (interpOutA - sMT) * PF : spM;
+      } else {
+        spM = iPtMT(dT); spB = iPtBT(dT); spA = iPtAT(dT);
+      }
+      spM1 = iPtMT1(dT1); spB1 = iPtBT1(dT1); spA1 = iPtAT1(dT1);
     } else if (ipaD && ipaD.fwdPoints != null) {
       const ipaM = ipaD.fwdPoints;
       const interpM = iPtMT(dT), interpB = iPtBT(dT), interpA = iPtAT(dT);
@@ -679,8 +720,34 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
       r.carryP = (ptsShift != null && ptsF != null) ? (ptsShift - ptsF) : null;
     }
     r.carryY = r.ffIyM;
-    r.rollP = i >= 2 && r.ffM != null && p?.ffM != null ? r.ffM - p.ffM : (i === 1 ? r.ffM : null);
-    r.rollY = i >= 2 && r.ffIyM != null && p?.ffIyM != null ? r.ffIyM - p.ffIyM : (i === 1 ? r.ffIyM : null);
+    // Roll-down: for sub-1M tenors, use 1-day roll from the days-indexed curve
+    // instead of fwd-fwd chain (which may not have a prior row).
+    if (r.month === 0) { r.rollP = null; r.rollY = null; }
+    else if (r.month < 1) {
+      // Sub-1M: 1-day roll-down = pts(days) - pts(days-1)
+      const td = r.dT || 0;
+      if (td >= 1) {
+        const ptsCur = r.spM != null ? r.spM : iPtMT(td);
+        const ptsPrev = iPtMT(td - 1);
+        r.rollP = (ptsCur != null && ptsPrev != null) ? ptsCur - ptsPrev : null;
+      } else { r.rollP = null; }
+      // Roll-down IY for sub-1M: compute IY at (days) and IY at (days-1)
+      if (td >= 1 && sMT != null) {
+        const sof = sTa.mo.length > 0 ? iST(Math.min(Math.max(r.month, 0.01), 24)) : null;
+        const ptsCur = r.spM != null ? r.spM : iPtMT(td);
+        const ptsPrev = iPtMT(td - 1);
+        if (ptsCur != null && ptsPrev != null && sof != null) {
+          const outCur = sMT + ptsCur / PF;
+          const outPrev = sMT + ptsPrev / PF;
+          const iyCur = implYld(outCur, sMT, sof, td);
+          const iyPrev = td > 1 ? implYld(outPrev, sMT, sof, td - 1) : null;
+          r.rollY = (iyCur != null && iyPrev != null) ? iyCur - iyPrev : (iyCur != null ? iyCur : null);
+        } else { r.rollY = null; }
+      } else { r.rollY = null; }
+    } else {
+      r.rollP = i >= 2 && r.ffM != null && p?.ffM != null ? r.ffM - p.ffM : (i === 1 ? r.ffM : null);
+      r.rollY = i >= 2 && r.ffIyM != null && p?.ffIyM != null ? r.ffIyM - p.ffIyM : (i === 1 ? r.ffIyM : null);
+    }
   }
 
   for (let i = 0; i < immR.length; i++) {

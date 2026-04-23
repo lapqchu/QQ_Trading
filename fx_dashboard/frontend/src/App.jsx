@@ -31,21 +31,29 @@ const PLOT_CFG={responsive:true,displayModeBar:true,modeBarButtonsToRemove:["las
 const STICKY_TH = { position: "sticky", left: 0, zIndex: 4, background: "#0F172A" };
 const stickyTd = (rowBg) => ({ position: "sticky", left: 0, zIndex: 1, background: rowBg });
 
-function PChart({traces,layout,height=190}){
+function PChart({traces,layout,height=190,revisionKey}){
   const mergedX={...PLOT_LAYOUT.xaxis,...(layout?.xaxis||{})};
   const mergedY={...PLOT_LAYOUT.yaxis,...(layout?.yaxis||{})};
   const mergedY2=layout?.yaxis2?{...PLOT_LAYOUT.yaxis,overlaying:"y",side:"right",gridcolor:"transparent",...layout.yaxis2}:undefined;
-  const l={...PLOT_LAYOUT,...layout,height,xaxis:mergedX,yaxis:mergedY,uirevision:"preserve"};
+  const uirev=revisionKey||layout?.uirevision||"preserve";
+  const l={...PLOT_LAYOUT,...layout,height,xaxis:mergedX,yaxis:mergedY,uirevision:uirev};
   if(mergedY2)l.yaxis2=mergedY2;
   return <Plot data={traces} layout={l} config={PLOT_CFG} style={{width:"100%"}} useResizeHandler/>;
 }
 
 // ── Helper: extract mid value from a history bar (no fabrication) ──
+// Issue 4: filter bars where all price fields are null/0 — don't return 0 as valid data.
 function barMid(bar){
-  if(bar.TRDPRC_1!=null&&isFinite(bar.TRDPRC_1))return bar.TRDPRC_1;
-  if(bar.BID!=null&&bar.ASK!=null)return(bar.BID+bar.ASK)/2;
-  if(bar.BID!=null)return bar.BID;
-  if(bar.ASK!=null)return bar.ASK;
+  const t=bar.TRDPRC_1, b=bar.BID, a=bar.ASK;
+  // If ALL fields are null or 0, treat as no data
+  const tValid=t!=null&&isFinite(t)&&t!==0;
+  const bValid=b!=null&&isFinite(b)&&b!==0;
+  const aValid=a!=null&&isFinite(a)&&a!==0;
+  if(!tValid&&!bValid&&!aValid)return null;
+  if(tValid)return t;
+  if(bValid&&aValid)return(b+a)/2;
+  if(bValid)return b;
+  if(aValid)return a;
   return null;
 }
 
@@ -255,10 +263,11 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
     return selection.find(s=>s!=="composite")||null;
   })();
   const[contributor,setContributor]=useState(defaultContributor);
-  const[viewMode,setViewMode]=useState("swap"); // swap|iy|ppd
+  const[viewMode,setViewMode]=useState("swap"); // swap|iy|ppd|carryDecomp
   const[spotHist,setSpotHist]=useState(null); // map: Date(yyyy-mm-dd) → spot mid (for IY calc)
   const[sofrHist,setSofrHist]=useState(null); // map: yyyy-mm-dd → nearest-tenor SOFR% (for IY calc)
   const[rawHist,setRawHist]=useState(null); // pre-transform raw points for IY recalc
+  const[rawHistData,setRawHistData]=useState(null); // full history response for carry decomp
   const[customNear,setCustomNear]=useState(nrDate||"");
   const[customFar,setCustomFar]=useState(frDate||"");
   const[customSeries,setCustomSeries]=useState(null);
@@ -328,6 +337,7 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
     }
     getHistory(ccy,{period,contributor}).then(data=>{
       if(cancelled)return;
+      setRawHistData(data); // store full response for carry decomp
       // If nrM/frM provided, this is a spread — compute from individual tenor legs
       const isSpread=nrM!=null&&frM!=null;
       const{pts,source}=isSpread
@@ -376,11 +386,23 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
       .catch(()=>{if(!cancelled)setCustomSeries(null);});
     return()=>{cancelled=true;};
   },[ccy,customNear,customFar,period,contributor]);
-  // Tenor days heuristic for IY/PPD
+  // Tenor days — use IPA-derived days from the snapshot (same as live display),
+  // NOT a per-bar changing value. This keeps PPD consistent with the live table.
   const tenorDays=(()=>{
     if(fundingTenor==="ON")return 1; if(fundingTenor==="TN")return 1; if(fundingTenor==="SN")return 1;
-    if(nrM!=null&&frM!=null)return Math.max(1,(frM-nrM)*30);
-    if(monthHint)return Math.max(1,Math.round(monthHint*30));
+    if(nrM!=null&&frM!=null){
+      // Try to get exact days from snapshot rows
+      const nrRow=ad?.rows?.find(x=>x.month===nrM);
+      const frRow=ad?.rows?.find(x=>x.month===frM);
+      if(nrRow&&frRow&&frRow.dT!=null&&nrRow.dT!=null)return Math.max(1,frRow.dT-nrRow.dT);
+      return Math.max(1,(frM-nrM)*30);
+    }
+    if(monthHint!=null){
+      // Try to get exact days from snapshot row
+      const row=ad?.rows?.find(x=>x.month===monthHint);
+      if(row&&row.dT!=null)return Math.max(1,row.dT);
+      return Math.max(1,Math.round(monthHint*30));
+    }
     return 30;
   })();
   // Current SOFR for this tenor from live snapshot (approximation — SOFR history not fetched).
@@ -421,7 +443,7 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
   // View-aware history (swap/iy/ppd) for stats+indicators. Declared AFTER vals to avoid TDZ.
   const vHist=useMemo(()=>{
     if(!hist)return null;
-    if(viewMode==="swap")return hist;
+    if(viewMode==="swap"||viewMode==="carryDecomp")return hist;
     const out=[];
     for(let i=0;i<hist.length;i++){const v=(typeof vals[i]==="number"&&isFinite(vals[i]))?vals[i]:null;if(v!=null)out.push({date:hist[i].date,value:v});}
     return out.length>5?out:null;
@@ -437,9 +459,125 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
   const[btPeriod,setBtPeriod]=useState(252);
   const btRes=useMemo(()=>vHist?backtest(vHist,btPeriod):[],[vHist,btPeriod]);
   const[selSt,setSelSt]=useState(null);const[hovSt,setHovSt]=useState(null);
+
+  // ── Issue 6: Carry Decomposition ──
+  // For each historical date, decompose total P&L into carry (curve roll-down) + market move.
+  const carryDecomp=useMemo(()=>{
+    if(!rawHistData?.history||!isSwapPts)return null;
+    // Determine near/far dates. For spot-start, nearDate=spot, farDate=tenor VD.
+    // For fwd-fwd, both come from the spread row.
+    const spotDate=ad?.SPOT_DATE||computeSpotDate();
+    let nearDate=null,farDate=null;
+    if(nrM!=null&&frM!=null){
+      // Fwd-fwd spread: use value dates from rows
+      const nrRow=ad?.rows?.find(x=>x.month===nrM);
+      const frRow=ad?.rows?.find(x=>x.month===frM);
+      nearDate=nrRow?.valDate??(nrM===0?spotDate:null);
+      farDate=frRow?.valDate??null;
+    }else{
+      // Spot-start tenor
+      nearDate=spotDate;
+      const mh=monthHint||1;
+      const row=ad?.rows?.find(x=>x.month===mh);
+      farDate=row?.valDate??null;
+    }
+    if(!nearDate||!farDate)return null;
+    nearDate=nearDate instanceof Date?nearDate:new Date(nearDate);
+    farDate=farDate instanceof Date?farDate:new Date(farDate);
+
+    // Build per-date curves from anchor tenor history bars
+    const rics=Object.keys(rawHistData.history);
+    const anchorData=[];
+    for(const ric of rics){
+      const m=ricToMonth(ric);
+      if(m<0)continue;
+      const bars=rawHistData.history[ric];
+      if(!bars||!bars.length)continue;
+      anchorData.push({month:m,bars});
+    }
+    if(anchorData.length<2)return null;
+
+    // Build date-indexed map: date -> {month: value, ...}
+    const dateMap=new Map();
+    for(const{month,bars}of anchorData){
+      for(const bar of bars){
+        const d=bar.Date?.slice(0,10);
+        if(!d)continue;
+        const v=barMid(bar);
+        if(v==null)continue;
+        if(!dateMap.has(d))dateMap.set(d,{});
+        dateMap.get(d)[month]=v;
+      }
+    }
+    // Add spot=0 for swap points interpolation
+    for(const d of dateMap.keys())dateMap.get(d)[0]=0;
+
+    const months=[0,...anchorData.map(a=>a.month)].sort((a,b)=>a-b);
+    const sortedDates=[...dateMap.keys()].sort();
+    if(sortedDates.length<3)return null;
+
+    // For each date, build interpolation function and evaluate at target day-counts
+    function buildCurveForDate(d){
+      const vals=dateMap.get(d);
+      if(!vals)return null;
+      const xs=[],ys=[];
+      for(const m of months){if(vals[m]!=null){xs.push(m*30);ys.push(vals[m]*pipMul);}}
+      if(xs.length<2)return null;
+      return mcI(xs,ys);
+    }
+
+    // Compute the spread for a given curve at given near/far day-counts
+    function spreadOnCurve(curve,dNear,dFar){
+      if(!curve)return null;
+      const ptsNear=dNear<=0?0:curve(dNear);
+      const ptsFar=dFar<=0?0:curve(dFar);
+      if(ptsNear==null||ptsFar==null)return null;
+      return ptsFar-ptsNear;
+    }
+
+    const results=[];
+    let cumTotal=0;
+    for(let i=1;i<sortedDates.length;i++){
+      const dToday=sortedDates[i];
+      const dYest=sortedDates[i-1];
+      const curveToday=buildCurveForDate(dToday);
+      const curveYest=buildCurveForDate(dYest);
+      if(!curveToday||!curveYest)continue;
+
+      const today=new Date(dToday);
+      // Days from today's date to fixed near/far dates
+      const daysToNear=Math.round((nearDate-today)/864e5);
+      const daysToFar=Math.round((farDate-today)/864e5);
+      // Past maturity check
+      if(daysToNear<-5)continue; // well past near date
+      if(daysToFar<0)continue;
+
+      const daysToNearYest=daysToNear+1; // yesterday had 1 more day
+      const daysToFarYest=daysToFar+1;
+
+      // Carry = roll-down from 1 day passing on YESTERDAY's curve
+      const spreadYestAtYestDays=spreadOnCurve(curveYest,Math.max(daysToNearYest,0),Math.max(daysToFarYest,0));
+      const spreadYestAtTodayDays=spreadOnCurve(curveYest,Math.max(daysToNear,0),Math.max(daysToFar,0));
+      // Market move = curve shift (today's curve vs yesterday's, both at today's day-counts)
+      const spreadTodayAtTodayDays=spreadOnCurve(curveToday,Math.max(daysToNear,0),Math.max(daysToFar,0));
+
+      if(spreadYestAtYestDays==null||spreadYestAtTodayDays==null||spreadTodayAtTodayDays==null)continue;
+
+      // For spot-start (near=0 days), carry = roll of the far leg only
+      const carry=spreadYestAtTodayDays-spreadYestAtYestDays;
+      const move=spreadTodayAtTodayDays-spreadYestAtTodayDays;
+      const total=carry+move;
+      cumTotal+=total;
+      results.push({date:today,carry,move,total,cumTotal});
+    }
+    return results.length>5?results:null;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[rawHistData,nrM,frM,monthHint,ad?.SPOT_DATE,isSwapPts,pipMul]);
+
   const dates=hist?hist.map(h=>h.date):[];
   const yLabel=viewMode==="swap"?(isSwapPts?"Swap Points (pips)":"Level")
-    :viewMode==="iy"?"Implied Yield (%)":"PPD";
+    :viewMode==="iy"?"Implied Yield (%)"
+    :viewMode==="ppd"?"PPD":"Carry Decomp (pips)";
   // Consistency indicator: last bar vs. live mid (swap-pts view only).
   const lastBar=(vals&&vals.length)?vals[vals.length-1]:null;
   const liveVsLast=(()=>{
@@ -494,7 +632,7 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
           <h2 style={{fontSize:13,fontWeight:800,color:"#F8FAFC",margin:0}}>{tenor} — Historical {isSwapPts?"(Swap Points)":""}{histSource==='interpolated'&&<span style={{color:"#60A5FA",fontWeight:400,fontSize:9,marginLeft:8}}>Interpolated from anchor data</span>}{liveVsLast&&<span style={{marginLeft:8,fontSize:9,fontWeight:600,padding:"1px 6px",borderRadius:3,background:liveVsLast.ok?"#14532D":"#78350F",color:liveVsLast.ok?"#4ADE80":"#FBBF24"}} title={`last bar=${liveVsLast.last.toFixed(2)} · live=${liveVsLast.live.toFixed(2)} · Δ=${liveVsLast.diff.toFixed(2)}`}>{liveVsLast.ok?`\u2713 live matches last bar`:`\u26A0 last: ${liveVsLast.last.toFixed(1)} · live: ${liveVsLast.live.toFixed(1)}`}</span>}</h2>
           <div style={{display:"flex",gap:4,alignItems:"center",flexWrap:"wrap"}}>
             <div style={{display:"flex",gap:2}}>{["1D","5D","1M","3M","6M","1Y","3Y","5Y","10Y","Max"].map(p=>(<button key={p} onClick={()=>setPeriod(p)} style={{fontSize:7.5,padding:"1px 5px",borderRadius:3,border:"none",cursor:"pointer",background:period===p?"#3B82F6":"#1E293B",color:period===p?"#FFF":"#94A3B8"}}>{p}</button>))}</div>
-            <div style={{display:"flex",gap:2,borderLeft:"1px solid #334155",paddingLeft:4}}>{[["swap","Swap Pts"],["iy","Impl Yld"],["ppd","PPD"]].map(([k,l])=>(<button key={k} onClick={()=>setViewMode(k)} style={{fontSize:7.5,padding:"1px 5px",borderRadius:3,border:"none",cursor:"pointer",background:viewMode===k?"#8B5CF6":"#1E293B",color:viewMode===k?"#FFF":"#94A3B8"}}>{l}</button>))}</div>
+            <div style={{display:"flex",gap:2,borderLeft:"1px solid #334155",paddingLeft:4}}>{[["swap","Swap Pts"],["iy","Impl Yld"],["ppd","PPD"],["carryDecomp","Carry Decomp"]].map(([k,l])=>(<button key={k} onClick={()=>setViewMode(k)} style={{fontSize:7.5,padding:"1px 5px",borderRadius:3,border:"none",cursor:"pointer",background:viewMode===k?"#8B5CF6":"#1E293B",color:viewMode===k?"#FFF":"#94A3B8"}}>{l}</button>))}</div>
             {brokersMeta&&Object.keys(brokersMeta).length>0&&(<select value={contributor||""} onChange={e=>setContributor(e.target.value||null)} style={{background:"#1E293B",border:"1px solid #334155",color:"#E2E8F0",borderRadius:3,padding:"1px 4px",fontSize:8}}>
               <option value="">Refinitiv</option>
               {Object.entries(brokersMeta).map(([code,m])=>(<option key={code} value={code}>{m.label||code}</option>))}
@@ -505,15 +643,57 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
             <button onClick={onClose} style={{background:"#1E293B",border:"1px solid #334155",color:"#94A3B8",padding:"3px 10px",borderRadius:4,cursor:"pointer",fontSize:9}}>Close (ESC)</button>
           </div>
         </div>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 220px",gap:8}}>
+        <div style={{display:"grid",gridTemplateColumns:viewMode==="carryDecomp"?"1fr":"1fr 220px",gap:8}}>
+          {viewMode==="carryDecomp"?(
+            <div>
+              {carryDecomp?(()=>{
+                const cdDates=carryDecomp.map(d=>d.date);
+                const cdCarry=carryDecomp.map(d=>d.carry);
+                const cdMove=carryDecomp.map(d=>d.move);
+                const cdCum=carryDecomp.map(d=>d.cumTotal);
+                const totalCarry=cdCarry.reduce((a,b)=>a+b,0);
+                const totalMove=cdMove.reduce((a,b)=>a+b,0);
+                return(<>
+                  <PChart traces={[
+                    {x:cdDates,y:cdCarry,type:"bar",name:"Carry (roll-down)",marker:{color:"rgba(74,222,128,0.7)"}},
+                    {x:cdDates,y:cdMove,type:"bar",name:"Market move",marker:{color:cdMove.map(v=>v>=0?"rgba(59,130,246,0.7)":"rgba(244,114,182,0.7)")}},
+                    {x:cdDates,y:cdCum,type:"scatter",mode:"lines",name:"Cumulative",line:{color:"#FBBF24",width:2},yaxis:"y2"},
+                  ]} layout={{
+                    title:{text:`${tenor} Carry Decomposition`,font:{size:10,color:"#94A3B8"}},
+                    barmode:"relative",
+                    yaxis:{title:"Daily P&L (pips)"},
+                    yaxis2:{title:"Cumulative (pips)",overlaying:"y",side:"right",gridcolor:"transparent"},
+                  }} height={280} revisionKey={`carryDecomp-${tenor}`}/>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginTop:6,fontSize:9}}>
+                    <div style={{background:"#131C2E",borderRadius:4,padding:6}}>
+                      <div style={{color:"#64748B",fontSize:7.5,marginBottom:2}}>TOTAL CARRY</div>
+                      <div style={{color:"#4ADE80",fontFamily:"monospace",fontWeight:700}}>{FP(totalCarry,1)} pips</div>
+                    </div>
+                    <div style={{background:"#131C2E",borderRadius:4,padding:6}}>
+                      <div style={{color:"#64748B",fontSize:7.5,marginBottom:2}}>TOTAL MARKET MOVE</div>
+                      <div style={{color:totalMove>=0?"#3B82F6":"#F472B6",fontFamily:"monospace",fontWeight:700}}>{FP(totalMove,1)} pips</div>
+                    </div>
+                    <div style={{background:"#131C2E",borderRadius:4,padding:6}}>
+                      <div style={{color:"#64748B",fontSize:7.5,marginBottom:2}}>TOTAL P&L</div>
+                      <div style={{color:"#FBBF24",fontFamily:"monospace",fontWeight:700}}>{FP(totalCarry+totalMove,1)} pips</div>
+                    </div>
+                  </div>
+                </>);
+              })():(
+                <div style={{color:"#64748B",padding:20,fontSize:10,textAlign:"center"}}>
+                  Carry decomposition unavailable. Requires swap-point history with at least 2 anchor tenor RICs.
+                </div>
+              )}
+            </div>
+          ):(
           <div>
-            <PChart traces={priceTraces} layout={{title:{text:`${tenor} ${yLabel}`,font:{size:10,color:"#94A3B8"}},yaxis:{title:yLabel}}} height={210}/>
+            <PChart traces={priceTraces} layout={{title:{text:`${tenor} ${yLabel}`,font:{size:10,color:"#94A3B8"}},yaxis:{title:yLabel}}} height={210} revisionKey={`hist-${tenor}-${viewMode}`}/>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:4,marginTop:4}}>
               <PChart traces={rsiTraces} layout={{title:{text:"RSI(14)",font:{size:9,color:"#64748B"}},yaxis:{range:[0,100]},shapes:[{type:"line",y0:70,y1:70,x0:0,x1:1,xref:"paper",line:{color:"#F87171",dash:"dot",width:1}},{type:"line",y0:30,y1:30,x0:0,x1:1,xref:"paper",line:{color:"#4ADE80",dash:"dot",width:1}}]}} height={120}/>
               <PChart traces={macdTraces} layout={{title:{text:"MACD(12,26,9)",font:{size:9,color:"#64748B"}}}} height={120}/>
             </div>
-          </div>
-          <div style={{background:"#131C2E",borderRadius:5,padding:6,overflow:"auto",maxHeight:460}}>
+          </div>)}
+          {viewMode!=="carryDecomp"&&<div style={{background:"#131C2E",borderRadius:5,padding:6,overflow:"auto",maxHeight:460}}>
             <div style={{fontSize:8,fontWeight:800,color:"#60A5FA",marginBottom:3,letterSpacing:".1em"}}>HIGH / LOW</div>
             {stats&&Object.entries(stats.ranges).map(([k,v])=>(<div key={k} style={{display:"flex",justifyContent:"space-between",padding:"1px 0",fontSize:8.5,borderBottom:"1px solid #1E293B"}}><span style={{color:"#64748B",width:22}}>{k}</span><span style={{color:"#4ADE80",fontFamily:"monospace"}}>{v.low.toFixed(isSwapPts?1:3)}</span><span style={{color:"#64748B"}}>—</span><span style={{color:"#F87171",fontFamily:"monospace"}}>{v.high.toFixed(isSwapPts?1:3)}</span></div>))}
             <div style={{fontSize:8,fontWeight:800,color:"#10B981",marginTop:5,marginBottom:3,letterSpacing:".1em"}}>STATISTICS</div>
@@ -531,7 +711,7 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
             {stats&&<><SR l={`SMA(${sigN})`} v={stats.smaN!=null?stats.smaN:"—"} dp={isSwapPts?1:(dpOverride||3)}/>
             <SR l="Dev from MA" v={stats.devMA!=null?stats.devMA:"—"} dp={isSwapPts?1:4}/>
             <div style={{display:"flex",justifyContent:"space-between",padding:"1px 0",borderBottom:"1px solid #1E293B",fontSize:8.5}}><span style={{color:"#64748B"}}>Z(Dev,{sigN})</span><span style={{color:stats.zDev==null?"#475569":(Math.abs(stats.zDev)>=2?"#F472B6":Math.abs(stats.zDev)>=1?"#FBBF24":"#4ADE80"),fontFamily:"monospace",fontWeight:700}}>{stats.zDev!=null?stats.zDev.toFixed(2):"—"}</span></div></>}
-          </div>
+          </div>}
         </div>
         {customSeries&&customSeries.series&&customSeries.series.length>0&&(
           <div style={{marginTop:8,background:"#131C2E",borderRadius:5,padding:6}}>
@@ -609,16 +789,16 @@ function SprTbl({spreads,title,color,mx,onDbl,pdp=1}){
   return(<div style={{background:"#131C2E",borderRadius:5,padding:6,marginBottom:6}}>
     <div style={{fontSize:9.5,fontWeight:800,color,marginBottom:3,letterSpacing:".05em"}}>{title}</div>
     <div style={{overflowX:"auto"}}><table style={{borderCollapse:"collapse",width:"100%",minWidth:1000,fontSize:9}}>
-      <thead><tr><th style={{...tS(),textAlign:"left",minWidth:60,...STICKY_TH}}>Spread</th><th style={tS()}>Near Val</th><th style={tS()}>Near Fix</th><th style={tS()}>Far Val</th><th style={tS()}>Far Fix</th><th style={tS()}>Days</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#F87171")}>Ask</th><th style={tS()}>D/D</th><th style={tS()}>Pts/D</th><th style={tS("#22D3EE")} title="Static-curve carry (display pips). Spot-start: carry=fwdPts[T]. Fwd-fwd NxF: carry=fwdPts[F-N]-(fwdPts[F]-fwdPts[N]).">Carry</th><th style={tS("#4ADE80")}>Iy Bid</th><th style={tS("#34D399")}>Iy Mid</th><th style={tS("#F87171")}>Iy Ask</th><th style={tS()}>Iy D/D</th><th style={tS()}>Iy bp/d</th><th style={tS("#FB923C")}>SOFR%</th><th style={tS("#C084FC")}>Basis</th></tr></thead>
+      <thead><tr><th style={{...tS(),textAlign:"left",minWidth:60,...STICKY_TH}}>Spread</th><th style={tS()}>Near Val</th><th style={tS()}>Near Fix</th><th style={tS()}>Far Val</th><th style={tS()}>Far Fix</th><th style={tS()}>Days</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#F87171")}>Ask</th><th style={tS()}>D/D</th><th style={tS()}>Pts/D</th><th style={tS("#4ADE80")}>Iy Bid</th><th style={tS("#34D399")}>Iy Mid</th><th style={tS("#F87171")}>Iy Ask</th><th style={tS()}>Iy D/D</th><th style={tS("#A78BFA")} title="Roll-down IY (bps): change in fwd-fwd IY per 1-month roll">Roll IY</th><th style={tS("#FB923C")}>SOFR%</th><th style={tS("#C084FC")}>Basis</th></tr></thead>
       <tbody>{spreads.map((s,i)=>{const iso=d=>{if(!d)return null;const x=d instanceof Date?d:new Date(d);if(isNaN(x))return null;return x.toISOString().slice(0,10);};const ndIso=iso(s.nrVD),fdIso=iso(s.frVD);const rowBg=i%2===0?"#0F172A":"#131C2E";const isInterp=s.interp||s.dataSource==="interpolated";return(<tr key={i} style={{background:rowBg,cursor:s.unavailable?"default":"pointer",opacity:s.unavailable?.55:(isInterp?.78:1)}} onDoubleClick={()=>!s.unavailable&&onDbl&&onDbl(s.label,Math.abs(s.pM)||1,true,null,s.nrM,s.frM,ndIso,fdIso,s.fundingTenor||null)}>
-        <td style={{...cS(isInterp?"#64748B":color,true),textAlign:"left",...stickyTd(rowBg)}} title={s.unavailable?s.unavailableReason:(isInterp?"interpolated — no direct RIC data":undefined)}>{s.label}{s.unavailable?" *":(isInterp?" ⁱ":"")}</td>
+        <td style={{...cS(isInterp?"#64748B":color,true),textAlign:"left",...stickyTd(rowBg)}} title={s.unavailable?s.unavailableReason:(isInterp?"interpolated — no direct RIC data":undefined)}>{s.label}{s.unavailable?" *":(isInterp?" \u2071":"")}</td>
         <td style={cS("#475569")}>{fD(s.nrVD)}</td><td style={cS("#475569")}>{fD(s.nrFxD)}</td><td style={cS("#475569")}>{fD(s.frVD)}</td><td style={cS("#475569")}>{fD(s.frFxD)}</td><td style={cS("#475569",false,true)}>{s.days}</td>
         <td style={cS("#4ADE80")}>{FP(s.pB,pdp)}</td><td style={cS("#FBBF24",true)}>{FP(s.pM,pdp)}</td><td style={cS("#F87171")}>{FP(s.pA,pdp)}</td>
         <td style={{...cS(CC(s.chg)),background:HB(s.chg,mx)}}>{FP(s.chg,pdp)}</td><td style={cS("#64748B",false,true)}>{F(s.ppd,2)}</td>
-        <td style={cS(s.carry!=null&&s.carry>=0?"#22D3EE":"#F472B6",true)} title={s.carry==null?"—":(s.nearLabel&&s.nearLabel!=="Spot"?"fwdPts[F-N]−(fwdPts[F]−fwdPts[N])":"fwdPts[T] (spot-start)")}>{s.carry!=null?FP(s.carry,pdp):"—"}</td>
         <td style={cS("#4ADE80")}>{F(s.fIyB,2)}</td><td style={cS("#34D399",true)}>{F(s.fIy,2)}</td><td style={cS("#F87171")}>{F(s.fIyA,2)}</td>
-        <td style={{...cS(CC(s.iyChg)),background:HB(s.iyChg,.1)}}>{FP(s.iyChg,2)}</td><td style={cS("#64748B")}>{s.iyBpD!=null?F(s.iyBpD,2):"—"}</td>
-        <td style={cS("#FB923C")}>{F(s.fSof,2)}</td><td style={cS(s.bas!=null&&s.bas>=0?"#C084FC":"#F472B6",true)}>{s.bas!=null?FP(s.bas*100,1):"—"}</td>
+        <td style={{...cS(CC(s.iyChg)),background:HB(s.iyChg,.1)}}>{FP(s.iyChg!=null?s.iyChg*100:null,2)}</td>
+        <td style={cS(s.iyBpD!=null&&s.iyBpD>=0?"#A78BFA":"#F472B6")}>{s.iyBpD!=null?F(s.iyBpD,2):"—"}</td>
+        <td style={cS("#FB923C")}>{F(s.fSof,2)}</td><td style={cS(s.bas!=null&&s.bas>=0?"#C084FC":"#F472B6",true)}>{s.bas!=null?FP(s.bas*100,2):"—"}</td>
       </tr>);})}</tbody></table></div></div>);
 }
 
@@ -1073,7 +1253,7 @@ export default function Dashboard(){
   const SprChart=({rows,title,color,height=150})=>(
     <div style={{marginBottom:6}}>
       <PChart traces={[{x:rows.map(s=>s.label),y:rows.map(s=>s.pM),type:"bar",marker:{color}}]}
-        layout={{title:{text:title,font:{size:10}}}} height={height}/>
+        layout={{title:{text:title,font:{size:10}}}} height={height} revisionKey={`spr-${title}`}/>
     </div>
   );
 
@@ -1162,10 +1342,10 @@ export default function Dashboard(){
       {/* MAIN TAB */}
       {tab==="main"&&(<>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:6}}>
-          <PChart traces={[{x:tenors,y:outPts,type:"scatter",mode:"lines+markers",name:"Outright SwPts",line:{color:"#F59E0B"},marker:{size:4}}]} layout={{title:{text:`${cfg.pair} Outright Swap Points (pips)`,font:{size:10}},yaxis:{title:"Swap Points (pips)"}}} height={175}/>
-          <PChart traces={[{x:tenors,y:ffPts,type:"bar",name:"1M Fwd-Fwd",marker:{color:ffPts.map(v=>v>=0?"#3B82F6":"#F472B6")}}]} layout={{title:{text:`${cfg.pair} 1M Forward-Forward (pips)`,font:{size:10}}}} height={175}/>
-          <PChart traces={[{x:tenors,y:iyVals,type:"scatter",mode:"lines+markers",name:`${cfg.pair.slice(3)} Impl%`,line:{color:"#10B981"},marker:{size:3}},{x:tenors,y:sofrVals,type:"scatter",mode:"lines+markers",name:"SOFR%",line:{color:"#FB923C"},marker:{size:3}}]} layout={{title:{text:`${cfg.pair} Implied Yield vs SOFR (%)`,font:{size:10}},yaxis:{title:"%"}}} height={175}/>
-          <PChart traces={[{x:tenors,y:basVals,type:"bar",name:"Basis bp",marker:{color:basVals.map(v=>v>=0?"#8B5CF6":"#F472B6")}}]} layout={{title:{text:`${cfg.pair} Basis (bp)`,font:{size:10}}}} height={175}/>
+          <PChart traces={[{x:tenors,y:outPts,type:"scatter",mode:"lines+markers",name:"Outright SwPts",line:{color:"#F59E0B"},marker:{size:4}}]} layout={{title:{text:`${cfg.pair} Outright Swap Points (pips)`,font:{size:10}},yaxis:{title:"Swap Points (pips)"}}} height={175} revisionKey={`main-swpts-${ccy}`}/>
+          <PChart traces={[{x:tenors,y:ffPts,type:"bar",name:"1M Fwd-Fwd",marker:{color:ffPts.map(v=>v>=0?"#3B82F6":"#F472B6")}}]} layout={{title:{text:`${cfg.pair} 1M Forward-Forward (pips)`,font:{size:10}}}} height={175} revisionKey={`main-ff-${ccy}`}/>
+          <PChart traces={[{x:tenors,y:iyVals,type:"scatter",mode:"lines+markers",name:`${cfg.pair.slice(3)} Impl%`,line:{color:"#10B981"},marker:{size:3}},{x:tenors,y:sofrVals,type:"scatter",mode:"lines+markers",name:"SOFR%",line:{color:"#FB923C"},marker:{size:3}}]} layout={{title:{text:`${cfg.pair} Implied Yield vs SOFR (%)`,font:{size:10}},yaxis:{title:"%"}}} height={175} revisionKey={`main-iy-${ccy}`}/>
+          <PChart traces={[{x:tenors,y:basVals,type:"bar",name:"Basis bp",marker:{color:basVals.map(v=>v>=0?"#8B5CF6":"#F472B6")}}]} layout={{title:{text:`${cfg.pair} Basis (bp)`,font:{size:10}}}} height={175} revisionKey={`main-basis-${ccy}`}/>
         </div>
 
         <div style={{fontSize:8.5,fontWeight:700,color:"#F8FAFC",marginBottom:2}}>OUTRIGHT {cfg.kind==="NDF"?"NDF":"FWD"} CURVE</div>
@@ -1175,7 +1355,7 @@ export default function Dashboard(){
               <td colSpan={4} style={sS("#64748B")}>TENOR</td><td colSpan={3} style={sS("#60A5FA")}>{cfg.kind} OUTRIGHT</td>
               <td colSpan={4} style={sS("#FBBF24")}>SWAP POINTS</td><td colSpan={4} style={sS("#34D399")}>IMPLIED YIELD*</td>
               <td colSpan={2} style={sS("#FB923C")}>SOFR</td><td colSpan={2} style={sS("#C084FC")}>BASIS</td>
-              <td colSpan={2} style={sS("#38BDF8")}>CARRY</td><td colSpan={2} style={sS("#A78BFA")}>ROLL-DOWN</td>
+              <td colSpan={2} style={sS("#A78BFA")}>ROLL-DOWN</td>
             </tr><tr>
               <th style={{...tS(),textAlign:"left",minWidth:36,...STICKY_TH}}>Tnr</th><th style={tS()}>Val</th><th style={tS()}>Fix</th><th style={{...tS(),borderRight:"1px solid #334155"}}>D</th>
               <th style={tS("#4ADE80")}>Bid</th><th style={tS("#F87171")}>Ask</th><th style={{...tS("#FBBF24"),borderRight:"1px solid #334155"}}>Mid</th>
@@ -1183,8 +1363,7 @@ export default function Dashboard(){
               <th style={tS("#4ADE80")}>Bid</th><th style={tS("#34D399")}>Mid</th><th style={tS("#F87171")}>Ask</th><th style={{...tS(),borderRight:"1px solid #334155"}}>D/D</th>
               <th style={tS("#FB923C")}>%</th><th style={{...tS(),borderRight:"1px solid #334155"}}>D/D</th>
               <th style={tS("#C084FC")}>bp</th><th style={{...tS(),borderRight:"1px solid #334155"}}>D/D</th>
-              <th style={tS("#38BDF8")}>Pip</th><th style={{...tS("#38BDF8"),borderRight:"1px solid #334155"}}>IY</th>
-              <th style={tS("#A78BFA")}>Pip</th><th style={tS("#A78BFA")}>IY</th>
+              <th style={tS("#A78BFA")}>Pip</th><th style={tS("#A78BFA")}>IY(bp)</th>
             </tr></thead>
             <tbody>{filt.map((r,i)=>{const sp=r.month===0,mj=[0,1,2,3,6,9,12,24].includes(r.month);const bg=sp?"#1a2744":(i%2===0?"#0F172A":"#111827");const tc=r.suspect?"#78350F":(r.interp?"#475569":(mj?"#F8FAFC":"#94A3B8"));
               return(<tr key={r.tenor} style={{background:bg,borderBottom:[3,6,9,12].includes(r.month)?"1px solid #334155":"none",cursor:"pointer",opacity:r.suspect?0.5:1}} onDoubleClick={()=>dblR(r.tenor,r.spM,true,r.month)} title={r.suspect?r.suspectReason:undefined}>
@@ -1194,14 +1373,12 @@ export default function Dashboard(){
                 <td style={cS("#4ADE80")}>{sp?"—":FP(r.spB,pdp)}</td><td style={cS("#FBBF24",true)}>{sp?"—":FP(r.spM,pdp)}</td><td style={cS("#F87171")}>{sp?"—":FP(r.spA,pdp)}</td>
                 <td style={{...cS(CC(r.pipChg)),borderRight:"1px solid #334155",background:sp?"transparent":HB(r.pipChg,mPC)}}>{sp?"—":FP(r.pipChg,pdp)}</td>
                 <td style={cS("#4ADE80")}>{sp?"—":F(r.iyB,2)}</td><td style={cS("#34D399",true)}>{sp?"—":F(r.iyM,2)}</td><td style={cS("#F87171")}>{sp?"—":F(r.iyA,2)}</td>
-                <td style={{...cS(CC(r.iyChg)),borderRight:"1px solid #334155",background:sp?"transparent":HB(r.iyChg,mIC)}}>{sp?"—":FP(r.iyChg,2)}</td>
+                <td style={{...cS(CC(r.iyChg)),borderRight:"1px solid #334155",background:sp?"transparent":HB(r.iyChg,mIC)}}>{sp?"—":FP(r.iyChg!=null?r.iyChg*100:null,2)}</td>
                 <td style={cS("#FB923C")}>{sp?"—":F(r.sofT,2)}</td><td style={{...cS(CC(r.sofChg)),borderRight:"1px solid #334155",background:sp?"transparent":HB(r.sofChg,.005)}}>{sp?"—":FP(r.sofChg*100,1)}</td>
-                <td style={cS(r.basisT!=null&&r.basisT>=0?"#C084FC":"#F472B6",true)}>{sp||r.basisT==null?"—":FP(r.basisT*100,1)}</td>
-                <td style={{...cS(CC(r.basChg)),borderRight:"1px solid #334155",background:sp?"transparent":HB(r.basChg,mBC)}}>{sp?"—":FP(r.basChg*100,1)}</td>
-                <td style={{...cS(r.carryP>=0?"#38BDF8":"#F472B6"),background:sp?"transparent":HB(r.carryP,mCP)}}>{sp?"—":FP(r.carryP,pdp)}</td>
-                <td style={{...cS(r.carryY>=0?"#38BDF8":"#F472B6"),borderRight:"1px solid #334155",background:sp?"transparent":HB(r.carryY||0,mCY)}}>{sp?"—":FP(r.carryY,2)}</td>
-                <td style={{...cS(r.rollP>=0?"#A78BFA":"#F472B6"),background:r.month<2?"transparent":HB(r.rollP,mRP)}}>{r.month<2?"—":FP(r.rollP,pdp)}</td>
-                <td style={cS(r.rollY>=0?"#A78BFA":"#F472B6")}>{r.month<2?"—":FP(r.rollY,2)}</td>
+                <td style={cS(r.basisT!=null&&r.basisT>=0?"#C084FC":"#F472B6",true)}>{sp||r.basisT==null?"—":FP(r.basisT*100,2)}</td>
+                <td style={{...cS(CC(r.basChg)),borderRight:"1px solid #334155",background:sp?"transparent":HB(r.basChg,mBC)}}>{sp?"—":FP(r.basChg!=null?r.basChg*100:null,2)}</td>
+                <td style={{...cS(r.rollP>=0?"#A78BFA":"#F472B6"),background:r.month<1?"transparent":HB(r.rollP,mRP)}}>{r.month<1?"—":FP(r.rollP,pdp)}</td>
+                <td style={cS(r.rollY>=0?"#A78BFA":"#F472B6")}>{r.month<1?"—":(r.rollY!=null?FP(r.rollY*100,2):"—")}</td>
               </tr>);})}</tbody></table></div>
 
         {/* Full-curve ladders: 1M chain, 3M chain. Issue 5: spot-start ladder removed for NDFs (same as deliverables). */}
