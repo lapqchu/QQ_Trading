@@ -41,19 +41,18 @@ function PChart({traces,layout,height=190,revisionKey}){
   return <Plot data={traces} layout={l} config={PLOT_CFG} style={{width:"100%"}} useResizeHandler/>;
 }
 
-// ── Helper: extract mid value from a history bar (no fabrication) ──
-// Issue 4: filter bars where all price fields are null/0 — don't return 0 as valid data.
+// ── Helper: extract mid value from a history bar ──
+// Zero IS valid data for swap points — only treat null/undefined/NaN as missing.
 function barMid(bar){
   const t=bar.TRDPRC_1, b=bar.BID, a=bar.ASK;
-  // If ALL fields are null or 0, treat as no data
-  const tValid=t!=null&&isFinite(t)&&t!==0;
-  const bValid=b!=null&&isFinite(b)&&b!==0;
-  const aValid=a!=null&&isFinite(a)&&a!==0;
-  if(!tValid&&!bValid&&!aValid)return null;
-  if(tValid)return t;
-  if(bValid&&aValid)return(b+a)/2;
-  if(bValid)return b;
-  if(aValid)return a;
+  const tOk=t!=null&&isFinite(t);
+  const bOk=b!=null&&isFinite(b);
+  const aOk=a!=null&&isFinite(a);
+  if(!tOk&&!bOk&&!aOk)return null;
+  if(bOk&&aOk)return(b+a)/2;
+  if(tOk)return t;
+  if(bOk)return b;
+  if(aOk)return a;
   return null;
 }
 
