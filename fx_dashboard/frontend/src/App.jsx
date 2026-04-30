@@ -41,6 +41,18 @@ function PChart({traces,layout,height=190,revisionKey}){
   return <Plot data={traces} layout={l} config={PLOT_CFG} style={{width:"100%"}} useResizeHandler/>;
 }
 
+// Module-scope: must NOT be inlined inside MainApp or each render creates a
+// new component identity, forcing Plotly to remount and resetting zoom/pan
+// every live-mode tick.
+function SprChart({rows,title,color,height=150}){
+  return(
+    <div style={{marginBottom:6}}>
+      <PChart traces={[{x:rows.map(s=>s.label),y:rows.map(s=>s.pM),type:"bar",marker:{color}}]}
+        layout={{title:{text:title,font:{size:10}}}} height={height} revisionKey={`spr-${title}`}/>
+    </div>
+  );
+}
+
 // ── Helper: extract mid value from a history bar ──
 // Zero IS valid data for swap points — only treat null/undefined/NaN as missing.
 function barMid(bar){
@@ -374,17 +386,33 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[ccy,tenor,isSwapPts,monthHint,nrM,frM,nrDate,frDate,period,contributor]);
 
-  // Custom fwd-fwd spread history (only when user changes dates beyond initial — avoids duplicate chart).
+  // Carry decomposition needs the anchor-tenor history (rawHistData). The
+  // standard getHistory path above sets it, but the fundingTenor and
+  // useBackendCustom paths don't — fetch it here so carry-decomp works in
+  // every viewing mode.
+  useEffect(()=>{
+    if(!fundingTenor&&!useBackendCustom)return; // standard path already sets rawHistData
+    let cancelled=false;
+    getHistory(ccy,{period,contributor}).then(d=>{if(!cancelled)setRawHistData(d);})
+      .catch(()=>{if(!cancelled)setRawHistData(null);});
+    return()=>{cancelled=true;};
+  },[ccy,period,contributor,fundingTenor,useBackendCustom]);
+
+  // Custom fwd-fwd spread history. Only fetch when the user has changed the
+  // date inputs to something different from the initial spread the main chart
+  // is already rendering. The main chart shows the spread for nrDate×frDate
+  // either via the anchor-RIC path (bothLegsAnchor) or via getHistoryCustom
+  // (useBackendCustom) — in both cases the custom chart would be a duplicate
+  // when inputs match, so dedup must NOT gate on useBackendCustom.
   useEffect(()=>{
     if(!customNear||!customFar){setCustomSeries(null);return;}
-    // If the current main chart is already rendering these exact dates via useBackendCustom, skip duplicate fetch.
-    if(useBackendCustom&&customNear===nrDate&&customFar===frDate){setCustomSeries(null);return;}
+    if(nrDate&&frDate&&customNear===nrDate&&customFar===frDate){setCustomSeries(null);return;}
     let cancelled=false;
     getHistoryCustom({ccy,near:customNear,far:customFar,period,contributor})
       .then(d=>{if(!cancelled)setCustomSeries(d);})
       .catch(()=>{if(!cancelled)setCustomSeries(null);});
     return()=>{cancelled=true;};
-  },[ccy,customNear,customFar,period,contributor]);
+  },[ccy,customNear,customFar,period,contributor,nrDate,frDate]);
   // Tenor days — use IPA-derived days from the snapshot (same as live display),
   // NOT a per-bar changing value. This keeps PPD consistent with the live table.
   const tenorDays=(()=>{
@@ -456,7 +484,13 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
   const s50=useMemo(()=>vHist?calcSMA(vHist,50):[],[vHist]);
   const zDev=useMemo(()=>vHist?calcZDev(vHist,sigN):[],[vHist,sigN]);
   const[btPeriod,setBtPeriod]=useState(252);
-  const btRes=useMemo(()=>vHist?backtest(vHist,btPeriod):[],[vHist,btPeriod]);
+  // btPeriod -1 = "Max" → use the full vHist window (limited only by the
+  // outer Period selector at the top of the modal).
+  const btRes=useMemo(()=>{
+    if(!vHist)return[];
+    const lookback=btPeriod===-1?vHist.length:btPeriod;
+    return backtest(vHist,lookback);
+  },[vHist,btPeriod]);
   const[selSt,setSelSt]=useState(null);const[hovSt,setHovSt]=useState(null);
 
   // ── Issue 6: Carry Decomposition ──
@@ -723,7 +757,7 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
             <span style={{fontSize:9,fontWeight:800,color:"#F59E0B",letterSpacing:".1em"}}>STRATEGY BACKTESTING</span>
             <div style={{display:"flex",gap:3,alignItems:"center"}}><span style={{fontSize:8,color:"#64748B"}}>Period:</span>
-              {[[22,"1M"],[66,"3M"],[132,"6M"],[252,"1Y"]].map(([d,l])=>(<button key={d} onClick={()=>{setBtPeriod(d);setSelSt(null);}} style={{fontSize:7.5,padding:"1px 5px",borderRadius:3,border:"none",cursor:"pointer",background:btPeriod===d?"#3B82F6":"#1E293B",color:btPeriod===d?"#FFF":"#64748B"}}>{l}</button>))}</div>
+              {[[22,"1M"],[66,"3M"],[132,"6M"],[252,"1Y"],[504,"2Y"],[756,"3Y"],[1260,"5Y"],[-1,"Max"]].map(([d,l])=>(<button key={d} onClick={()=>{setBtPeriod(d);setSelSt(null);}} style={{fontSize:7.5,padding:"1px 5px",borderRadius:3,border:"none",cursor:"pointer",background:btPeriod===d?"#3B82F6":"#1E293B",color:btPeriod===d?"#FFF":"#64748B"}}>{l}</button>))}</div>
           </div>
           {hovSt&&<div style={{background:"#0F172A",padding:"4px 8px",borderRadius:4,marginBottom:4,fontSize:8,color:"#94A3B8",border:"1px solid #334155"}}>{STRAT_DESCS[hovSt]||hovSt}</div>}
           <div style={{display:"grid",gridTemplateColumns:selSt!=null?"1fr 1fr":"1fr",gap:6}}>
@@ -787,8 +821,8 @@ function SprTbl({spreads,title,color,mx,onDbl,pdp=1}){
   if(!spreads||!spreads.length)return null;
   return(<div style={{background:"#131C2E",borderRadius:5,padding:6,marginBottom:6}}>
     <div style={{fontSize:9.5,fontWeight:800,color,marginBottom:3,letterSpacing:".05em"}}>{title}</div>
-    <div style={{overflowX:"auto"}}><table style={{borderCollapse:"collapse",width:"100%",minWidth:1000,fontSize:9}}>
-      <thead><tr><th style={{...tS(),textAlign:"left",minWidth:60,...STICKY_TH}}>Spread</th><th style={tS()}>Near Val</th><th style={tS()}>Near Fix</th><th style={tS()}>Far Val</th><th style={tS()}>Far Fix</th><th style={tS()}>Days</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#F87171")}>Ask</th><th style={tS()}>D/D</th><th style={tS()}>Pts/D</th><th style={tS("#4ADE80")}>Iy Bid</th><th style={tS("#34D399")}>Iy Mid</th><th style={tS("#F87171")}>Iy Ask</th><th style={tS()}>Iy D/D</th><th style={tS("#A78BFA")} title="Roll-down IY (bps): change in fwd-fwd IY per 1-month roll">Roll IY</th><th style={tS("#FB923C")}>SOFR%</th><th style={tS("#C084FC")}>Basis</th></tr></thead>
+    <div style={{overflowX:"auto"}}><table style={{borderCollapse:"collapse",width:"100%",minWidth:1080,fontSize:9}}>
+      <thead><tr><th style={{...tS(),textAlign:"left",minWidth:60,...STICKY_TH}}>Spread</th><th style={tS()}>Near Val</th><th style={tS()}>Near Fix</th><th style={tS()}>Far Val</th><th style={tS()}>Far Fix</th><th style={tS()}>Days</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#F87171")}>Ask</th><th style={tS()}>D/D</th><th style={tS()}>Pts/D</th><th style={tS("#4ADE80")}>Iy Bid</th><th style={tS("#34D399")}>Iy Mid</th><th style={tS("#F87171")}>Iy Ask</th><th style={tS()}>Iy D/D</th><th style={tS("#A78BFA")} title="Roll-down in pips: static-curve P&L from rolling forward by the spread horizon (1M for spot-start, near-leg days for fwd-fwd)">Roll Pip</th><th style={tS("#A78BFA")} title="Roll-down IY (bps): change in implied yield from rolling forward (post-roll = SPx(F-horizon))">Roll IY</th><th style={tS("#FB923C")}>SOFR%</th><th style={tS("#C084FC")}>Basis</th></tr></thead>
       <tbody>{spreads.map((s,i)=>{const iso=d=>{if(!d)return null;const x=d instanceof Date?d:new Date(d);if(isNaN(x))return null;return x.toISOString().slice(0,10);};const ndIso=iso(s.nrVD),fdIso=iso(s.frVD);const rowBg=i%2===0?"#0F172A":"#131C2E";const isInterp=s.interp||s.dataSource==="interpolated";return(<tr key={i} style={{background:rowBg,cursor:s.unavailable?"default":"pointer",opacity:s.unavailable?.55:(isInterp?.78:1)}} onDoubleClick={()=>!s.unavailable&&onDbl&&onDbl(s.label,Math.abs(s.pM)||1,true,null,s.nrM,s.frM,ndIso,fdIso,s.fundingTenor||null)}>
         <td style={{...cS(isInterp?"#64748B":color,true),textAlign:"left",...stickyTd(rowBg)}} title={s.unavailable?s.unavailableReason:(isInterp?"interpolated — no direct RIC data":undefined)}>{s.label}{s.unavailable?" *":(isInterp?" \u2071":"")}</td>
         <td style={cS("#475569")}>{fD(s.nrVD)}</td><td style={cS("#475569")}>{fD(s.nrFxD)}</td><td style={cS("#475569")}>{fD(s.frVD)}</td><td style={cS("#475569")}>{fD(s.frFxD)}</td><td style={cS("#475569",false,true)}>{s.days}</td>
@@ -796,7 +830,8 @@ function SprTbl({spreads,title,color,mx,onDbl,pdp=1}){
         <td style={{...cS(CC(s.chg)),background:HB(s.chg,mx)}}>{FP(s.chg,pdp)}</td><td style={cS("#64748B",false,true)}>{F(s.ppd,2)}</td>
         <td style={cS("#4ADE80")}>{F(s.fIyB,2)}</td><td style={cS("#34D399",true)}>{F(s.fIy,2)}</td><td style={cS("#F87171")}>{F(s.fIyA,2)}</td>
         <td style={{...cS(CC(s.iyChg)),background:HB(s.iyChg,.1)}}>{FP(s.iyChg!=null?s.iyChg*100:null,2)}</td>
-        <td style={cS(s.iyBpD!=null&&s.iyBpD>=0?"#A78BFA":"#F472B6")}>{s.iyBpD!=null?F(s.iyBpD,2):"—"}</td>
+        <td style={cS(s.carry!=null&&s.carry>=0?"#A78BFA":"#F472B6")}>{s.carry!=null?FP(s.carry,pdp):"—"}</td>
+        <td style={cS(s.carryY!=null&&s.carryY>=0?"#A78BFA":"#F472B6")}>{s.carryY!=null?FP(s.carryY*100,2):"—"}</td>
         <td style={cS("#FB923C")}>{F(s.fSof,2)}</td><td style={cS(s.bas!=null&&s.bas>=0?"#C084FC":"#F472B6",true)}>{s.bas!=null?FP(s.bas*100,2):"—"}</td>
       </tr>);})}</tbody></table></div></div>);
 }
@@ -1233,7 +1268,6 @@ export default function Dashboard(){
   const mBC=Math.max(...mr.map(r=>Math.abs(r.basChg||0)),.01);
   const mFC=Math.max(...mr.filter(r=>r.month>1).map(r=>Math.abs(r.ffChg||0)),1);
   const mCP=Math.max(...mr.map(r=>Math.abs(r.carryP||0)),1);
-  const mRP=Math.max(...mr.filter(r=>r.month>1).map(r=>Math.abs(r.rollP||0)),1);
   const mCY=Math.max(...mr.map(r=>Math.abs(r.carryY||0)),.01);
   const mSC=Math.max(...[...anchors,...qFF,...spSpr,...immSpr].map(s=>Math.abs(s.chg||0)),1);
   const dblR=(t,v,isSP=false,month=null,nrM=null,frM=null,nrDate=null,frDate=null,fundingTenor=null)=>setHm({tenor:t,value:v,isSP,month,nrM,frM,nrDate,frDate,fundingTenor});
@@ -1249,12 +1283,6 @@ export default function Dashboard(){
   const basVals=chartRows.map(r=>r.basisT!=null?r.basisT*100:null);
 
   const tabs=[{id:"main",label:"Full Curve"},{id:"spreads",label:"Spreads & Rolls"},{id:"tools",label:"Tools"},{id:"broker",label:"Broker Monitor"}];
-  const SprChart=({rows,title,color,height=150})=>(
-    <div style={{marginBottom:6}}>
-      <PChart traces={[{x:rows.map(s=>s.label),y:rows.map(s=>s.pM),type:"bar",marker:{color}}]}
-        layout={{title:{text:title,font:{size:10}}}} height={height} revisionKey={`spr-${title}`}/>
-    </div>
-  );
 
   return(
     <div style={{background:"#0F172A",color:"#E2E8F0",minHeight:"100vh",fontFamily:"'Inter',system-ui,sans-serif",padding:8}}>
@@ -1376,8 +1404,8 @@ export default function Dashboard(){
                 <td style={cS("#FB923C")}>{sp?"—":F(r.sofT,2)}</td><td style={{...cS(CC(r.sofChg)),borderRight:"1px solid #334155",background:sp?"transparent":HB(r.sofChg,.005)}}>{sp?"—":FP(r.sofChg*100,1)}</td>
                 <td style={cS(r.basisT!=null&&r.basisT>=0?"#C084FC":"#F472B6",true)}>{sp||r.basisT==null?"—":FP(r.basisT*100,2)}</td>
                 <td style={{...cS(CC(r.basChg)),borderRight:"1px solid #334155",background:sp?"transparent":HB(r.basChg,mBC)}}>{sp?"—":FP(r.basChg!=null?r.basChg*100:null,2)}</td>
-                <td style={{...cS(r.rollP>=0?"#A78BFA":"#F472B6"),background:r.month<1?"transparent":HB(r.rollP,mRP)}}>{r.month<1?"—":FP(r.rollP,pdp)}</td>
-                <td style={cS(r.rollY>=0?"#A78BFA":"#F472B6")}>{r.month<1?"—":(r.rollY!=null?FP(r.rollY*100,2):"—")}</td>
+                <td style={{...cS(r.carryP!=null&&r.carryP>=0?"#A78BFA":"#F472B6"),background:r.carryP!=null?HB(r.carryP,mCP):"transparent"}}>{r.carryP!=null?FP(r.carryP,pdp):"—"}</td>
+                <td style={cS(r.carryY!=null&&r.carryY>=0?"#A78BFA":"#F472B6")}>{r.carryY!=null?FP(r.carryY*100,2):"—"}</td>
               </tr>);})}</tbody></table></div>
 
         {/* Full-curve ladders: 1M chain, 3M chain. Issue 5: spot-start ladder removed for NDFs (same as deliverables). */}

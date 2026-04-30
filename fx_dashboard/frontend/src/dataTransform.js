@@ -709,45 +709,46 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
     r.sofChg = r.sofT != null && r.sofT1 != null ? r.sofT - r.sofT1 : null;
     r.basChg = r.basisT != null && r.basisT1 != null ? r.basisT - r.basisT1 : null;
     r.ffIyChg = r.ffIyM != null && r.ffIyM1 != null ? r.ffIyM - r.ffIyM1 : null;
-    // Row-level carry (spot-start SPxT): 1-month roll.
-    // carry = fwdPts[T-30d] - fwdPts[T]; at month===0 (spot) carry is undefined.
-    if (r.month === 0) { r.carryP = null; }
-    else {
+    // Row-level carry / roll-down (spot-start SPxT). Both are static-curve
+    // P&L from rolling forward by 1 month (30d):
+    //   carryP = fwdPts[T-30] - fwdPts[T]   (in pips)
+    //   carryY = IY(SPx(T-30)) - IY(SPxT)   (in % — multiply ×100 for bps)
+    // For sub-1M tenors use a 1-day horizon. At month===0 both are undefined.
+    if (r.month === 0) { r.carryP = null; r.carryY = null; }
+    else if (r.month < 1) {
+      // Sub-1M: 1-day roll = pts(days) - pts(days-1)
+      const td = r.dT || 0;
+      if (td >= 1) {
+        const ptsCur = r.spM != null ? r.spM : iPtMT(td);
+        const ptsPrev = iPtMT(td - 1);
+        r.carryP = (ptsCur != null && ptsPrev != null) ? ptsPrev - ptsCur : null;
+        if (sMT != null) {
+          const sofCur = sTa.mo.length ? iST(Math.min(Math.max(r.month, 0.01), 24)) : null;
+          const sofPrev = sTa.mo.length ? iST(Math.min(Math.max((td - 1) / 30, 0.01), 24)) : sofCur;
+          if (ptsCur != null && ptsPrev != null && sofCur != null && sofPrev != null) {
+            const iyCur = implYld(sMT + ptsCur / PF, sMT, sofCur, td);
+            const iyPrev = td > 1 ? implYld(sMT + ptsPrev / PF, sMT, sofPrev, td - 1) : null;
+            r.carryY = (iyCur != null && iyPrev != null) ? iyPrev - iyCur : null;
+          } else { r.carryY = null; }
+        } else { r.carryY = null; }
+      } else { r.carryP = null; r.carryY = null; }
+    } else {
       const td = r.dT || 0;
       const shifted = td - 30;
       const ptsShift = shifted <= 0 ? 0 : iPtMT(shifted);
       const ptsF = r.spM != null ? r.spM : iPtMT(td);
       r.carryP = (ptsShift != null && ptsF != null) ? (ptsShift - ptsF) : null;
+      if (sMT != null && shifted > 0 && ptsShift != null && r.iyM != null) {
+        const sofShift = sTa.mo.length ? iST(Math.min(Math.max(shifted / 30, 0.1), 24)) : null;
+        if (sofShift != null) {
+          const iyShift = implYld(sMT + ptsShift / PF, sMT, sofShift, shifted);
+          r.carryY = iyShift != null ? iyShift - r.iyM : null;
+        } else { r.carryY = null; }
+      } else { r.carryY = null; }
     }
-    r.carryY = r.ffIyM;
-    // Roll-down: for sub-1M tenors, use 1-day roll from the days-indexed curve
-    // instead of fwd-fwd chain (which may not have a prior row).
-    if (r.month === 0) { r.rollP = null; r.rollY = null; }
-    else if (r.month < 1) {
-      // Sub-1M: 1-day roll-down = pts(days) - pts(days-1)
-      const td = r.dT || 0;
-      if (td >= 1) {
-        const ptsCur = r.spM != null ? r.spM : iPtMT(td);
-        const ptsPrev = iPtMT(td - 1);
-        r.rollP = (ptsCur != null && ptsPrev != null) ? ptsCur - ptsPrev : null;
-      } else { r.rollP = null; }
-      // Roll-down IY for sub-1M: compute IY at (days) and IY at (days-1)
-      if (td >= 1 && sMT != null) {
-        const sof = sTa.mo.length > 0 ? iST(Math.min(Math.max(r.month, 0.01), 24)) : null;
-        const ptsCur = r.spM != null ? r.spM : iPtMT(td);
-        const ptsPrev = iPtMT(td - 1);
-        if (ptsCur != null && ptsPrev != null && sof != null) {
-          const outCur = sMT + ptsCur / PF;
-          const outPrev = sMT + ptsPrev / PF;
-          const iyCur = implYld(outCur, sMT, sof, td);
-          const iyPrev = td > 1 ? implYld(outPrev, sMT, sof, td - 1) : null;
-          r.rollY = (iyCur != null && iyPrev != null) ? iyCur - iyPrev : (iyCur != null ? iyCur : null);
-        } else { r.rollY = null; }
-      } else { r.rollY = null; }
-    } else {
-      r.rollP = i >= 2 && r.ffM != null && p?.ffM != null ? r.ffM - p.ffM : (i === 1 ? r.ffM : null);
-      r.rollY = i >= 2 && r.ffIyM != null && p?.ffIyM != null ? r.ffIyM - p.ffIyM : (i === 1 ? r.ffIyM : null);
-    }
+    // Legacy slope fields kept for back-compat (unused by tables now).
+    r.rollP = r.carryP;
+    r.rollY = r.carryY;
   }
 
   for (let i = 0; i < immR.length; i++) {
@@ -876,6 +877,31 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
     return ptsDiff - (ptsF - ptsN);
   }
 
+  // Carry-Y = static-curve change in implied yield (bps as percent) over the
+  // same horizon as computeCarry. After rolling forward by `horizon`, the
+  // position becomes SPx(F-horizon) outright; new IY is computed from the
+  // post-roll outright. Returns iyNew - iyOld in % (multiply by 100 for bps).
+  function computeCarryY(nr, fr) {
+    if (!nr || !fr || sMT == null) return null;
+    const nearDays = nr.dT || 0;
+    const farDays = fr.dT || 0;
+    if (farDays <= 0) return null;
+    const horizon = nearDays === 0 ? 30 : nearDays;
+    const newDays = farDays - horizon;
+    if (newDays <= 0) return null;
+    const newPts = iPtMT(newDays);
+    if (newPts == null) return null;
+    const sofN = sTa.mo.length ? iST(Math.min(Math.max(newDays / 30, 0.1), 24)) : null;
+    if (sofN == null) return null;
+    const outN = sMT + newPts / PF;
+    const iyNew = implYld(outN, sMT, sofN, newDays);
+    if (iyNew == null) return null;
+    // Pre-roll yield: spot-start = current outright IY (fr.iyM); fwd-fwd = fwd-fwd IY.
+    const iyOld = nearDays === 0 ? fr.iyM : fwdFwdIy(nr.iyM, nr.dT, fr.iyM, fr.dT);
+    if (iyOld == null) return null;
+    return iyNew - iyOld;
+  }
+
   function mkSpr(nrM, frM, label, opts) {
     opts = opts || {};
     let nr = null, fr = null;
@@ -894,7 +920,7 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
         nrDT: null, frDT: null,
         fIyB: null, fIy: null, fIyA: null, fIy1: null,
         iyChg: null, fSof: null, fSof1: null, sofChg: null, bas: null, basChg: null,
-        ppd: null, carry: null, iyBpD: null,
+        ppd: null, carry: null, carryY: null, iyBpD: null,
         nearLabel: opts.nearLabel || null, farLabel: opts.farLabel || null,
         unavailable: true,
         unavailableReason: "data unavailable",
@@ -916,6 +942,7 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
     const fSof1 = haveSof1 ? ((1 + fr.sofT1 / 100 * fr.dT1 / 360) / (1 + nr.sofT1 / 100 * nr.dT1 / 360) - 1) * 360 / ds * 100 : null;
     const bas = fIy != null && fSof != null ? fIy - fSof : null;
     const carry = computeCarry(nr, fr);
+    const carryY = computeCarryY(nr, fr);
     return {
       label, nrM, frM, pB, pM, pA, pB1, pM1, pA1, chg: pM != null && pM1 != null ? pM - pM1 : null, days: ds,
       nrVD: nr.valDate, frVD: fr.valDate, nrFxD: nr.fixDate, frFxD: fr.fixDate,
@@ -925,7 +952,7 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
       fSof, fSof1, sofChg: fSof != null && fSof1 != null ? fSof - fSof1 : null,
       bas, basChg: bas != null && fIy1 != null && fSof1 != null ? bas - (fIy1 - fSof1) : null,
       ppd: ds > 0 && pM != null ? pM / ds : null,
-      carry,
+      carry, carryY,
       iyBpD: fIy != null ? fIy / 360 * 100 : null,
       nearLabel: opts.nearLabel || null, farLabel: opts.farLabel || null,
     };
@@ -982,7 +1009,7 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
       fIyB: null, fIy: null, fIyA: null, fIy1: null,
       iyChg: null, fSof: null, fSof1: null, sofChg: null, bas: null, basChg: null,
       ppd: days > 0 && pM != null ? pM / days : null,
-      carry,
+      carry, carryY: null,
       iyBpD: null,
       nearLabel: def.nearLabel || null, farLabel: def.farLabel || null,
       isFunding: true, fundingTenor: ricKey,
@@ -1131,6 +1158,7 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
       bas: fIy != null && fSof != null ? fIy - fSof : null, basChg: null,
       ppd: ds > 0 && pM != null ? pM / ds : null,
       carry: computeCarry(nr, fr),
+      carryY: computeCarryY(nr, fr),
       iyBpD: fIy != null ? fIy / 360 * 100 : null,
     });
   }

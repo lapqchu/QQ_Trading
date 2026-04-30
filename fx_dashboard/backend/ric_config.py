@@ -190,6 +190,9 @@ BROKER_META: Dict[str, Dict[str, str]] = {
     "FMD":  {"group": "Fenics",    "label": "Fenics (FMD)"},
     "MBGL": {"group": "Martin",    "label": "Martin Brokers"},
     "PREB": {"group": "Prebon",    "label": "Prebon"},
+    # KZT-specific local brokers (most reliable for USDKZT per user).
+    "SVKZ": {"group": "SVKZ",      "label": "SVKZ (KZT)"},
+    "EUKZ": {"group": "EUKZ",      "label": "EUKZ (KZT)"},
 }
 
 
@@ -522,7 +525,8 @@ CURRENCIES: Dict[str, CurrencyConfig] = {
     "KZT": CurrencyConfig("KZT","USDKZT","DELIVERABLE", 1e2, 2, 2,
         [1,3,6,9,12,18,24], 24, "KZT=", "DELIVERABLE",
         value_mode="pips",
-        brokers=["BGCP","ICAP","TDS","PYNY","TPTS"]),
+        # SVKZ + EUKZ are the most reliable KZT sources (local interbank).
+        brokers=["SVKZ","EUKZ","BGCP","ICAP","TDS","PYNY","TPTS"]),
 
     "RUB": CurrencyConfig("RUB","USDRUB","DELIVERABLE", 1e4, 4, 1,
         [1,3,6,12], 12, "RUB=", "DELIVERABLE",
