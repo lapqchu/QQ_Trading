@@ -406,13 +406,13 @@ CURRENCIES: Dict[str, CurrencyConfig] = {
         composite_18m_fallback_brokers=["FMD"]),
 
     "IDR": CurrencyConfig("IDR","USDIDR","NDF", 1e0, 2, 0,
-        [1,3,6,9,12,18,24], 24, "IDR=", "NDF",
+        [1,2,3,6,9,12,18,24], 24, "IDR=", "NDF",
         value_mode="outright",
         brokers=["FMD","TDS","TRDS","TRDL","BGCP","ICAP","TPTS","PYNY","GMGM"],
         composite_18m_fallback_brokers=["FMD"]),
 
     "PHP": CurrencyConfig("PHP","USDPHP","NDF", 1e2, 2, 2,
-        [1,3,6,9,12,18,24], 24, "PHP=", "NDF",
+        [1,2,3,6,9,12,18,24], 24, "PHP=", "NDF",
         value_mode="outright",
         brokers=["FMD","TDS","TRDS","TRDL","BGCP","ICAP","TPTS","PYNY","GMGM"],
         composite_18m_fallback_brokers=["FMD"]),
@@ -430,7 +430,7 @@ CURRENCIES: Dict[str, CurrencyConfig] = {
         composite_18m_fallback_brokers=["FMD"]),
 
     "NGN": CurrencyConfig("NGN","USDNGN","NDF", 1e0, 2, 2,
-        [1,3,6,9,12,18,24], 24, "NGN=", "NDF",
+        [1,2,3,6,9,12,18,24], 24, "NGN=", "NDF",
         value_mode="outright",
         brokers=["MBGL"],
         derive_from_outrights=True,
@@ -438,20 +438,20 @@ CURRENCIES: Dict[str, CurrencyConfig] = {
         outright_prefer_year_code=True),  # NGN*NDFOR=MBGL uses 1Y/2Y
 
     "EGP": CurrencyConfig("EGP","USDEGP","NDF", 1e4, 4, 0,
-        [1,3,6,9,12,18,24], 24, "EGP=", "NDF",
+        [1,2,3,6,9,12,18,24], 24, "EGP=", "NDF",
         value_mode="pips",
         brokers=["FMD","TDS","TRDS","TRDL","GMGM"],
         derive_from_outrights=True,
         outright_source_brokers=["FMD","TDS"]),
 
     "CLP": CurrencyConfig("CLP","USDCLP","NDF", 1e0, 2, 2,
-        [1,3,6,9,12,18,24], 24, "CLP=", "NDF",
+        [1,2,3,6,9,12,18,24], 24, "CLP=", "NDF",
         value_mode="outright",
         brokers=["FMD","TDS","TRDS","TRDL","BGCP","ICAP","TPTS","PYNY","GMGM"],
         composite_18m_fallback_brokers=["FMD"]),
 
     "COP": CurrencyConfig("COP","USDCOP","NDF", 1e0, 0, 0,
-        [1,3,6,9,12,18,24], 24, "COP=", "NDF",
+        [1,2,3,6,9,12,18,24], 24, "COP=", "NDF",
         value_mode="outright",
         brokers=["FMD","TDS","TRDS","TRDL","BGCP","ICAP","TPTS","PYNY","GMGM"],
         composite_18m_fallback_brokers=["FMD"]),
@@ -523,54 +523,58 @@ CURRENCIES: Dict[str, CurrencyConfig] = {
 
     # ═══════ Deliverables — Tier 3 / restricted ═══════
     "KZT": CurrencyConfig("KZT","USDKZT","DELIVERABLE", 1e2, 2, 2,
-        [1,3,6,9,12,18,24], 24, "KZT=", "DELIVERABLE",
+        [1,2,3,6,9,12,18,24], 24, "KZT=", "DELIVERABLE",
         value_mode="pips",
         # SVKZ + EUKZ are the most reliable KZT sources (local interbank).
         brokers=["SVKZ","EUKZ","BGCP","ICAP","TDS","PYNY","TPTS"]),
 
     "RUB": CurrencyConfig("RUB","USDRUB","DELIVERABLE", 1e4, 4, 1,
-        [1,3,6,12], 12, "RUB=", "DELIVERABLE",
+        # Was [1,3,6,12]/max=12 — restored to standard deliverable curve
+        # so RUB renders the same Full Curve / Spreads tables as its peers.
+        # Tenors with no data will render as "—" (acceptable; structure
+        # consistency is the priority per user instruction).
+        [1,2,3,6,9,12,18,24], 24, "RUB=", "DELIVERABLE",
         value_mode="pips",
         brokers=["BGCP","ICAP","TDS","PYNY","TPTS"]),
 
     "UGX": CurrencyConfig("UGX","USDUGX","DELIVERABLE", 1e0, 0, 0,
-        [1,3,6,9,12,18,24], 24, "UGX=", "DELIVERABLE",
+        [1,2,3,6,9,12,18,24], 24, "UGX=", "DELIVERABLE",
         value_mode="outright",
         brokers=["BGCP","ICAP","TDS","PYNY","TPTS"]),
 
     "MUR": CurrencyConfig("MUR","USDMUR","DELIVERABLE", 1e2, 2, 2,
-        [1,3,6,9,12,18,24], 24, "MUR=", "DELIVERABLE",
+        [1,2,3,6,9,12,18,24], 24, "MUR=", "DELIVERABLE",
         value_mode="pips",
         brokers=["BGCP","ICAP","TDS","PYNY","TPTS"]),
 
     "BWP": CurrencyConfig("BWP","USDBWP","DELIVERABLE", 1e4, 4, 1,
-        [1,3,6,9,12,18,24], 24, "BWP=", "DELIVERABLE",
+        [1,2,3,6,9,12,18,24], 24, "BWP=", "DELIVERABLE",
         value_mode="pips",
         brokers=["BGCP","ICAP","TDS","PYNY","TPTS"]),
 
     # ═══════ Deliverables — GCC + North Africa ═══════
     "SAR": CurrencyConfig("SAR","USDSAR","DELIVERABLE", 1e4, 4, 1,
-        [1,3,6,9,12,18,24], 24, "SAR=", "DELIVERABLE",
+        [1,2,3,6,9,12,18,24], 24, "SAR=", "DELIVERABLE",
         value_mode="pips",
         brokers=["BGCP","ICAP","TDS","PYNY","TPTS"]),
 
     "AED": CurrencyConfig("AED","USDAED","DELIVERABLE", 1e4, 4, 1,
-        [1,3,6,9,12,18,24], 24, "AED=", "DELIVERABLE",
+        [1,2,3,6,9,12,18,24], 24, "AED=", "DELIVERABLE",
         value_mode="pips",
         brokers=["BGCP","ICAP","TDS","PYNY","TPTS"]),
 
     "MAD": CurrencyConfig("MAD","USDMAD","DELIVERABLE", 1e4, 4, 1,
-        [1,3,6,9,12,18,24], 24, "MAD=", "DELIVERABLE",
+        [1,2,3,6,9,12,18,24], 24, "MAD=", "DELIVERABLE",
         value_mode="pips",
         brokers=["BGCP","ICAP","TDS","PYNY","TPTS"]),
 
     "TND": CurrencyConfig("TND","USDTND","DELIVERABLE", 1e3, 3, 1,
-        [1,3,6,9,12,18,24], 24, "TND=", "DELIVERABLE",
+        [1,2,3,6,9,12,18,24], 24, "TND=", "DELIVERABLE",
         value_mode="pips",
         brokers=["BGCP","ICAP","TDS","PYNY","TPTS"]),
 
     "QAR": CurrencyConfig("QAR","USDQAR","DELIVERABLE", 1e4, 4, 1,
-        [1,3,6,9,12,18,24], 24, "QAR=", "DELIVERABLE",
+        [1,2,3,6,9,12,18,24], 24, "QAR=", "DELIVERABLE",
         value_mode="pips",
         brokers=["BGCP","ICAP","TDS","PYNY","TPTS"]),
 }

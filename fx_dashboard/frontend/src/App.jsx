@@ -45,9 +45,20 @@ function PChart({traces,layout,height=190,revisionKey}){
 // new component identity, forcing Plotly to remount and resetting zoom/pan
 // every live-mode tick.
 function SprChart({rows,title,color,height=150}){
-  const xs=rows.map(s=>s.label);
-  const ys=rows.map(s=>s.pM);
-  const iy=rows.map(s=>s.fIy);
+  const safe=Array.isArray(rows)?rows:[];
+  if(!safe.length){
+    // Empty-state placeholder so kind-mates render the same layout (per-ccy
+    // data gaps must not change UI structure).
+    return(
+      <div style={{marginBottom:6,background:"#131C2E",borderRadius:5,padding:6,height,display:"flex",flexDirection:"column",justifyContent:"center"}}>
+        <div style={{fontSize:9.5,fontWeight:800,color,letterSpacing:".05em",marginBottom:3}}>{title}</div>
+        <div style={{color:"#475569",fontSize:9,fontStyle:"italic",textAlign:"center"}}>no data for this currency</div>
+      </div>
+    );
+  }
+  const xs=safe.map(s=>s.label);
+  const ys=safe.map(s=>s.pM);
+  const iy=safe.map(s=>s.fIy);
   const hasIy=iy.some(v=>v!=null&&isFinite(v));
   const traces=[{x:xs,y:ys,type:"bar",name:"Pts",marker:{color:ys.map(v=>v!=null&&v>=0?color:"#F472B6")}}];
   if(hasIy)traces.push({x:xs,y:iy,type:"scatter",mode:"lines+markers",name:"Impl%",line:{color:"#10B981",width:1.5},marker:{size:3},yaxis:"y2"});
@@ -831,7 +842,16 @@ function FundingTbl({ad,brokersMeta,onDbl}){
 
 // ══════════════════════ SPREAD TABLE ══════════════════════
 function SprTbl({spreads,title,color,mx,onDbl,pdp=1}){
-  if(!spreads||!spreads.length)return null;
+  if(!spreads||!spreads.length){
+    // Empty-state placeholder: keeps the table card present so two ccys of
+    // the same kind always render the same set of sections.
+    return(
+      <div style={{background:"#131C2E",borderRadius:5,padding:6,marginBottom:6}}>
+        <div style={{fontSize:9.5,fontWeight:800,color,marginBottom:3,letterSpacing:".05em"}}>{title}</div>
+        <div style={{color:"#475569",fontSize:9,fontStyle:"italic",padding:"6px 0"}}>no data for this currency</div>
+      </div>
+    );
+  }
   return(<div style={{background:"#131C2E",borderRadius:5,padding:6,marginBottom:6}}>
     <div style={{fontSize:9.5,fontWeight:800,color,marginBottom:3,letterSpacing:".05em"}}>{title}</div>
     <div style={{overflowX:"auto"}}><table style={{borderCollapse:"collapse",width:"100%",minWidth:1080,fontSize:9}}>
@@ -1361,8 +1381,9 @@ export default function Dashboard(){
           <div style={{background:"#1E293B",padding:"2px 6px",borderRadius:4,fontSize:9,fontFamily:"monospace"}}>
             <span style={{color:"#64748B"}}>Spot </span><span style={{color:"#4ADE80"}}>{F(rows[0].bT,dp)}</span><span style={{color:"#334155"}}>/</span><span style={{color:"#F87171"}}>{F(rows[0].aT,dp)}</span><span style={{color:"#334155"}}> | </span><span style={{color:"#FBBF24",fontWeight:700}}>{F(rows[0].mT,dp)}</span>
           </div>
-          {/* 1M live quote — shown for both NDFs and deliverables for parity. */}
-          {rows.find(r=>r.month===1)&&(
+          {/* 1M live quote — NDF-only (deliverables don't anchor on a 1M
+              tomfix-style outright). Reverted from the brief parity attempt. */}
+          {cfg.kind==="NDF"&&rows.find(r=>r.month===1)&&(
             <div style={{background:"#1E293B",padding:"2px 6px",borderRadius:4,fontSize:9,fontFamily:"monospace"}}>
               <span style={{color:"#64748B"}}>1M </span>
               <span style={{color:"#4ADE80"}}>{F(rows.find(r=>r.month===1)?.bT,dp)}</span>
@@ -1370,7 +1391,7 @@ export default function Dashboard(){
               <span style={{color:"#F87171"}}>{F(rows.find(r=>r.month===1)?.aT,dp)}</span>
               <span style={{color:"#334155"}}> | </span>
               <span style={{color:"#FBBF24",fontWeight:700}}>{F(rows.find(r=>r.month===1)?.mT,dp)}</span>
-              {cfg.kind==="NDF"&&!snap.deriveFromOutrights&&snap.ndf1mOutright?.sourceLabel&&<span style={{color:"#475569",fontSize:7,marginLeft:3}}>({snap.ndf1mOutright.sourceLabel})</span>}
+              {!snap.deriveFromOutrights&&snap.ndf1mOutright?.sourceLabel&&<span style={{color:"#475569",fontSize:7,marginLeft:3}}>({snap.ndf1mOutright.sourceLabel})</span>}
             </div>
           )}
         </div>
@@ -1423,33 +1444,34 @@ export default function Dashboard(){
                 <td style={cS(r.carryY!=null&&r.carryY>=0?"#A78BFA":"#F472B6")}>{r.carryY!=null?FP(r.carryY*100,2):"—"}</td>
               </tr>);})}</tbody></table></div>
 
-        {/* Full-curve ladders: 1M chain, 3M chain. Issue 5: spot-start ladder removed for NDFs (same as deliverables). */}
-        {pkM1.length>0&&(<>
-          <SprChart rows={pkM1} title={`${cfg.pair} 1M Forward-Forward chain`} color="#22D3EE" height={180}/>
-          <SprTbl spreads={pkM1} title={`${cfg.pair} 1M FWD-FWD CHAIN`} color="#22D3EE" mx={mSC} onDbl={dblR} pdp={pdp}/>
-        </>)}
-        {pkM3.length>0&&(<>
-          <SprChart rows={pkM3} title={`${cfg.pair} 3M Forward-Forward chain`} color="#8B5CF6"/>
-          <SprTbl spreads={pkM3} title={`${cfg.pair} 3M FWD-FWD CHAIN`} color="#8B5CF6" mx={mSC} onDbl={dblR} pdp={pdp}/>
-        </>)}
+        {/* Full-curve ladders: always render 1M + 3M chain sections so every
+            ccy of the same kind has the same layout. SprChart/SprTbl render
+            an empty-state placeholder if rows is empty. */}
+        <SprChart rows={pkM1} title={`${cfg.pair} 1M Forward-Forward chain`} color="#22D3EE" height={180}/>
+        <SprTbl spreads={pkM1} title={`${cfg.pair} 1M FWD-FWD CHAIN`} color="#22D3EE" mx={mSC} onDbl={dblR} pdp={pdp}/>
+        <SprChart rows={pkM3} title={`${cfg.pair} 3M Forward-Forward chain`} color="#8B5CF6"/>
+        <SprTbl spreads={pkM3} title={`${cfg.pair} 3M FWD-FWD CHAIN`} color="#8B5CF6" mx={mSC} onDbl={dblR} pdp={pdp}/>
       </>)}
 
-      {/* SPREADS & ROLLS TAB — interbank anchors (NDF only) + IMM outrights + IMM rolls.
-          Full-curve ladders (spot-start / 1M chain / 3M chain) live on Full Curve tab. */}
+      {/* SPREADS & ROLLS TAB — interbank anchors (NDF-only by trading-desk
+          convention) + IMM outrights + IMM rolls. Sections always render so
+          every NDF and every deliverable has the same layout. */}
       {tab==="spreads"&&(<div>
-        {cfg.kind==="NDF"&&pkInterbank.length>0&&(<>
+        {cfg.kind==="NDF"&&(<>
           <SprChart rows={pkInterbank} title={`${cfg.pair} Interbank Anchors`} color="#10B981"/>
           <SprTbl spreads={pkInterbank} title={`${cfg.pair} INTERBANK ANCHOR SPREADS`} color="#10B981" mx={mSC} onDbl={dblR} pdp={pdp}/>
         </>)}
-        {immR.length>0&&(<>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginTop:6,marginBottom:6}}>
-            <PChart traces={[{x:immR.map(r=>r.tenor.split(" ")[1]),y:immR.map(r=>r.spM),type:"bar",name:"SwPts",marker:{color:"#3B82F6"}},{x:immR.map(r=>r.tenor.split(" ")[1]),y:immR.map(r=>r.iyM),type:"scatter",mode:"lines+markers",name:"Impl%",line:{color:"#10B981"},yaxis:"y2"}]}
-              layout={{title:{text:`${cfg.pair} IMM Outrights`,font:{size:10}},yaxis:{title:"Pips"},yaxis2:{title:"%",overlaying:"y",side:"right",gridcolor:"transparent"}}} height={185} revisionKey={`imm-outrights-${ccy}`}/>
-            <PChart traces={[{x:immSpr.map(s=>s.label),y:immSpr.map(s=>s.pM),type:"bar",name:"Roll Pips",marker:{color:"#F59E0B"}},{x:immSpr.map(s=>s.label),y:immSpr.map(s=>s.fIy),type:"scatter",mode:"lines+markers",name:"Impl%",line:{color:"#10B981"},yaxis:"y2"}]}
-              layout={{title:{text:`${cfg.pair} IMM Roll Spreads`,font:{size:10}},yaxis:{title:"Pips"},yaxis2:{title:"%",overlaying:"y",side:"right",gridcolor:"transparent"}}} height={185} revisionKey={`imm-rolls-${ccy}`}/>
-          </div>
-          <div style={{background:"#131C2E",borderRadius:5,padding:6,marginBottom:6}}>
-            <div style={{fontSize:9.5,fontWeight:800,color:"#FB923C",marginBottom:3}}>{cfg.pair} IMM OUTRIGHTS</div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginTop:6,marginBottom:6}}>
+          <PChart traces={immR.length>0?[{x:immR.map(r=>r.tenor.split(" ")[1]),y:immR.map(r=>r.spM),type:"bar",name:"SwPts",marker:{color:"#3B82F6"}},{x:immR.map(r=>r.tenor.split(" ")[1]),y:immR.map(r=>r.iyM),type:"scatter",mode:"lines+markers",name:"Impl%",line:{color:"#10B981"},yaxis:"y2"}]:[]}
+            layout={{title:{text:`${cfg.pair} IMM Outrights${immR.length===0?" — no data":""}`,font:{size:10}},yaxis:{title:"Pips"},yaxis2:{title:"%",overlaying:"y",side:"right",gridcolor:"transparent"}}} height={185} revisionKey={`imm-outrights-${ccy}`}/>
+          <PChart traces={immSpr.length>0?[{x:immSpr.map(s=>s.label),y:immSpr.map(s=>s.pM),type:"bar",name:"Roll Pips",marker:{color:"#F59E0B"}},{x:immSpr.map(s=>s.label),y:immSpr.map(s=>s.fIy),type:"scatter",mode:"lines+markers",name:"Impl%",line:{color:"#10B981"},yaxis:"y2"}]:[]}
+            layout={{title:{text:`${cfg.pair} IMM Roll Spreads${immSpr.length===0?" — no data":""}`,font:{size:10}},yaxis:{title:"Pips"},yaxis2:{title:"%",overlaying:"y",side:"right",gridcolor:"transparent"}}} height={185} revisionKey={`imm-rolls-${ccy}`}/>
+        </div>
+        <div style={{background:"#131C2E",borderRadius:5,padding:6,marginBottom:6}}>
+          <div style={{fontSize:9.5,fontWeight:800,color:"#FB923C",marginBottom:3}}>{cfg.pair} IMM OUTRIGHTS</div>
+          {immR.length===0?(
+            <div style={{color:"#475569",fontSize:9,fontStyle:"italic",padding:"6px 0"}}>no IMM data for this currency</div>
+          ):(
             <div style={{overflowX:"auto"}}><table style={{borderCollapse:"collapse",width:"100%",minWidth:1200,fontSize:9}}>
               <thead><tr><th style={{...tS(),textAlign:"left"}}>IMM</th><th style={tS()}>Val Date</th><th style={tS()}>Fix Date</th><th style={tS()}>Days</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#F87171")}>Ask</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#FBBF24")}>Pips</th><th style={tS()}>D/D</th><th style={tS("#34D399")}>Iy Mid</th><th style={tS()}>Iy D/D</th><th style={tS("#FB923C")}>SOFR</th><th style={tS("#C084FC")}>Basis</th><th style={tS("#A78BFA")}>FF</th><th style={tS()}>FF D/D</th><th style={tS("#34D399")}>FF Iy</th></tr></thead>
               <tbody>{immR.map((r,i)=>(<tr key={i} style={{background:i%2===0?"#0F172A":"#131C2E",cursor:"pointer"}} onDoubleClick={()=>dblR(r.tenor,r.spM,true,r.month)}>
@@ -1460,12 +1482,10 @@ export default function Dashboard(){
                 <td style={cS("#FB923C")}>{F(r.sofT,2)}</td><td style={cS(r.basisT!=null&&r.basisT>=0?"#C084FC":"#F472B6")}>{r.basisT!=null?FP(r.basisT*100,1):"—"}</td>
                 <td style={cS(r.ffM>=0?"#A78BFA":"#F472B6")}>{FP(r.ffM,pdp)}</td><td style={{...cS(CC(r.ffChg)),background:HB(r.ffChg,mFC)}}>{FP(r.ffChg,pdp)}</td>
                 <td style={cS("#34D399")}>{F(r.ffIyM,2)}</td>
-              </tr>))}</tbody></table></div></div>
-          {immSpr.length>0&&<SprTbl spreads={immSpr} title={`${cfg.pair} IMM ROLL SPREADS`} color="#F59E0B" mx={mSC} onDbl={dblR} pdp={pdp}/>}
-        </>)}
-        {cfg.kind==="DELIVERABLE"&&pkInterbank.length===0&&immR.length===0&&(
-          <div style={{color:"#64748B",padding:20,fontSize:10}}>No interbank anchors or IMM data available for this currency.</div>
-        )}
+              </tr>))}</tbody></table></div>
+          )}
+        </div>
+        <SprTbl spreads={immSpr} title={`${cfg.pair} IMM ROLL SPREADS`} color="#F59E0B" mx={mSC} onDbl={dblR} pdp={pdp}/>
       </div>)}
 
       {tab==="tools"&&<ToolsPanel ad={ad} onDbl={dblR} ccy={ccy}/>}
