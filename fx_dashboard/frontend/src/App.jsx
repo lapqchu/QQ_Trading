@@ -45,10 +45,17 @@ function PChart({traces,layout,height=190,revisionKey}){
 // new component identity, forcing Plotly to remount and resetting zoom/pan
 // every live-mode tick.
 function SprChart({rows,title,color,height=150}){
+  const xs=rows.map(s=>s.label);
+  const ys=rows.map(s=>s.pM);
+  const iy=rows.map(s=>s.fIy);
+  const hasIy=iy.some(v=>v!=null&&isFinite(v));
+  const traces=[{x:xs,y:ys,type:"bar",name:"Pts",marker:{color:ys.map(v=>v!=null&&v>=0?color:"#F472B6")}}];
+  if(hasIy)traces.push({x:xs,y:iy,type:"scatter",mode:"lines+markers",name:"Impl%",line:{color:"#10B981",width:1.5},marker:{size:3},yaxis:"y2"});
+  const layout={title:{text:title,font:{size:10}},yaxis:{title:"Pts"}};
+  if(hasIy)layout.yaxis2={title:"%",overlaying:"y",side:"right",gridcolor:"transparent"};
   return(
     <div style={{marginBottom:6}}>
-      <PChart traces={[{x:rows.map(s=>s.label),y:rows.map(s=>s.pM),type:"bar",marker:{color}}]}
-        layout={{title:{text:title,font:{size:10}}}} height={height} revisionKey={`spr-${title}`}/>
+      <PChart traces={traces} layout={layout} height={height} revisionKey={`spr-${title}`}/>
     </div>
   );
 }
@@ -338,7 +345,13 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
           setHistSource(d.interpolated?"interpolated":"direct");
         }else{
           setHist(null);
-          setUnavailReason(series.length>0?`Only ${series.length} data points from backend`:"no historical data for this window");
+          // Backend now returns a `reason` field describing why series is empty
+          // (LSEG inactive / no anchor data / sparse curve / past maturity).
+          // Also report ricsRequested vs ricsWithData so the user can see how
+          // many anchor RICs failed.
+          const ricsInfo=d?.ricsRequested!=null?` [${d.ricsWithData||0}/${d.ricsRequested} anchor RICs returned data]`:"";
+          const reason=d?.reason||(series.length>0?`only ${series.length} data points from backend`:"no historical data for this window");
+          setUnavailReason(`${reason}${ricsInfo}`);
         }
         setLoading(false);
       }).catch(err=>{
@@ -722,8 +735,8 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
           <div>
             <PChart traces={priceTraces} layout={{title:{text:`${tenor} ${yLabel}`,font:{size:10,color:"#94A3B8"}},yaxis:{title:yLabel}}} height={210} revisionKey={`hist-${tenor}-${viewMode}`}/>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:4,marginTop:4}}>
-              <PChart traces={rsiTraces} layout={{title:{text:"RSI(14)",font:{size:9,color:"#64748B"}},yaxis:{range:[0,100]},shapes:[{type:"line",y0:70,y1:70,x0:0,x1:1,xref:"paper",line:{color:"#F87171",dash:"dot",width:1}},{type:"line",y0:30,y1:30,x0:0,x1:1,xref:"paper",line:{color:"#4ADE80",dash:"dot",width:1}}]}} height={120}/>
-              <PChart traces={macdTraces} layout={{title:{text:"MACD(12,26,9)",font:{size:9,color:"#64748B"}}}} height={120}/>
+              <PChart traces={rsiTraces} layout={{title:{text:"RSI(14)",font:{size:9,color:"#64748B"}},yaxis:{range:[0,100]},shapes:[{type:"line",y0:70,y1:70,x0:0,x1:1,xref:"paper",line:{color:"#F87171",dash:"dot",width:1}},{type:"line",y0:30,y1:30,x0:0,x1:1,xref:"paper",line:{color:"#4ADE80",dash:"dot",width:1}}]}} height={120} revisionKey={`hist-rsi-${tenor}-${viewMode}`}/>
+              <PChart traces={macdTraces} layout={{title:{text:"MACD(12,26,9)",font:{size:9,color:"#64748B"}}}} height={120} revisionKey={`hist-macd-${tenor}-${viewMode}`}/>
             </div>
           </div>)}
           {viewMode!=="carryDecomp"&&<div style={{background:"#131C2E",borderRadius:5,padding:6,overflow:"auto",maxHeight:460}}>
@@ -749,7 +762,7 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
         {customSeries&&customSeries.series&&customSeries.series.length>0&&(
           <div style={{marginTop:8,background:"#131C2E",borderRadius:5,padding:6}}>
             <div style={{fontSize:9,fontWeight:800,color:"#60A5FA",letterSpacing:".1em",marginBottom:4}}>CUSTOM FWD-FWD SPREAD {customSeries.interpolated&&<span style={{color:"#FBBF24",fontWeight:400,fontSize:8,marginLeft:6}}>interpolated</span>}</div>
-            <PChart traces={[{x:customSeries.series.map(p=>p.date),y:customSeries.series.map(p=>p.spread),type:"scatter",mode:"lines",name:`${customSeries.nearDate} × ${customSeries.farDate}`,line:{color:"#F59E0B",width:1.5}}]} layout={{title:{text:`Fwd-Fwd spread ${customSeries.nearDate} × ${customSeries.farDate}`,font:{size:9}},yaxis:{title:"Pts"}}} height={150}/>
+            <PChart traces={[{x:customSeries.series.map(p=>p.date),y:customSeries.series.map(p=>p.spread),type:"scatter",mode:"lines",name:`${customSeries.nearDate} × ${customSeries.farDate}`,line:{color:"#F59E0B",width:1.5}}]} layout={{title:{text:`Fwd-Fwd spread ${customSeries.nearDate} × ${customSeries.farDate}`,font:{size:9}},yaxis:{title:"Pts"}}} height={150} revisionKey={`custom-spr-${customSeries.nearDate}-${customSeries.farDate}`}/>
           </div>
         )}
         {/* Backtesting */}
@@ -774,8 +787,8 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
             </table>
             {selSt!=null&&btRes[selSt]&&!btRes[selSt].unavail&&(()=>{const st=btRes[selSt];
               return(<div>
-                <PChart traces={[{x:st.dates,y:st.eqC.slice(1),type:"scatter",mode:"lines",name:"Cum P&L (pts)",line:{color:"#10B981",width:1.5}}]} layout={{title:{text:`${st.name} — Cumulative P&L (pts)`,font:{size:9,color:"#94A3B8"}},yaxis:{title:"Points"},shapes:[{type:"line",y0:0,y1:0,x0:0,x1:1,xref:"paper",line:{color:"#475569",dash:"dot"}}]}} height={110}/>
-                <PChart traces={[{x:st.dates,y:st.rollSh,type:"scatter",mode:"lines",name:"Roll 20d Sharpe",line:{color:"#FBBF24",width:1.3}}]} layout={{title:{text:"Rolling 20d Sharpe",font:{size:9,color:"#94A3B8"}},shapes:[{type:"line",y0:0,y1:0,x0:0,x1:1,xref:"paper",line:{color:"#475569",dash:"dot"}}]}} height={100}/>
+                <PChart traces={[{x:st.dates,y:st.eqC.slice(1),type:"scatter",mode:"lines",name:"Cum P&L (pts)",line:{color:"#10B981",width:1.5}}]} layout={{title:{text:`${st.name} — Cumulative P&L (pts)`,font:{size:9,color:"#94A3B8"}},yaxis:{title:"Points"},shapes:[{type:"line",y0:0,y1:0,x0:0,x1:1,xref:"paper",line:{color:"#475569",dash:"dot"}}]}} height={110} revisionKey={`bt-eq-${tenor}-${selSt}-${btPeriod}`}/>
+                <PChart traces={[{x:st.dates,y:st.rollSh,type:"scatter",mode:"lines",name:"Roll 20d Sharpe",line:{color:"#FBBF24",width:1.3}}]} layout={{title:{text:"Rolling 20d Sharpe",font:{size:9,color:"#94A3B8"}},shapes:[{type:"line",y0:0,y1:0,x0:0,x1:1,xref:"paper",line:{color:"#475569",dash:"dot"}}]}} height={100} revisionKey={`bt-sh-${tenor}-${selSt}-${btPeriod}`}/>
               </div>);})()}
           </div>
         </div>
@@ -1279,6 +1292,7 @@ export default function Dashboard(){
   const outPts=chartRows.map(r=>r.spM);
   const ffPts=chartRows.map(r=>r.ffM);
   const iyVals=chartRows.map(r=>r.iyM);
+  const ffIyVals=chartRows.map(r=>r.ffIyM);
   const sofrVals=chartRows.map(r=>r.sofT);
   const basVals=chartRows.map(r=>r.basisT!=null?r.basisT*100:null);
 
@@ -1347,7 +1361,8 @@ export default function Dashboard(){
           <div style={{background:"#1E293B",padding:"2px 6px",borderRadius:4,fontSize:9,fontFamily:"monospace"}}>
             <span style={{color:"#64748B"}}>Spot </span><span style={{color:"#4ADE80"}}>{F(rows[0].bT,dp)}</span><span style={{color:"#334155"}}>/</span><span style={{color:"#F87171"}}>{F(rows[0].aT,dp)}</span><span style={{color:"#334155"}}> | </span><span style={{color:"#FBBF24",fontWeight:700}}>{F(rows[0].mT,dp)}</span>
           </div>
-          {cfg.kind==="NDF"&&rows[1+3]&&(
+          {/* 1M live quote — shown for both NDFs and deliverables for parity. */}
+          {rows.find(r=>r.month===1)&&(
             <div style={{background:"#1E293B",padding:"2px 6px",borderRadius:4,fontSize:9,fontFamily:"monospace"}}>
               <span style={{color:"#64748B"}}>1M </span>
               <span style={{color:"#4ADE80"}}>{F(rows.find(r=>r.month===1)?.bT,dp)}</span>
@@ -1355,7 +1370,7 @@ export default function Dashboard(){
               <span style={{color:"#F87171"}}>{F(rows.find(r=>r.month===1)?.aT,dp)}</span>
               <span style={{color:"#334155"}}> | </span>
               <span style={{color:"#FBBF24",fontWeight:700}}>{F(rows.find(r=>r.month===1)?.mT,dp)}</span>
-              {!snap.deriveFromOutrights&&snap.ndf1mOutright?.sourceLabel&&<span style={{color:"#475569",fontSize:7,marginLeft:3}}>({snap.ndf1mOutright.sourceLabel})</span>}
+              {cfg.kind==="NDF"&&!snap.deriveFromOutrights&&snap.ndf1mOutright?.sourceLabel&&<span style={{color:"#475569",fontSize:7,marginLeft:3}}>({snap.ndf1mOutright.sourceLabel})</span>}
             </div>
           )}
         </div>
@@ -1369,10 +1384,10 @@ export default function Dashboard(){
       {/* MAIN TAB */}
       {tab==="main"&&(<>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:6}}>
-          <PChart traces={[{x:tenors,y:outPts,type:"scatter",mode:"lines+markers",name:"Outright SwPts",line:{color:"#F59E0B"},marker:{size:4}}]} layout={{title:{text:`${cfg.pair} Outright Swap Points (pips)`,font:{size:10}},yaxis:{title:"Swap Points (pips)"}}} height={175} revisionKey={`main-swpts-${ccy}`}/>
-          <PChart traces={[{x:tenors,y:ffPts,type:"bar",name:"1M Fwd-Fwd",marker:{color:ffPts.map(v=>v>=0?"#3B82F6":"#F472B6")}}]} layout={{title:{text:`${cfg.pair} 1M Forward-Forward (pips)`,font:{size:10}}}} height={175} revisionKey={`main-ff-${ccy}`}/>
+          <PChart traces={[{x:tenors,y:outPts,type:"bar",name:"Outright SwPts",marker:{color:outPts.map(v=>v!=null&&v>=0?"#F59E0B":"#F472B6")}},{x:tenors,y:iyVals,type:"scatter",mode:"lines+markers",name:"Impl%",line:{color:"#10B981",width:1.5},marker:{size:3},yaxis:"y2"}]} layout={{title:{text:`${cfg.pair} Outright Swap Points (pips)`,font:{size:10}},yaxis:{title:"Pips"},yaxis2:{title:"%",overlaying:"y",side:"right",gridcolor:"transparent"}}} height={175} revisionKey={`main-swpts-${ccy}`}/>
+          <PChart traces={[{x:tenors,y:ffPts,type:"bar",name:"1M Fwd-Fwd",marker:{color:ffPts.map(v=>v!=null&&v>=0?"#3B82F6":"#F472B6")}},{x:tenors,y:ffIyVals,type:"scatter",mode:"lines+markers",name:"FF Impl%",line:{color:"#10B981",width:1.5},marker:{size:3},yaxis:"y2"}]} layout={{title:{text:`${cfg.pair} 1M Forward-Forward (pips)`,font:{size:10}},yaxis:{title:"Pips"},yaxis2:{title:"%",overlaying:"y",side:"right",gridcolor:"transparent"}}} height={175} revisionKey={`main-ff-${ccy}`}/>
           <PChart traces={[{x:tenors,y:iyVals,type:"scatter",mode:"lines+markers",name:`${cfg.pair.slice(3)} Impl%`,line:{color:"#10B981"},marker:{size:3}},{x:tenors,y:sofrVals,type:"scatter",mode:"lines+markers",name:"SOFR%",line:{color:"#FB923C"},marker:{size:3}}]} layout={{title:{text:`${cfg.pair} Implied Yield vs SOFR (%)`,font:{size:10}},yaxis:{title:"%"}}} height={175} revisionKey={`main-iy-${ccy}`}/>
-          <PChart traces={[{x:tenors,y:basVals,type:"bar",name:"Basis bp",marker:{color:basVals.map(v=>v>=0?"#8B5CF6":"#F472B6")}}]} layout={{title:{text:`${cfg.pair} Basis (bp)`,font:{size:10}}}} height={175} revisionKey={`main-basis-${ccy}`}/>
+          <PChart traces={[{x:tenors,y:basVals,type:"bar",name:"Basis bp",marker:{color:basVals.map(v=>v!=null&&v>=0?"#8B5CF6":"#F472B6")}},{x:tenors,y:iyVals,type:"scatter",mode:"lines+markers",name:"Impl%",line:{color:"#10B981",width:1.5},marker:{size:3},yaxis:"y2"}]} layout={{title:{text:`${cfg.pair} Basis (bp)`,font:{size:10}},yaxis:{title:"bp"},yaxis2:{title:"%",overlaying:"y",side:"right",gridcolor:"transparent"}}} height={175} revisionKey={`main-basis-${ccy}`}/>
         </div>
 
         <div style={{fontSize:8.5,fontWeight:700,color:"#F8FAFC",marginBottom:2}}>OUTRIGHT {cfg.kind==="NDF"?"NDF":"FWD"} CURVE</div>
@@ -1429,9 +1444,9 @@ export default function Dashboard(){
         {immR.length>0&&(<>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginTop:6,marginBottom:6}}>
             <PChart traces={[{x:immR.map(r=>r.tenor.split(" ")[1]),y:immR.map(r=>r.spM),type:"bar",name:"SwPts",marker:{color:"#3B82F6"}},{x:immR.map(r=>r.tenor.split(" ")[1]),y:immR.map(r=>r.iyM),type:"scatter",mode:"lines+markers",name:"Impl%",line:{color:"#10B981"},yaxis:"y2"}]}
-              layout={{title:{text:`${cfg.pair} IMM Outrights`,font:{size:10}},yaxis:{title:"Pips"},yaxis2:{title:"%",overlaying:"y",side:"right",gridcolor:"transparent"}}} height={185}/>
-            <PChart traces={[{x:immSpr.map(s=>s.label),y:immSpr.map(s=>s.pM),type:"bar",name:"Roll Pips",marker:{color:"#F59E0B"}}]}
-              layout={{title:{text:`${cfg.pair} IMM Roll Spreads`,font:{size:10}}}} height={185}/>
+              layout={{title:{text:`${cfg.pair} IMM Outrights`,font:{size:10}},yaxis:{title:"Pips"},yaxis2:{title:"%",overlaying:"y",side:"right",gridcolor:"transparent"}}} height={185} revisionKey={`imm-outrights-${ccy}`}/>
+            <PChart traces={[{x:immSpr.map(s=>s.label),y:immSpr.map(s=>s.pM),type:"bar",name:"Roll Pips",marker:{color:"#F59E0B"}},{x:immSpr.map(s=>s.label),y:immSpr.map(s=>s.fIy),type:"scatter",mode:"lines+markers",name:"Impl%",line:{color:"#10B981"},yaxis:"y2"}]}
+              layout={{title:{text:`${cfg.pair} IMM Roll Spreads`,font:{size:10}},yaxis:{title:"Pips"},yaxis2:{title:"%",overlaying:"y",side:"right",gridcolor:"transparent"}}} height={185} revisionKey={`imm-rolls-${ccy}`}/>
           </div>
           <div style={{background:"#131C2E",borderRadius:5,padding:6,marginBottom:6}}>
             <div style={{fontSize:9.5,fontWeight:800,color:"#FB923C",marginBottom:3}}>{cfg.pair} IMM OUTRIGHTS</div>

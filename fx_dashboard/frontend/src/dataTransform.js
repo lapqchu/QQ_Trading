@@ -405,6 +405,13 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
   const iPtMT1 = mcI(ptT1.days, ptT1.pM), iPtBT1 = mcI(ptT1.days, ptT1.pB), iPtAT1 = mcI(ptT1.days, ptT1.pA);
   const iDT = mcI(ptT.mo, ptT.days), iDT1 = mcI(ptT1.mo, ptT1.days);
   const iST = mcI(sTa.mo, sTa.va), iST1 = mcI(sT1a.mo, sT1a.va);
+  // SOFR is provided at [1,2,3,6,9,12,18,24] months. Calling iST below 1M
+  // extrapolates a monotone-cubic spline below its data range — the result
+  // can be wildly off (negative or huge), making implied yield NaN/null for
+  // weekly and funding tenors. Use 1M SOFR as a flat floor for sub-1M; the
+  // resulting IY error is small and shows a sensible value instead of "—".
+  const sofAt   = (m) => sTa.mo.length  ? iST (Math.max(1, Math.min(m, 24))) : null;
+  const sofAt1  = (m) => sT1a.mo.length ? iST1(Math.max(1, Math.min(m, 24))) : null;
 
   // Issue 3: For deriveFromOutrights ccys, build outright interpolation curves.
   // Interpolate outrights directly (smoother for EGP/NGN), then derive swap points.
@@ -507,8 +514,8 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
       mT1 = spotT1.m != null && spM1 != null ? spotT1.m + spM1 / PF : null;
     }
 
-    const sofTRaw = month > 0 && sTa.mo.length > 0 ? iST(Math.min(month, 24)) : null;
-    const sofT1Raw = month > 0 && sT1a.mo.length > 0 ? iST1(Math.min(month, 24)) : null;
+    const sofTRaw = month > 0 ? sofAt(month) : null;
+    const sofT1Raw = month > 0 ? sofAt1(month) : null;
     const sofT = sofTRaw != null && isFinite(sofTRaw) ? sofTRaw : (month === 0 ? 0 : null);
     const sofT1 = sofT1Raw != null && isFinite(sofT1Raw) ? sofT1Raw : (month === 0 ? 0 : null);
 
@@ -671,7 +678,7 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
               r.mT = spotT.m + r.spM / PF;
             }
             // Recompute IY
-            const sofTR = sTa.mo.length > 0 ? iST(Math.min(r.month, 24)) : null;
+            const sofTR = sofAt(r.month);
             if (r.dT > 0 && r.mT != null && sMT != null && sofTR != null) {
               r.iyM = implYld(r.mT, sMT, sofTR, r.dT);
               r.iyB = implYld(r.bT, sAT, sofTR, r.dT);
@@ -723,8 +730,8 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
         const ptsPrev = iPtMT(td - 1);
         r.carryP = (ptsCur != null && ptsPrev != null) ? ptsPrev - ptsCur : null;
         if (sMT != null) {
-          const sofCur = sTa.mo.length ? iST(Math.min(Math.max(r.month, 0.01), 24)) : null;
-          const sofPrev = sTa.mo.length ? iST(Math.min(Math.max((td - 1) / 30, 0.01), 24)) : sofCur;
+          const sofCur = sofAt(r.month);
+          const sofPrev = sofAt((td - 1) / 30);
           if (ptsCur != null && ptsPrev != null && sofCur != null && sofPrev != null) {
             const iyCur = implYld(sMT + ptsCur / PF, sMT, sofCur, td);
             const iyPrev = td > 1 ? implYld(sMT + ptsPrev / PF, sMT, sofPrev, td - 1) : null;
@@ -739,7 +746,7 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
       const ptsF = r.spM != null ? r.spM : iPtMT(td);
       r.carryP = (ptsShift != null && ptsF != null) ? (ptsShift - ptsF) : null;
       if (sMT != null && shifted > 0 && ptsShift != null && r.iyM != null) {
-        const sofShift = sTa.mo.length ? iST(Math.min(Math.max(shifted / 30, 0.1), 24)) : null;
+        const sofShift = sofAt(shifted / 30);
         if (sofShift != null) {
           const iyShift = implYld(sMT + ptsShift / PF, sMT, sofShift, shifted);
           r.carryY = iyShift != null ? iyShift - r.iyM : null;
@@ -793,8 +800,8 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
       if (spB == null) spB = iPtBT(days);
       if (spA == null) spA = iPtAT(days);
       if (spM1 == null) spM1 = iPtMT1(days);
-      const sof = sTa.mo.length ? iST(1) : null;
-      const sof1 = sT1a.mo.length ? iST1(1) : null;
+      const sof = sofAt(1);
+      const sof1 = sofAt1(1);
       const mT = sMT != null && spM != null ? sMT + spM / PF : null;
       const iyM = implYld(mT, sMT, sof, days);
       return {
@@ -828,8 +835,8 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
       const spM1 = iPtMT1(d);
       const spB1 = iPtBT1(d);
       const spA1 = iPtAT1(d);
-      const sof = sTa.mo.length ? iST(Math.min(Math.max(d / 30, 1), 24)) : null;
-      const sof1 = sT1a.mo.length ? iST1(Math.min(Math.max(d / 30, 1), 24)) : null;
+      const sof = sofAt(d / 30);
+      const sof1 = sofAt1(d / 30);
       const mT = sMT != null && spM != null ? sMT + spM / PF : null;
       const iyM = implYld(mT, sMT, sof, d);
       // Issue 7: wire fixing dates from backend tomfixPlus1bd
@@ -891,7 +898,7 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
     if (newDays <= 0) return null;
     const newPts = iPtMT(newDays);
     if (newPts == null) return null;
-    const sofN = sTa.mo.length ? iST(Math.min(Math.max(newDays / 30, 0.1), 24)) : null;
+    const sofN = sofAt(newDays / 30);
     if (sofN == null) return null;
     const outN = sMT + newPts / PF;
     const iyNew = implYld(outN, sMT, sofN, newDays);
@@ -1322,11 +1329,19 @@ export function calcCustom(ad, nearM, farM, nearDate, farDate, ipaCustom) {
   const nr = nrI >= 0 && nrI <= mT ? rows.find(r => r.month === nrI) : null;
   const fr = frI >= 0 && frI <= mT ? rows.find(r => r.month === frI) : null;
   if (!nr || !fr) return null;
-  const pM = fr.spM != null && nr.spM != null ? fr.spM - nr.spM : null;
-  const pB = fr.spB != null && nr.spA != null ? fr.spB - nr.spA : null;
-  const pA = fr.spA != null && nr.spB != null ? fr.spA - nr.spB : null;
+  // Spot-start (near=spot): pts of spread = pts of far outright (spot has no
+  // swap pts), and the fwd-fwd IY collapses to the far leg's outright IY.
+  // Without this case both pM and fIy become null whenever the user picks
+  // Spot as the near leg in Tools.
+  const isSpotNear = nr.month === 0;
+  const nrSpM = isSpotNear ? 0 : nr.spM;
+  const nrSpB = isSpotNear ? 0 : nr.spB;
+  const nrSpA = isSpotNear ? 0 : nr.spA;
+  const pM = fr.spM != null && nrSpM != null ? fr.spM - nrSpM : null;
+  const pB = fr.spB != null && nrSpA != null ? fr.spB - nrSpA : null;
+  const pA = fr.spA != null && nrSpB != null ? fr.spA - nrSpB : null;
   const ds = fr.dT - nr.dT;
-  const fIy = fwdFwdIy(nr.iyM, nr.dT, fr.iyM, fr.dT);
+  const fIy = isSpotNear ? fr.iyM : fwdFwdIy(nr.iyM, nr.dT, fr.iyM, fr.dT);
   return {
     label: `${nearDate ? fD(nearDate) : `${nrI}M`} × ${farDate ? fD(farDate) : `${frI}M`}`,
     pB, pM, pA, days: ds, fIy,

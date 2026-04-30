@@ -910,22 +910,44 @@ class MarketService:
                 elif m is not None:
                     by_date.setdefault(d[:10], {})[m] = mid
 
+        # For derive_from_outrights ccys (EGP, NGN), the curves above carry
+        # absolute outright prices. Spread = (out_far - out_near) is in price
+        # units; multiply by pip_factor so the frontend gets pips uniformly.
+        out_to_pts = float(cfg.pip_factor) if cfg.derive_from_outrights else 1.0
+
         series = []
+        skipped_past_maturity = 0
+        skipped_curve_sparse = 0
         for d_str, curve in sorted(by_date.items()):
             near_days = (near_d - _parse_iso(d_str)).days
             far_days = (far_d - _parse_iso(d_str)).days
             if near_days < 0 or far_days < 0:
+                skipped_past_maturity += 1
                 continue
             near_val = _interp_curve_days(curve, near_days)
             far_val = _interp_curve_days(curve, far_days)
             if near_val is None or far_val is None:
+                skipped_curve_sparse += 1
                 continue
             series.append({
                 "date": d_str,
                 "near": near_val, "far": far_val,
-                "spread": far_val - near_val,
+                "spread": (far_val - near_val) * out_to_pts,
                 "nearDays": near_days, "farDays": far_days,
             })
+
+        # Diagnostic reason when series is empty so the frontend can surface a
+        # specific message instead of "no historical data for this window".
+        reason = None
+        if not series:
+            if not hist:
+                reason = "LSEG returned no bars (session inactive or RICs invalid)"
+            elif not by_date:
+                reason = f"no anchor RICs returned valid mids ({len(rics) - 1} tenors requested)"
+            elif skipped_past_maturity and not skipped_curve_sparse:
+                reason = "all historical bars are past the requested far_date"
+            elif skipped_curve_sparse:
+                reason = "anchor curve too sparse to interpolate at requested days"
 
         return {
             "ccy": ccy, "pair": cfg.pair,
@@ -934,6 +956,9 @@ class MarketService:
             "contributor": contributor,
             "series": series,
             "interpolated": True,
+            "reason": reason,
+            "ricsRequested": len(rics) - 1,  # exclude spot
+            "ricsWithData": len({m for c in by_date.values() for m in c.keys()}),
         }
 
 
