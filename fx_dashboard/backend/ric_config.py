@@ -290,6 +290,12 @@ class CurrencyConfig:
     # Defaulted per kind in __post_init__.
     extended_tenors_m: List[int] = field(default_factory=list)
 
+    # Turn-date types this currency prices in. Subset of {"YE","QE","ME","LUNAR"}.
+    # Empty -> use default in turns.turn_types_for(cfg) (per-ccy heuristic).
+    # Override here when a desk view differs from the defaults (e.g. switch
+    # off QE for an NDF where market clearly doesn't price quarter-ends).
+    turn_types: List[str] = field(default_factory=list)
+
     def __post_init__(self):
         # Default extended-tenor set: every month 1-12 plus 15/18/21/24,
         # capped at max_display_m. Frontend uses this to know which months

@@ -3,6 +3,7 @@ import React, { useEffect, useMemo, useState, useCallback, useRef } from "react"
 import Plot from "react-plotly.js";
 import { getCurrencies, getHistory, getHistoryCustom, getSnapshot, liveStart, liveStop, openChannel, getIpaForward, t1Backfill } from "./api.js";
 import { buildAllData, calcCustom, valueModeForSource, mergeT1, sourceQuality } from "./dataTransform.js";
+import { bootstrapCleanCurve, spreadRichness } from "./cleanCurve.js";
 import { F, FP, CC, HB, cS, tS, sS, mid, implYld, fwdFwdIy, mcI, calcSMA, calcEMA, calcRSI, calcBB, calcMACD, calcStats, calcZDev, backtest, STRAT_DESCS } from "./calc.js";
 import { fD, daysBtwn, buildIMMDates, computeSpotDate, addMon, bizBefore, dateFromSpot } from "./dates.js";
 
@@ -1150,6 +1151,161 @@ function BrokerMon({ad,liveOn=false}){
   </div>);
 }
 
+// ══════════════════════ CLEAN vs DIRTY ══════════════════════
+// Strips turn-date premiums out of the observed (dirty) swap-point curve to
+// reveal the underlying smooth (clean) term structure. Diff per spread tells
+// you which fwd-fwds are paying you to hold turn risk vs paying premium to
+// be turn-protected.
+function CleanDirtyPanel({ad,snap,onDbl}){
+  const turns=snap?.turns||[];
+  const turnTypes=snap?.turnTypes||[];
+  const cfg=ad?.cfg||{};
+  const ccy=ad?.ccy;
+  const pdp=cfg.pipDp??1;
+  const PF=cfg.pipFactor||1;
+
+  // Build dirty anchor list (filter out spot row, keep month-anchor tenors only)
+  const anchorRows=useMemo(()=>{
+    if(!ad?.rows)return[];
+    return ad.rows
+      .filter(r=>r.month>0&&!r.isWeekly&&r.spM!=null&&isFinite(r.spM)&&(r.dT||0)>0)
+      .map(r=>({tenor:r.tenor,month:r.month,days:r.dT,pts:r.spM}));
+  },[ad?.rows]);
+
+  // Bootstrap on snapshot refresh (NOT on every live tick — turns move slowly).
+  const boot=useMemo(()=>{
+    if(!anchorRows.length||!ad?.SPOT_DATE)return null;
+    return bootstrapCleanCurve({
+      anchors:anchorRows,
+      turns,
+      spotDate:ad.SPOT_DATE,
+      spot:ad.sMT,
+      pipFactor:PF,
+    });
+  },[anchorRows,turns,ad?.SPOT_DATE,ad?.sMT,PF]);
+
+  // Spread richness across all existing fwd-fwd packs we already build.
+  const allSpreads=useMemo(()=>{
+    if(!ad)return[];
+    const out=[];
+    const tag=(arr,group)=>arr.forEach(s=>s&&s.label&&out.push({...s,_group:group}));
+    tag(ad.spreadPacks?.fullCurve?.m1Chain||ad.ff1M||[],"1M chain");
+    tag(ad.spreadPacks?.fullCurve?.m3Chain||ad.ff3M||[],"3M chain");
+    tag(ad.spreadPacks?.spreadsRolls?.interbankAnchors||ad.ibAnchor||[],"Interbank");
+    tag(ad.immSpr||[],"IMM rolls");
+    return out;
+  },[ad]);
+
+  const richness=useMemo(()=>{
+    if(!boot)return[];
+    return allSpreads.map(s=>({...spreadRichness(s,boot)||{},_group:s._group,nrM:s.nrM,frM:s.frM,nrVD:s.nrVD,frVD:s.frVD,fundingTenor:s.fundingTenor}))
+      .filter(r=>r&&r.label!=null&&r.diff!=null);
+  },[allSpreads,boot]);
+
+  // Build clean & dirty pts curves for plotting. Sample at every anchor day +
+  // every turn date so the chart shows the kinks at turn dates.
+  const curveData=useMemo(()=>{
+    if(!boot||!anchorRows.length)return null;
+    const xs=[],dirty=[],clean=[];
+    const pts=[...anchorRows];
+    for(const t of (boot.deltas||[]))pts.push({tenor:t.label,days:t.days,pts:null});
+    pts.sort((a,b)=>a.days-b.days);
+    let cumDelta=0;
+    for(const p of pts){
+      // cumulative delta at this day = sum of deltas with days <= this.days
+      cumDelta=(boot.deltas||[]).filter(d=>d.days<=p.days).reduce((s,d)=>s+(d.deltaPts||0),0);
+      xs.push(p.tenor);
+      const cleanV=boot.cleanCurve(p.days);
+      clean.push(cleanV);
+      dirty.push(cleanV!=null?cleanV+cumDelta:null);
+    }
+    return{xs,dirty,clean};
+  },[boot,anchorRows]);
+
+  if(!turns||!turns.length){
+    return(<div style={{padding:14,fontSize:10,color:"#94A3B8"}}>
+      <div style={{fontSize:11,fontWeight:700,color:"#F8FAFC",marginBottom:6}}>{cfg.pair} CLEAN vs DIRTY</div>
+      <div style={{color:"#64748B"}}>No turn dates configured for {ccy}. Default rules per ccy live in <code>backend/turns.py</code> and <code>CurrencyConfig.turn_types</code>.</div>
+    </div>);
+  }
+  if(!boot){
+    return(<div style={{padding:14,fontSize:10,color:"#94A3B8"}}>
+      <div style={{fontSize:11,fontWeight:700,color:"#F8FAFC",marginBottom:6}}>{cfg.pair} CLEAN vs DIRTY</div>
+      <div style={{color:"#64748B"}}>Bootstrap unavailable — need at least 2 valid anchor swap-point rows. Check that snapshot has live data.</div>
+    </div>);
+  }
+
+  return(<div>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+      <div style={{fontSize:11,fontWeight:800,color:"#F8FAFC"}}>{cfg.pair} CLEAN vs DIRTY <span style={{color:"#64748B",fontWeight:400,fontSize:8}}>· {turns.length} turns · types: {turnTypes.join(", ")||"default"}</span></div>
+      <div style={{fontSize:7.5,color:"#475569"}}>δ {">"} 0 ⇒ turn ADDS to pts (USD funding squeeze direction). Diff {">"} 0 ⇒ spread is paying for turn risk (rich); Diff {"<"} 0 ⇒ paying premium (cheap).</div>
+    </div>
+    {/* Top: clean vs dirty pts curve overlay (full anchor span). */}
+    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:6}}>
+      <PChart traces={[
+        {x:curveData.xs,y:curveData.dirty,type:"scatter",mode:"lines+markers",name:"Dirty (market)",line:{color:"#F59E0B",width:1.6},marker:{size:4}},
+        {x:curveData.xs,y:curveData.clean,type:"scatter",mode:"lines+markers",name:"Clean (turn-stripped)",line:{color:"#10B981",width:1.6,dash:"dot"},marker:{size:4}},
+      ]} layout={{title:{text:`${cfg.pair} Swap-Pts: Clean vs Dirty`,font:{size:10}},yaxis:{title:"Pips"}}} height={210} revisionKey={`cleandirty-curve-${ccy}`}/>
+      <PChart traces={[
+        {x:(boot.deltas||[]).map(d=>d.label),y:(boot.deltas||[]).map(d=>d.deltaPts),type:"bar",name:"δ (pips)",marker:{color:(boot.deltas||[]).map(d=>d.deltaPts>=0?"#3B82F6":"#F472B6")}},
+        {x:(boot.deltas||[]).map(d=>d.label),y:(boot.deltas||[]).map(d=>d.deltaBps),type:"scatter",mode:"lines+markers",name:"δ (bps)",line:{color:"#A78BFA",width:1.5},marker:{size:3},yaxis:"y2"},
+      ]} layout={{title:{text:`${cfg.pair} Per-turn premium δ`,font:{size:10}},yaxis:{title:"Pips"},yaxis2:{title:"bps",overlaying:"y",side:"right",gridcolor:"transparent"}}} height={210} revisionKey={`cleandirty-deltas-${ccy}`}/>
+    </div>
+
+    {/* Middle: turn premium table */}
+    <div style={{background:"#131C2E",borderRadius:5,padding:6,marginBottom:6}}>
+      <div style={{fontSize:9.5,fontWeight:800,color:"#A78BFA",marginBottom:3,letterSpacing:".05em"}}>TURN PREMIUMS — {cfg.pair}</div>
+      <div style={{overflowX:"auto"}}><table style={{borderCollapse:"collapse",width:"100%",fontSize:9,minWidth:700}}>
+        <thead><tr>
+          <th style={{...tS(),textAlign:"left",...STICKY_TH}}>Date</th>
+          <th style={tS()}>Type</th>
+          <th style={tS("#94A3B8")}>Label</th>
+          <th style={tS()}>Days from spot</th>
+          <th style={tS("#FBBF24")} title="Turn delta in pips. > 0 = turn adds to pts.">δ pips</th>
+          <th style={tS("#A78BFA")} title="Turn delta converted to 1d implied yield bps.">δ bps</th>
+        </tr></thead>
+        <tbody>{(boot.deltas||[]).map((d,i)=>{const bg=i%2===0?"#0F172A":"#131C2E";const col=d.deltaPts>=0?"#FBBF24":"#F472B6";return(
+          <tr key={d.date} style={{background:bg}}>
+            <td style={{...cS("#CBD5E1",true),textAlign:"left"}}>{d.date}</td>
+            <td style={cS(d.type==="YE"?"#F87171":d.type==="LUNAR"?"#22D3EE":d.type==="QE"?"#FBBF24":"#94A3B8",true)}>{d.type}</td>
+            <td style={cS("#94A3B8")}>{d.label}</td>
+            <td style={cS("#475569")}>{d.days}</td>
+            <td style={cS(col,true)}>{FP(d.deltaPts,pdp)}</td>
+            <td style={cS(col,true)}>{d.deltaBps!=null?FP(d.deltaBps,2):"—"}</td>
+          </tr>);})}</tbody></table></div>
+    </div>
+
+    {/* Bottom: spread richness — every fwd-fwd we already render, with dirty/clean/diff. */}
+    <div style={{background:"#131C2E",borderRadius:5,padding:6,marginBottom:6}}>
+      <div style={{fontSize:9.5,fontWeight:800,color:"#10B981",marginBottom:3,letterSpacing:".05em"}}>SPREAD RICHNESS — DIRTY vs CLEAN</div>
+      <div style={{overflowX:"auto"}}><table style={{borderCollapse:"collapse",width:"100%",fontSize:9,minWidth:900}}>
+        <thead><tr>
+          <th style={{...tS(),textAlign:"left",...STICKY_TH}}>Spread</th>
+          <th style={tS()}>Group</th>
+          <th style={tS()}>Days</th>
+          <th style={tS("#FBBF24")}>Dirty</th>
+          <th style={tS("#10B981")}>Clean</th>
+          <th style={tS("#A78BFA")} title="Dirty − Clean. Positive = paying you to hold turn risk; negative = paying premium to be turn-protected.">Diff (pips)</th>
+          <th style={tS("#94A3B8")}>Turns spanned</th>
+        </tr></thead>
+        <tbody>{richness.map((r,i)=>{const bg=i%2===0?"#0F172A":"#131C2E";const col=r.diff>=0?"#A78BFA":"#F472B6";const days=r.fDays-r.nDays;
+          return(<tr key={`${r._group}-${r.label}-${i}`} style={{background:bg,cursor:"pointer"}} onDoubleClick={()=>onDbl&&onDbl(r.label,Math.abs(r.dirty)||1,true,null,r.nrM,r.frM,r.nrVD?(r.nrVD instanceof Date?r.nrVD.toISOString().slice(0,10):r.nrVD):null,r.frVD?(r.frVD instanceof Date?r.frVD.toISOString().slice(0,10):r.frVD):null,r.fundingTenor||null)}>
+            <td style={{...cS("#CBD5E1",true),textAlign:"left"}}>{r.label}</td>
+            <td style={cS("#64748B")}>{r._group}</td>
+            <td style={cS("#475569")}>{days}</td>
+            <td style={cS("#FBBF24",true)}>{FP(r.dirty,pdp)}</td>
+            <td style={cS("#10B981",true)}>{FP(r.clean,pdp)}</td>
+            <td style={cS(col,true)}>{FP(r.diff,pdp)}</td>
+            <td style={cS("#94A3B8")}>{r.turns&&r.turns.length?r.turns.map(t=>`${t.type}·${t.label.replace(/^[A-Z]+\s/,'')}`).join(", "):"—"}</td>
+          </tr>);})}</tbody></table></div>
+    </div>
+
+    <div style={{fontSize:7,color:"#475569",marginTop:6}}>
+      Bootstrap: Tikhonov-regularized least squares solving <code>pts_dirty(d) = pts_clean(d) + Σ δ_i 1(t_i ≤ d)</code> with smoothness penalty on the clean curve and ridge on δ. Recomputes on snapshot refresh, not on every live tick (turns move slowly). Edit per-ccy turn types in <code>backend/ric_config.py:turn_types</code>.
+    </div>
+  </div>);
+}
+
 // ══════════════════════ MAIN DASHBOARD ══════════════════════
 export default function Dashboard(){
   const[meta,setMeta]=useState(null);
@@ -1316,7 +1472,7 @@ export default function Dashboard(){
   const sofrVals=chartRows.map(r=>r.sofT);
   const basVals=chartRows.map(r=>r.basisT!=null?r.basisT*100:null);
 
-  const tabs=[{id:"main",label:"Full Curve"},{id:"spreads",label:"Spreads & Rolls"},{id:"tools",label:"Tools"},{id:"broker",label:"Broker Monitor"}];
+  const tabs=[{id:"main",label:"Full Curve"},{id:"spreads",label:"Spreads & Rolls"},{id:"clean",label:"Clean vs Dirty"},{id:"tools",label:"Tools"},{id:"broker",label:"Broker Monitor"}];
 
   return(
     <div style={{background:"#0F172A",color:"#E2E8F0",minHeight:"100vh",fontFamily:"'Inter',system-ui,sans-serif",padding:8}}>
@@ -1488,6 +1644,7 @@ export default function Dashboard(){
         <SprTbl spreads={immSpr} title={`${cfg.pair} IMM ROLL SPREADS`} color="#F59E0B" mx={mSC} onDbl={dblR} pdp={pdp}/>
       </div>)}
 
+      {tab==="clean"&&<CleanDirtyPanel ad={ad} snap={snap} onDbl={dblR}/>}
       {tab==="tools"&&<ToolsPanel ad={ad} onDbl={dblR} ccy={ccy}/>}
       {tab==="broker"&&<BrokerMon ad={ad} liveOn={liveOn}/>}
 

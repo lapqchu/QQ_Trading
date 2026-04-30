@@ -30,6 +30,7 @@ from typing import Dict, List, Any, Optional, Set, Tuple
 from dataclasses import dataclass
 
 from lseg_client import LsegClient
+from turns import generate_turns, turn_types_for
 from ric_config import (
     CURRENCIES, SOFR_RICS, FUNDING_TENORS, BROKER_META,
     CurrencyConfig,
@@ -472,7 +473,39 @@ class MarketService:
             "freshnessThresholdsSec": {"fresh": FRESH_SEC, "stale": STALE_SEC},
             "ipa": ipa,
             "tomfixPlus1bd": tomfix_pl,
+            "turnTypes": turn_types_for(cfg),
+            "turns": self._build_turns_payload(cfg, ipa),
         }
+
+    # ───── turn calendar payload ─────
+    def _build_turns_payload(self, cfg: CurrencyConfig,
+                             ipa: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Generate turn dates for the next 24M anchored to spot.
+        spot_date is derived from the IPA spot bundle when available; otherwise
+        we approximate as today + 2 calendar days (good enough — the bootstrap
+        matches turns to swap value-date windows, so a one-day error is
+        absorbed by the windowing)."""
+        spot_iso = None
+        if ipa:
+            for key in ("spot", "SP", "Spot"):
+                v = ipa.get(key) if isinstance(ipa, dict) else None
+                if v and isinstance(v, dict):
+                    spot_iso = v.get("valueDate") or v.get("startDate")
+                    if spot_iso:
+                        break
+        if not spot_iso:
+            # Fall back: use the 1M tenor's startDate (which is the spot value date)
+            ipa1 = (ipa or {}).get("1M") or {}
+            spot_iso = ipa1.get("startDate")
+        if spot_iso:
+            try:
+                spot_d = date.fromisoformat(spot_iso[:10])
+            except Exception:
+                spot_d = date.today() + timedelta(days=2)
+        else:
+            spot_d = date.today() + timedelta(days=2)
+        turns = generate_turns(turn_types_for(cfg), spot_d, horizon_months=cfg.max_display_m)
+        return [t.to_dict() for t in turns]
 
     # ───── per-tenor bundle ─────
     def _tenor_bundle(self, cfg: CurrencyConfig, m: int,
