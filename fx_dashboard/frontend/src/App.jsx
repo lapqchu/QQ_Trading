@@ -1164,13 +1164,24 @@ function CleanDirtyPanel({ad,snap,onDbl}){
   const pdp=cfg.pipDp??1;
   const PF=cfg.pipFactor||1;
 
-  // Build dirty anchor list (filter out spot row, keep month-anchor tenors only)
+  // Build dirty anchor list (filter out spot row, keep month-anchor tenors only).
+  // Anchor x-axis = days from spot to VALUE date — matches turn x-axis (also
+  // spot→VD) and the value-date semantics of the turn premium (USD held
+  // across the calendar boundary). For NDFs we deliberately do NOT use
+  // r.dT here: dT is today→fixDate (used for implied-yield calc), but the
+  // turn premium kicks in at VALUE-date boundaries, not fixing-date ones.
   const anchorRows=useMemo(()=>{
-    if(!ad?.rows)return[];
+    if(!ad?.rows||!ad?.SPOT_DATE)return[];
     return ad.rows
-      .filter(r=>r.month>0&&!r.isWeekly&&r.spM!=null&&isFinite(r.spM)&&(r.dT||0)>0)
-      .map(r=>({tenor:r.tenor,month:r.month,days:r.dT,pts:r.spM}));
-  },[ad?.rows]);
+      .filter(r=>r.month>0&&!r.isWeekly&&r.spM!=null&&isFinite(r.spM)&&r.valDate)
+      .map(r=>({
+        tenor:r.tenor,
+        month:r.month,
+        days:Math.round((r.valDate-ad.SPOT_DATE)/86400000),
+        pts:r.spM,
+      }))
+      .filter(a=>a.days>0);
+  },[ad?.rows,ad?.SPOT_DATE]);
 
   // Bootstrap on snapshot refresh (NOT on every live tick — turns move slowly).
   const boot=useMemo(()=>{

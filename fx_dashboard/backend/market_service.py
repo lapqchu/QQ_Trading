@@ -482,9 +482,10 @@ class MarketService:
                              ipa: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Generate turn dates for the next 24M anchored to spot.
         spot_date is derived from the IPA spot bundle when available; otherwise
-        we approximate as today + 2 calendar days (good enough — the bootstrap
-        matches turns to swap value-date windows, so a one-day error is
-        absorbed by the windowing)."""
+        we approximate as today + 2 calendar days. Each turn date returned is
+        the post-boundary VALUE date (first biz day at-or-after the new period
+        + T+2 spot offset) — the first FX swap VD that holds USD across the
+        calendar boundary. See turns.py for the full derivation."""
         spot_iso = None
         if ipa:
             for key in ("spot", "SP", "Spot"):
