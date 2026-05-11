@@ -25,6 +25,18 @@ export function daysForCurve(snap, m) {
   return t.days ?? null;
 }
 
+// IY-MATH days policy: ALWAYS spot→value-date (the discount window over which
+// both currency yields accrue). For deliverables this equals daysForCurve;
+// for NDFs they differ by ~2bd (fix is value − 2bd) — using daysFix here
+// systematically biases the implied yield. Use `days` (= ipa.days) when
+// available; otherwise the curve-axis days as a fallback.
+export function daysForIY(snap, m) {
+  if (!snap || !snap.tenors) return null;
+  const t = snap.tenors[m] || snap.tenors[String(m)];
+  if (!t) return null;
+  return t.days ?? daysForCurve(snap, m);
+}
+
 // ── Source-level helpers (exported) ─────────────────────────────────────
 const FRESHNESS_RANK = { fresh: 0, stale: 1, very_stale: 2, unknown: 3 };
 
@@ -448,6 +460,11 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
     const anchorD = isK && month > 0 ? daysForCurve(snap, month) : null;
     const dT = daysOvr || (anchorD != null ? anchorD : (ipaD?.days != null ? Math.round(ipaD.days) : Math.round(iDT(month))));
     const dT1 = daysOvr ? Math.round(iDT1(month) + (daysOvr - iDT(month))) : Math.round(iDT1(month));
+    // daysVal: spot→value-date count for IY math. Equals dT for deliverables;
+    // for NDFs it's typically dT + 2bd (value-date is fix + 2bd settlement).
+    const valD = isK && month > 0 ? daysForIY(snap, month) : null;
+    const daysVal = daysOvr || (valD != null ? valD : (ipaD?.days != null ? Math.round(ipaD.days) : dT));
+    const daysVal1 = dT1; // T-1 IY uses same convention; refine if T-1 IPA available
     let dataSource = month === 0 ? "spot" : isK ? "RIC" : (ipaD ? "IPA" : "interp");
 
     // NOTE: display-pts (spB/spM/spA) are in PIP units regardless of source valueMode.
@@ -519,23 +536,26 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
     const sofT = sofTRaw != null && isFinite(sofTRaw) ? sofTRaw : (month === 0 ? 0 : null);
     const sofT1 = sofT1Raw != null && isFinite(sofT1Raw) ? sofT1Raw : (month === 0 ? 0 : null);
 
+    // IY math: ALWAYS use spot→value-date days (daysVal). Using dT (= daysFix
+    // for NDFs) systematically biases the implied yield by ~2bd worth of
+    // discount, which materially distorts KRW/INR/CNY/etc IY values.
     let iyB, iyM, iyA, iyB1, iyM1, iyA1;
     if (ipaD && ipaD.impliedYield != null && !isK && month > 0) {
       iyM = ipaD.impliedYield;
-      iyB = dT > 0 ? implYld(bT, sAT, sofT, dT) : null;
-      iyA = dT > 0 ? implYld(aT, sBT, sofT, dT) : null;
+      iyB = daysVal > 0 ? implYld(bT, sAT, sofT, daysVal) : null;
+      iyA = daysVal > 0 ? implYld(aT, sBT, sofT, daysVal) : null;
     } else {
-      iyB = dT > 0 ? implYld(bT, sAT, sofT, dT) : null;
-      iyM = dT > 0 ? implYld(mT, sMT, sofT, dT) : null;
-      iyA = dT > 0 ? implYld(aT, sBT, sofT, dT) : null;
+      iyB = daysVal > 0 ? implYld(bT, sAT, sofT, daysVal) : null;
+      iyM = daysVal > 0 ? implYld(mT, sMT, sofT, daysVal) : null;
+      iyA = daysVal > 0 ? implYld(aT, sBT, sofT, daysVal) : null;
     }
-    iyB1 = dT1 > 0 ? implYld(bT1, sAT1, sofT1, dT1) : null;
-    iyM1 = dT1 > 0 ? implYld(mT1, sMT1, sofT1, dT1) : null;
-    iyA1 = dT1 > 0 ? implYld(aT1, sBT1, sofT1, dT1) : null;
+    iyB1 = daysVal1 > 0 ? implYld(bT1, sAT1, sofT1, daysVal1) : null;
+    iyM1 = daysVal1 > 0 ? implYld(mT1, sMT1, sofT1, daysVal1) : null;
+    iyA1 = daysVal1 > 0 ? implYld(aT1, sBT1, sofT1, daysVal1) : null;
 
     const basisT = iyM != null && sofT != null ? iyM - sofT : null;
     const basisT1 = iyM1 != null && sofT1 != null ? iyM1 - sofT1 : null;
-    const iyBpD = iyM != null && dT > 0 ? iyM / 360 * 100 : null;
+    const iyBpD = iyM != null && daysVal > 0 ? iyM / 360 * 100 : null;
 
     const td = TENOR_DATES[Math.round(month)] || {};
     const ipaValDate = ipaD?.valueDate ? new Date(ipaD.valueDate) : null;
@@ -566,7 +586,7 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
 
     return {
       tenor: label || (month === 0 ? "Spot" : month <= 12 ? `${month}M` : month === 24 ? "2Y" : `${month}M`),
-      month, dT, dT1, dataSource,
+      month, dT, dT1, daysVal, daysVal1, dataSource,
       bT, aT, mT, bT1, aT1, mT1,
       spB, spM, spA, spB1, spM1, spA1,
       ptsPerDay: dT > 0 && spM != null ? spM / dT : null,
@@ -702,12 +722,20 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
     r.ffB1 = i === 0 ? 0 : (r.spB1 != null && p?.spA1 != null ? r.spB1 - p.spA1 : null);
     r.ffM1 = i === 0 ? 0 : (r.spM1 != null && p?.spM1 != null ? r.spM1 - p.spM1 : null);
     r.ffA1 = i === 0 ? 0 : (r.spA1 != null && p?.spB1 != null ? r.spA1 - p.spB1 : null);
-    r.ffIyB = p ? fwdFwdIy(p.iyA, p.dT, r.iyB, r.dT) : null;
-    r.ffIyM = p ? fwdFwdIy(p.iyM, p.dT, r.iyM, r.dT) : null;
-    r.ffIyA = p ? fwdFwdIy(p.iyB, p.dT, r.iyA, r.dT) : null;
-    r.ffIyM1 = p ? fwdFwdIy(p.iyM1, p.dT1, r.iyM1, r.dT1) : null;
-    const fwdD = p ? r.dT - p.dT : 0;
-    r.ffSofr = fwdD > 0 && r.sofT != null && p?.sofT != null ? ((1 + r.sofT / 100 * r.dT / 360) / (1 + p.sofT / 100 * p.dT / 360) - 1) * 360 / fwdD * 100 : null;
+    // Fwd-fwd implied yields use spot→value-date days (daysVal), matching the
+    // discount-window convention of the underlying IY math. For deliverables
+    // dT == daysVal so behavior is unchanged; for NDFs this fixes the ~2bd
+    // discounting offset that previously biased ffIy.
+    const pVal = p ? (p.daysVal ?? p.dT) : null;
+    const rVal = r.daysVal ?? r.dT;
+    const pVal1 = p ? (p.daysVal1 ?? p.dT1) : null;
+    const rVal1 = r.daysVal1 ?? r.dT1;
+    r.ffIyB = p ? fwdFwdIy(p.iyA, pVal, r.iyB, rVal) : null;
+    r.ffIyM = p ? fwdFwdIy(p.iyM, pVal, r.iyM, rVal) : null;
+    r.ffIyA = p ? fwdFwdIy(p.iyB, pVal, r.iyA, rVal) : null;
+    r.ffIyM1 = p ? fwdFwdIy(p.iyM1, pVal1, r.iyM1, rVal1) : null;
+    const fwdD = p ? rVal - pVal : 0;
+    r.ffSofr = fwdD > 0 && r.sofT != null && p?.sofT != null ? ((1 + r.sofT / 100 * rVal / 360) / (1 + p.sofT / 100 * pVal / 360) - 1) * 360 / fwdD * 100 : null;
     r.ffBasis = r.ffIyM != null && r.ffSofr != null ? r.ffIyM - r.ffSofr : null;
     r.ffIyBpD = r.ffIyM != null && fwdD > 0 ? r.ffIyM / 360 * 100 : null;
     r.pipChg = r.spM != null && r.spM1 != null ? r.spM - r.spM1 : null;
@@ -939,14 +967,21 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
     const pB = haveT ? fr.spB - nr.spA : null, pM = haveT ? fr.spM - nr.spM : null, pA = haveT ? fr.spA - nr.spB : null;
     const pB1 = haveT1 ? fr.spB1 - nr.spA1 : null, pM1 = haveT1 ? fr.spM1 - nr.spM1 : null, pA1 = haveT1 ? fr.spA1 - nr.spB1 : null;
     const ds = fr.dT - nr.dT;
-    const fIyB = fwdFwdIy(nr.iyA, nr.dT, fr.iyB, fr.dT);
-    const fIy = fwdFwdIy(nr.iyM, nr.dT, fr.iyM, fr.dT);
-    const fIyA = fwdFwdIy(nr.iyB, nr.dT, fr.iyA, fr.dT);
-    const fIy1 = fwdFwdIy(nr.iyM1, nr.dT1, fr.iyM1, fr.dT1);
-    const haveSof = ds > 0 && fr.sofT != null && nr.sofT != null;
-    const haveSof1 = ds > 0 && fr.sofT1 != null && nr.sofT1 != null;
-    const fSof = haveSof ? ((1 + fr.sofT / 100 * fr.dT / 360) / (1 + nr.sofT / 100 * nr.dT / 360) - 1) * 360 / ds * 100 : null;
-    const fSof1 = haveSof1 ? ((1 + fr.sofT1 / 100 * fr.dT1 / 360) / (1 + nr.sofT1 / 100 * nr.dT1 / 360) - 1) * 360 / ds * 100 : null;
+    // Fwd-fwd IY math uses spot→value-date days (daysVal). For NDFs daysVal
+    // = days(spot→value), not daysFix; using dT here previously biased ffIy.
+    const nVal = nr.daysVal ?? nr.dT;
+    const fVal = fr.daysVal ?? fr.dT;
+    const nVal1 = nr.daysVal1 ?? nr.dT1;
+    const fVal1 = fr.daysVal1 ?? fr.dT1;
+    const dsVal = fVal - nVal;
+    const fIyB = fwdFwdIy(nr.iyA, nVal, fr.iyB, fVal);
+    const fIy = fwdFwdIy(nr.iyM, nVal, fr.iyM, fVal);
+    const fIyA = fwdFwdIy(nr.iyB, nVal, fr.iyA, fVal);
+    const fIy1 = fwdFwdIy(nr.iyM1, nVal1, fr.iyM1, fVal1);
+    const haveSof = dsVal > 0 && fr.sofT != null && nr.sofT != null;
+    const haveSof1 = dsVal > 0 && fr.sofT1 != null && nr.sofT1 != null;
+    const fSof = haveSof ? ((1 + fr.sofT / 100 * fVal / 360) / (1 + nr.sofT / 100 * nVal / 360) - 1) * 360 / dsVal * 100 : null;
+    const fSof1 = haveSof1 ? ((1 + fr.sofT1 / 100 * fVal1 / 360) / (1 + nr.sofT1 / 100 * nVal1 / 360) - 1) * 360 / dsVal * 100 : null;
     const bas = fIy != null && fSof != null ? fIy - fSof : null;
     const carry = computeCarry(nr, fr);
     const carryY = computeCarryY(nr, fr);

@@ -799,22 +799,49 @@ class MarketService:
         contributor: if given, use broker RICs for swap pts; else composite.
         extra_rics: optional list of additional RICs (e.g. specific broker feeds the
                     frontend wants alongside composite — per-broker history toggle).
+
+        Response includes `ricMeta` mapping each RIC to:
+            {kind: "spot"|"swap"|"outright"|"sofr"|"funding",
+             month: float|None, source: "composite"|<broker>,
+             valueMode: "pips"|"outright"}
+        Frontend uses valueMode to convert raw bars → display pips correctly per
+        RIC, even when one history mixes RICs of different value modes (e.g. NDF
+        18M composite fallback uses a broker quote in pips while 1–12M composite
+        is in outright differences).
         """
         cfg = CURRENCIES[ccy]
         start, interval = _resolve_period(period)
 
         rics: List[str] = [cfg.spot_ric]
+        ric_meta: Dict[str, Dict[str, Any]] = {
+            cfg.spot_ric: {"kind": "spot", "month": 0, "source": "spot",
+                           "valueMode": "outright", "pipFactor": cfg.pip_factor},
+        }
         # Funding-tenor override: query ON/TN/SN RICs for that single funding tenor.
         if tenor and tenor.upper() in FUNDING_TENORS and cfg.kind == "DELIVERABLE":
             t = tenor.upper()
             base = cfg.funding_ric(t)
             if base:
                 rics.append(base)
+                ric_meta[base] = {"kind": "funding", "month": None,
+                                  "source": "composite",
+                                  "valueMode": cfg.value_mode_for("composite"),
+                                  "pipFactor": cfg.pip_factor, "tenor": t}
             for b in cfg.brokers:
                 br = cfg.funding_ric(t, broker=b)
                 if br:
                     rics.append(br)
+                    ric_meta[br] = {"kind": "funding", "month": None,
+                                    "source": b,
+                                    "valueMode": cfg.value_mode_for(b),
+                                    "pipFactor": cfg.pip_factor, "tenor": t}
             if extra_rics:
+                for er in extra_rics:
+                    if er not in ric_meta:
+                        ric_meta[er] = {"kind": "funding", "month": None,
+                                        "source": "extra",
+                                        "valueMode": cfg.value_mode_for("composite"),
+                                        "pipFactor": cfg.pip_factor, "tenor": t}
                 rics = list(dict.fromkeys(rics + extra_rics))
             end = date.today()
             kwargs = {"rics": rics, "fields": ["BID", "ASK", "TRDPRC_1"],
@@ -828,28 +855,60 @@ class MarketService:
                 "start": start.isoformat() if start else None,
                 "end": end.isoformat(),
                 "contributor": contributor, "tenor": t,
-                "rics": rics, "history": hist,
+                "rics": rics, "ricMeta": ric_meta, "history": hist,
             }
         if contributor:
             for m in cfg.anchor_tenors_m:
-                rics.append(cfg.broker_ric(m, contributor))
+                r = cfg.broker_ric(m, contributor)
+                rics.append(r)
+                ric_meta[r] = {"kind": "swap", "month": m, "source": contributor,
+                               "valueMode": cfg.value_mode_for(contributor),
+                               "pipFactor": cfg.pip_factor}
         else:
             if cfg.derive_from_outrights:
                 # NGN: "composite" history = use first outright broker
                 pri = cfg.outright_source_brokers[0] if cfg.outright_source_brokers else None
                 if pri:
                     for m in cfg.anchor_tenors_m:
-                        rics.append(cfg.outright_ric(m, broker=pri))
+                        r = cfg.outright_ric(m, broker=pri)
+                        rics.append(r)
+                        # outright_ric carries OUTRIGHT prices (not swap pts);
+                        # frontend will diff against spot to derive pts.
+                        ric_meta[r] = {"kind": "outright", "month": m,
+                                       "source": pri,
+                                       "valueMode": "outright",
+                                       "pipFactor": cfg.pip_factor,
+                                       "deriveFromSpot": True}
             else:
                 for m in cfg.anchor_tenors_m:
                     if cfg.kind == "NDF" and m == 18 and cfg.composite_18m_fallback_brokers:
                         # use first fallback broker for 18M composite history
                         b = cfg.composite_18m_fallback_brokers[0]
-                        rics.append(cfg.broker_ric(m, b))
+                        r = cfg.broker_ric(m, b)
+                        rics.append(r)
+                        # CRITICAL: this broker may quote in a different value_mode
+                        # than the composite. ricMeta tags it with the broker's mode
+                        # so the frontend transforms it correctly.
+                        ric_meta[r] = {"kind": "swap", "month": m, "source": b,
+                                       "valueMode": cfg.value_mode_for(b),
+                                       "pipFactor": cfg.pip_factor,
+                                       "fallback": "composite_missing"}
                     else:
-                        rics.append(cfg.swap_points_ric(m))
+                        r = cfg.swap_points_ric(m)
+                        rics.append(r)
+                        ric_meta[r] = {"kind": "swap", "month": m,
+                                       "source": "composite",
+                                       "valueMode": cfg.value_mode_for("composite"),
+                                       "pipFactor": cfg.pip_factor}
 
         if extra_rics:
+            for er in extra_rics:
+                if er not in ric_meta:
+                    # Best-effort tag for extras (frontend should still work).
+                    ric_meta[er] = {"kind": "swap", "month": None,
+                                    "source": "extra",
+                                    "valueMode": cfg.value_mode_for("composite"),
+                                    "pipFactor": cfg.pip_factor}
             rics = list(dict.fromkeys(rics + extra_rics))
 
         # Append SOFR history — single tenor-matched RIC if caller specified `tenor`,
@@ -861,6 +920,11 @@ class MarketService:
                 sofr_rics.append(s)
         if not sofr_rics:
             sofr_rics = list(SOFR_RICS.values())
+        for sr in sofr_rics:
+            if sr not in ric_meta:
+                ric_meta[sr] = {"kind": "sofr", "month": None,
+                                "source": "USD", "valueMode": "pct",
+                                "pipFactor": 1}
         rics = list(dict.fromkeys(rics + sofr_rics))
 
         end = date.today()
@@ -882,6 +946,7 @@ class MarketService:
             "end": end.isoformat(),
             "contributor": contributor,
             "rics": rics,
+            "ricMeta": ric_meta,
             "sofrRics": sofr_rics,
             "history": hist,
         }
@@ -899,18 +964,37 @@ class MarketService:
         cfg = CURRENCIES[ccy]
         start, interval = _resolve_period(period)
 
+        # Build RIC list AND a per-RIC mode tag so we can normalize each bar to
+        # "display pips" regardless of whether the source quotes in pips or in
+        # outright-difference. This is what fixes the silent units-mixing bug
+        # where (e.g.) NDF 18M used a broker fallback in pips while the rest
+        # of the composite curve was in outright units.
+        # mode: "pips" → bar value is already in pips
+        #       "outright" → bar value × pip_factor = pips
+        #       "outright_abs" → bar carries an absolute outright price; pts =
+        #                        (out − spot) × pip_factor (used for EGP/NGN)
         rics: List[str] = [cfg.spot_ric]
+        ric_mode: Dict[str, str] = {cfg.spot_ric: "spot"}
         if contributor:
             for m in cfg.anchor_tenors_m:
-                rics.append(cfg.broker_ric(m, contributor))
+                r = cfg.broker_ric(m, contributor)
+                rics.append(r)
+                ric_mode[r] = cfg.value_mode_for(contributor)
         else:
             for m in cfg.anchor_tenors_m:
                 if cfg.kind == "NDF" and m == 18 and cfg.composite_18m_fallback_brokers:
-                    rics.append(cfg.broker_ric(m, cfg.composite_18m_fallback_brokers[0]))
+                    b = cfg.composite_18m_fallback_brokers[0]
+                    r = cfg.broker_ric(m, b)
+                    rics.append(r)
+                    ric_mode[r] = cfg.value_mode_for(b)
                 elif cfg.derive_from_outrights and cfg.outright_source_brokers:
-                    rics.append(cfg.outright_ric(m, broker=cfg.outright_source_brokers[0]))
+                    r = cfg.outright_ric(m, broker=cfg.outright_source_brokers[0])
+                    rics.append(r)
+                    ric_mode[r] = "outright_abs"
                 else:
-                    rics.append(cfg.swap_points_ric(m))
+                    r = cfg.swap_points_ric(m)
+                    rics.append(r)
+                    ric_mode[r] = cfg.value_mode_for("composite")
 
         end = date.today()
         kwargs = {"rics": rics, "fields": ["BID", "ASK", "TRDPRC_1"],
@@ -924,10 +1008,12 @@ class MarketService:
         if near_d is None or far_d is None:
             raise ValueError(f"invalid dates: near={near_date} far={far_date}")
 
-        # Build per-day curves
-        by_date: Dict[str, Dict[int, float]] = {}          # date → {months: mid}
+        # Build per-day curves of swap points (in display pips).
+        by_date: Dict[str, Dict[int, float]] = {}
         spot_by_date: Dict[str, float] = {}
+        PF = float(cfg.pip_factor)
         for ric, bars in (hist or {}).items():
+            mode = ric_mode.get(ric, "pips")
             for b in bars:
                 d = b.get("Date") or ""
                 if not d:
@@ -937,18 +1023,24 @@ class MarketService:
                 mid = (bid + ask) / 2 if (bid is not None and ask is not None) else last
                 if mid is None:
                     continue
-                # Identify tenor month from ric. Spot ric: no tenor digits.
-                m = _tenor_months_from_ric(ric, cfg)
-                if ric == cfg.spot_ric:
+                if mode == "spot":
                     spot_by_date[d[:10]] = mid
-                elif m is not None:
-                    by_date.setdefault(d[:10], {})[m] = mid
+                    continue
+                m = _tenor_months_from_ric(ric, cfg)
+                if m is None:
+                    continue
+                if mode == "outright":
+                    pts_pips = mid * PF
+                elif mode == "outright_abs":
+                    spot_for_d = spot_by_date.get(d[:10])
+                    if spot_for_d is None:
+                        continue  # outright_abs requires spot for the same date
+                    pts_pips = (mid - spot_for_d) * PF
+                else:  # "pips"
+                    pts_pips = mid
+                by_date.setdefault(d[:10], {})[m] = pts_pips
 
-        # For derive_from_outrights ccys (EGP, NGN), the curves above carry
-        # absolute outright prices. Spread = (out_far - out_near) is in price
-        # units; multiply by pip_factor so the frontend gets pips uniformly.
-        out_to_pts = float(cfg.pip_factor) if cfg.derive_from_outrights else 1.0
-
+        # Curves are now uniformly in display pips → spread = (far − near) pips.
         series = []
         skipped_past_maturity = 0
         skipped_curve_sparse = 0
@@ -966,7 +1058,7 @@ class MarketService:
             series.append({
                 "date": d_str,
                 "near": near_val, "far": far_val,
-                "spread": (far_val - near_val) * out_to_pts,
+                "spread": far_val - near_val,
                 "nearDays": near_days, "farDays": far_days,
             })
 

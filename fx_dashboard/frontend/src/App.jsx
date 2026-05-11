@@ -2,7 +2,7 @@
 import React, { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import Plot from "react-plotly.js";
 import { getCurrencies, getHistory, getHistoryCustom, getSnapshot, liveStart, liveStop, openChannel, getIpaForward, t1Backfill } from "./api.js";
-import { buildAllData, calcCustom, valueModeForSource, mergeT1, sourceQuality } from "./dataTransform.js";
+import { buildAllData, calcCustom, mergeT1, sourceQuality } from "./dataTransform.js";
 import { bootstrapCleanCurve, spreadRichness } from "./cleanCurve.js";
 import { F, FP, CC, HB, cS, tS, sS, mid, implYld, fwdFwdIy, mcI, calcSMA, calcEMA, calcRSI, calcBB, calcMACD, calcStats, calcZDev, backtest, STRAT_DESCS } from "./calc.js";
 import { fD, daysBtwn, buildIMMDates, computeSpotDate, addMon, bizBefore, dateFromSpot } from "./dates.js";
@@ -87,6 +87,34 @@ function barMid(bar){
   return null;
 }
 
+// ── Per-RIC bar → display-pip value ──
+// Uses ricMeta from the backend so every RIC is normalized into the same units
+// (display pips), even when one history mixes RICs of different value modes.
+// Without this, a single composite-fallback broker RIC at 18M (in pips) was
+// being charted alongside outright-mode 1M-12M anchors, producing curves with
+// the wrong magnitude and "live vs last" mismatches by a factor of pipFactor.
+//   "pips"          → value (already in pips)
+//   "outright"      → value × pipFactor (small outright-difference → pips)
+//   "outright_abs"  → (value − spotForDate) × pipFactor (carries spot-relative diff)
+//   "spot" / "sofr" → returned as-is (callers handle separately)
+function barPipValue(bar, ric, ricMeta, spotForDate){
+  const raw = barMid(bar);
+  if (raw == null) return null;
+  const meta = ricMeta && ricMeta[ric];
+  if (!meta) return raw;
+  const pf = meta.pipFactor || 1;
+  if (meta.kind === "spot" || meta.kind === "sofr") return raw;
+  if (meta.deriveFromSpot && meta.valueMode === "outright_abs") {
+    if (spotForDate == null) return null;
+    return (raw - spotForDate) * pf;
+  }
+  // Funding (ON/TN/SN) bars carry the same value_mode as the source quote —
+  // composite NAB on MXN funding is "outright" while BGCP is "pips" — so we
+  // honor meta.valueMode just like swap-pt RICs.
+  if (meta.valueMode === "outright") return raw * pf;
+  return raw; // "pips"
+}
+
 // ── Build a per-date SOFR map from history response, picking the RIC whose
 //    tenor is closest to `targetMonths`. Returns { "YYYY-MM-DD": sofr% }.
 function buildSofrHist(data,targetMonths){
@@ -132,24 +160,52 @@ function tenorToMonth(tenor){
   return n;
 }
 
-// ── Build historical timeseries for any tenor ──
-// Strategy: 1) try direct RIC match, 2) if not found, interpolate from all anchor histories
+// ── Build per-date spot map (for outright_abs RICs that need spot to derive pts) ──
+function buildSpotMap(data){
+  if(!data?.history)return{};
+  const ricMeta=data.ricMeta||{};
+  const out={};
+  for(const[ric,meta]of Object.entries(ricMeta)){
+    if(meta?.kind!=="spot")continue;
+    const bars=data.history[ric]||[];
+    for(const b of bars){
+      const v=barMid(b);
+      if(v==null||!b.Date)continue;
+      out[b.Date.slice(0,10)]=v;
+    }
+  }
+  return out;
+}
+
+// ── Build historical timeseries for any tenor — values returned in DISPLAY PIPS ──
+// Per-RIC normalization via ricMeta means callers no longer need to scale by pipMul:
+// every bar is already in pips regardless of source value_mode.
+// Strategy: 1) try direct RIC match, 2) if not found, interpolate from all anchor histories.
 function buildHistoryForTenor(data,tenor,isSwapPts,monthHint){
   if(!data?.history)return{pts:null,source:null};
   const rics=Object.keys(data.history);
   if(!rics.length)return{pts:null,source:null};
+  const ricMeta=data.ricMeta||{};
+  const spotMap=buildSpotMap(data);
 
-  // Step 1: try direct match
+  // Step 1: try direct match. Skip the spot RIC for swap-pt charts (it's not a swap-pt RIC).
   const tenorClean=tenor.replace(/\s/g,'');
   let targetRic=null;
   for(const ric of rics){
+    const meta=ricMeta[ric];
+    if(meta?.kind==="spot")continue;
+    if(meta?.kind==="sofr")continue;
     if(tenorClean==='Spot'&&!ric.match(/\d+(M|Y|W)/i)){targetRic=ric;break;}
     if(ric.includes(tenorClean)||ric.includes(tenorClean.replace('M','MNDF'))){targetRic=ric;break;}
   }
   if(targetRic){
     const bars=data.history[targetRic];
     if(bars&&bars.length>0){
-      const pts=bars.map(bar=>({date:new Date(bar.Date),value:barMid(bar)})).filter(p=>p.value!=null&&!isNaN(p.value));
+      const pts=bars.map(bar=>{
+        const iso=bar.Date?bar.Date.slice(0,10):null;
+        const sp=iso?spotMap[iso]:null;
+        return{date:new Date(bar.Date),value:barPipValue(bar,targetRic,ricMeta,sp)};
+      }).filter(p=>p.value!=null&&!isNaN(p.value));
       if(pts.length>10)return{pts,source:'direct'};
     }
   }
@@ -158,25 +214,30 @@ function buildHistoryForTenor(data,tenor,isSwapPts,monthHint){
   const targetM=monthHint??tenorToMonth(tenor);
   if(targetM==null||targetM===0)return{pts:null,source:null};
 
-  // Build per-RIC: {month, bars[]}
+  // Build per-RIC: {month, ric, bars[]}. Use ricMeta.month when available (more reliable
+  // than parsing the RIC string), fall back to ricToMonth.
   const anchorData=[];
   for(const ric of rics){
-    const m=ricToMonth(ric);
-    if(m<=0)continue; // skip spot RIC (we add spot=0 synthetically below)
+    const meta=ricMeta[ric];
+    if(meta?.kind==="spot"||meta?.kind==="sofr"||meta?.kind==="funding")continue;
+    const m=meta?.month!=null?meta.month:ricToMonth(ric);
+    if(m==null||m<=0)continue;
     const bars=data.history[ric];
     if(!bars||!bars.length)continue;
-    anchorData.push({month:m,bars});
+    anchorData.push({month:m,ric,bars});
   }
   if(anchorData.length<1)return{pts:null,source:null};
   anchorData.sort((a,b)=>a.month-b.month);
 
-  // Build date-indexed map: date → {month: value, ...}
+  // Build date-indexed map: date → {month: pipValue, ...} — already normalized.
   const dateMap=new Map();
-  for(const{month,bars}of anchorData){
+  for(const{month,ric,bars}of anchorData){
     for(const bar of bars){
       const d=bar.Date;
       if(!d)continue;
-      const v=barMid(bar);
+      const iso=d.slice(0,10);
+      const sp=spotMap[iso];
+      const v=barPipValue(bar,ric,ricMeta,sp);
       if(v==null)continue;
       if(!dateMap.has(d))dateMap.set(d,{});
       dateMap.get(d)[month]=v;
@@ -208,23 +269,43 @@ function buildHistoryForTenor(data,tenor,isSwapPts,monthHint){
   return{pts:pts.length>0?pts:null,source:pts.length>0?'interpolated':null};
 }
 
-// ── Build historical spread timeseries from two tenor legs ──
-// For rolling spreads (e.g. 1Mx3M): get each leg's history, compute spread day-by-day
+// ── Build historical spread timeseries from two tenor legs (in DISPLAY PIPS) ──
+// For rolling spreads (e.g. 1Mx3M): get each leg's history, compute spread day-by-day.
 function buildSpreadHistory(data,nearM,farM){
   if(!data?.history)return{pts:null,source:null};
   const rics=Object.keys(data.history);
   if(!rics.length)return{pts:null,source:null};
+  const ricMeta=data.ricMeta||{};
+  const spotMap=buildSpotMap(data);
 
-  // Helper: get history for a specific month (direct or interpolated)
+  // Helper: get history for a specific month (direct or interpolated), in display pips.
   function getMonthSeries(targetM){
+    // Spot leg: synthesize zero swap-pts series from any RIC's bar dates.
+    if(targetM===0){
+      const map=new Map();
+      for(const ric of rics){
+        const meta=ricMeta[ric];
+        if(meta?.kind==="sofr"||meta?.kind==="funding")continue;
+        const bars=data.history[ric]||[];
+        for(const b of bars){if(b.Date)map.set(b.Date,0);}
+      }
+      return{map,source:map.size>0?'synthetic_spot':null};
+    }
     // Try direct RIC match first
     for(const ric of rics){
-      const m=ricToMonth(ric);
+      const meta=ricMeta[ric];
+      if(meta?.kind==="spot"||meta?.kind==="sofr"||meta?.kind==="funding")continue;
+      const m=meta?.month!=null?meta.month:ricToMonth(ric);
       if(m===targetM){
         const bars=data.history[ric];
         if(bars&&bars.length>0){
           const map=new Map();
-          for(const bar of bars){const v=barMid(bar);if(v!=null&&bar.Date)map.set(bar.Date,v);}
+          for(const bar of bars){
+            const iso=bar.Date?bar.Date.slice(0,10):null;
+            const sp=iso?spotMap[iso]:null;
+            const v=barPipValue(bar,ric,ricMeta,sp);
+            if(v!=null&&bar.Date)map.set(bar.Date,v);
+          }
           if(map.size>5)return{map,source:'direct'};
         }
       }
@@ -232,20 +313,31 @@ function buildSpreadHistory(data,nearM,farM){
     // Interpolate from all available anchors
     const anchorData=[];
     for(const ric of rics){
-      const m=ricToMonth(ric);
-      if(m<=0)continue;
+      const meta=ricMeta[ric];
+      if(meta?.kind==="spot"||meta?.kind==="sofr"||meta?.kind==="funding")continue;
+      const m=meta?.month!=null?meta.month:ricToMonth(ric);
+      if(m==null||m<=0)continue;
       const bars=data.history[ric];
       if(!bars||!bars.length)continue;
-      anchorData.push({month:m,bars});
+      anchorData.push({month:m,ric,bars});
     }
     if(anchorData.length<2)return{map:new Map(),source:null};
     anchorData.sort((a,b)=>a.month-b.month);
     const months=anchorData.map(a=>a.month);
     if(targetM<months[0]||targetM>months[months.length-1])return{map:new Map(),source:null};
-    // Build date-indexed anchor data
+    // Build date-indexed anchor data (in display pips)
     const dateMap=new Map();
-    for(const{month,bars}of anchorData){
-      for(const bar of bars){const d=bar.Date;if(!d)continue;const v=barMid(bar);if(v==null)continue;if(!dateMap.has(d))dateMap.set(d,{});dateMap.get(d)[month]=v;}
+    for(const{month,ric,bars}of anchorData){
+      for(const bar of bars){
+        const d=bar.Date;
+        if(!d)continue;
+        const iso=d.slice(0,10);
+        const sp=spotMap[iso];
+        const v=barPipValue(bar,ric,ricMeta,sp);
+        if(v==null)continue;
+        if(!dateMap.has(d))dateMap.set(d,{});
+        dateMap.get(d)[month]=v;
+      }
     }
     const map=new Map();
     for(const[d,vals]of dateMap){
@@ -263,7 +355,7 @@ function buildSpreadHistory(data,nearM,farM){
   const farSeries=getMonthSeries(farM);
   if(!nearSeries.source||!farSeries.source)return{pts:null,source:null};
 
-  // Compute spread day-by-day: far - near
+  // Compute spread day-by-day: far - near (both already in pips)
   const sortedDates=[...new Set([...nearSeries.map.keys(),...farSeries.map.keys()])].sort();
   const pts=[];
   for(const d of sortedDates){
@@ -306,13 +398,13 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
   const anchorSet=new Set(snap?.anchorTenorsM||snap?.tenorsM||[1,2,3,6,9,12,18,24]);
   const bothLegsAnchor=nrM!=null&&frM!=null&&(nrM===0||anchorSet.has(nrM))&&anchorSet.has(frM);
   const useBackendCustom=!!(nrDate&&frDate)&&!bothLegsAnchor;
-  // Pip-convention transform: raw history values → displayed (pip) values.
+  // History values are returned in DISPLAY PIPS by buildHistoryForTenor /
+  // buildSpreadHistory (per-RIC normalization via ricMeta), so transformPts is
+  // a passthrough now. Kept as a thin wrapper for null-filtering.
   const PF=snap?.pipFactor||1e3;
-  const vm=valueModeForSource(snap,contributor);
-  const pipMul=vm==="outright"?PF:1;
   function transformPts(rawPts){
     if(!rawPts)return rawPts;
-    return rawPts.map(p=>({date:p.date,value:p.value==null?null:p.value*pipMul})).filter(p=>p.value!=null&&!isNaN(p.value));
+    return rawPts.map(p=>({date:p.date,value:p.value==null?null:p.value})).filter(p=>p.value!=null&&!isNaN(p.value));
   }
   useEffect(()=>{
     let cancelled=false;
@@ -324,21 +416,23 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
       getHistory(ccy,{period,contributor,tenor:fundingTenor}).then(data=>{
         if(cancelled)return;
         const rics=Object.keys(data?.history||{});
+        const ricMeta=data?.ricMeta||{};
+        const spotMap=buildSpotMap(data);
         // Pick the first funding RIC (prefer one matching contributor suffix, else base).
         let chosen=null;
         for(const r of rics){if(r.includes(`${fundingTenor}=`)&&(!contributor||r.endsWith(contributor))){chosen=r;break;}}
         if(!chosen)for(const r of rics){if(r.includes(`${fundingTenor}=`)){chosen=r;break;}}
         const bars=chosen?data.history[chosen]:[];
-        const rawPts=bars.map(b=>({date:new Date(b.Date),value:barMid(b)})).filter(p=>p.value!=null&&!isNaN(p.value));
+        const rawPts=bars.map(b=>{
+          const iso=b.Date?b.Date.slice(0,10):null;
+          const sp=iso?spotMap[iso]:null;
+          return{date:new Date(b.Date),value:barPipValue(b,chosen,ricMeta,sp)};
+        }).filter(p=>p.value!=null&&!isNaN(p.value));
         if(rawPts.length>10){
           setRawHist(rawPts);
           setHist(transformPts(rawPts));
           setHistSource('direct');
-          // Extract spot series too
-          const spotRic=rics.find(r=>r.match(/^[A-Z]{6}=$/));
-          const sMap={};
-          if(spotRic&&data.history[spotRic]){for(const b of data.history[spotRic]){const v=barMid(b);if(v!=null&&b.Date)sMap[b.Date]=v;}}
-          setSpotHist(sMap);
+          setSpotHist(spotMap);
           setSofrHist(buildSofrHist(data,fundingTenor==="ON"||fundingTenor==="TN"||fundingTenor==="SN"?"1M":null));
         }else{setHist(null);setRawHist(null);setUnavailReason(`No funding history for ${fundingTenor}`);}
         setLoading(false);
@@ -383,12 +477,8 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
         setRawHist(pts);
         setHist(transformPts(pts));
         setHistSource(source);
-        // Extract spot series (for IY view)
-        const rics=Object.keys(data.history||{});
-        const spotRic=rics.find(r=>r.match(/^[A-Z]{6}=$/));
-        const sMap={};
-        if(spotRic&&data.history[spotRic]){for(const b of data.history[spotRic]){const v=barMid(b);if(v!=null&&b.Date)sMap[b.Date]=v;}}
-        setSpotHist(sMap);
+        // Extract spot series (for IY view) — uses ricMeta when available.
+        setSpotHist(buildSpotMap(data));
         // Build SOFR-per-date history for IY view: pick RIC matching current tenor, else fall back.
         setSofrHist(buildSofrHist(data,monthHint||(nrM!=null&&frM!=null?(frM-nrM):null)));
       }else{
@@ -440,22 +530,38 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
   },[ccy,customNear,customFar,period,contributor,nrDate,frDate]);
   // Tenor days — use IPA-derived days from the snapshot (same as live display),
   // NOT a per-bar changing value. This keeps PPD consistent with the live table.
-  const tenorDays=(()=>{
+  // For NDFs the row's dT is daysFix (today→fix) which is right for curve
+  // INTERPOLATION but NOT for IY math. For IY we want days(spot→value-date),
+  // which is row.daysVal (added below) or snap.tenors[m].days.
+  const tenorDaysCurve=(()=>{
     if(fundingTenor==="ON")return 1; if(fundingTenor==="TN")return 1; if(fundingTenor==="SN")return 1;
     if(nrM!=null&&frM!=null){
-      // Try to get exact days from snapshot rows
       const nrRow=ad?.rows?.find(x=>x.month===nrM);
       const frRow=ad?.rows?.find(x=>x.month===frM);
       if(nrRow&&frRow&&frRow.dT!=null&&nrRow.dT!=null)return Math.max(1,frRow.dT-nrRow.dT);
       return Math.max(1,(frM-nrM)*30);
     }
     if(monthHint!=null){
-      // Try to get exact days from snapshot row
       const row=ad?.rows?.find(x=>x.month===monthHint);
       if(row&&row.dT!=null)return Math.max(1,row.dT);
       return Math.max(1,Math.round(monthHint*30));
     }
     return 30;
+  })();
+  const tenorDays=tenorDaysCurve; // back-compat alias for PPD etc.
+  // IY math days: spot→value-date. Falls back to tenorDaysCurve if not set.
+  const tenorDaysVal=(()=>{
+    if(fundingTenor==="ON")return 1; if(fundingTenor==="TN")return 1; if(fundingTenor==="SN")return 1;
+    if(nrM!=null&&frM!=null){
+      const nrRow=ad?.rows?.find(x=>x.month===nrM);
+      const frRow=ad?.rows?.find(x=>x.month===frM);
+      if(nrRow&&frRow&&frRow.daysVal!=null&&nrRow.daysVal!=null)return Math.max(1,frRow.daysVal-nrRow.daysVal);
+    }
+    if(monthHint!=null){
+      const row=ad?.rows?.find(x=>x.month===monthHint);
+      if(row&&row.daysVal!=null)return Math.max(1,row.daysVal);
+    }
+    return tenorDaysCurve;
   })();
   // Current SOFR for this tenor from live snapshot (approximation — SOFR history not fetched).
   const currentSofr=(()=>{
@@ -469,26 +575,30 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
     if(viewMode==="swap"){vals=hist.map(h=>h.value);}
     else if(viewMode==="ppd"){vals=hist.map(h=>h.value*365/Math.max(tenorDays,1)/PF);}
     else if(viewMode==="iy"){
-      // Need spot per date + fwdPoints (raw) + current SOFR (approximation).
+      // hist[i].value is in display PIPS (per-RIC normalized). For a spot-start
+      // tenor: fwd outright = spot + pips/pipFactor.
+      // For a SPREAD (nrM/frM both set), the value IS already a pts spread —
+      // need fwd-fwd IY which requires both legs' outrights. Falling back to
+      // simple "ppd-equivalent" interpretation: ratio change relative to spot.
+      // For IY math days, use spot→value-date count (tenorDaysVal), not
+      // daysFix — the latter underestimates the discount window for NDFs.
       vals=hist.map((h,i)=>{
-        const raw=rawHist?.[i]?.value;
-        if(raw==null)return null;
+        const pipVal=rawHist?.[i]?.value;
+        if(pipVal==null)return null;
         const iso=h.date instanceof Date?h.date.toISOString().slice(0,10):null;
         const spot=spotHist?.[iso]??ad?.sMT;
-        // Prefer per-date SOFR from history; fall back to previous bar; then current snapshot.
         let sofrForDate=null;
         if(sofrHist&&iso){
           sofrForDate=sofrHist[iso];
           if(sofrForDate==null){
-            // walk back up to 7 days
             const d=new Date(iso);
             for(let k=1;k<=7&&sofrForDate==null;k++){d.setDate(d.getDate()-1);const key=d.toISOString().slice(0,10);sofrForDate=sofrHist[key];}
           }
         }
         if(sofrForDate==null)sofrForDate=currentSofr;
         if(spot==null||sofrForDate==null)return null;
-        const fwd=vm==="outright"?spot+raw:spot+raw/PF;
-        return implYld(fwd,spot,sofrForDate,tenorDays);
+        const fwd=spot+pipVal/PF;
+        return implYld(fwd,spot,sofrForDate,tenorDaysVal);
       });
     }
   }
@@ -518,119 +628,135 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
   },[vHist,btPeriod]);
   const[selSt,setSelSt]=useState(null);const[hovSt,setHovSt]=useState(null);
 
-  // ── Issue 6: Carry Decomposition ──
-  // For each historical date, decompose total P&L into carry (curve roll-down) + market move.
+  // ── Carry Decomposition (constant-tenor methodology) ──
+  // The previous version used FIXED near/far value dates from today's snapshot
+  // and walked history backwards — which means the same trade got OLDER as we
+  // went back in time (a "1M trade today" was a "13M trade a year ago"). That
+  // is not what FX traders mean by carry decomp.
+  //
+  // Constant-tenor decomposition: at each historical date t, hold a position
+  // at FIXED tenor τ (e.g. constant 30d). Daily P&L from t-1 to t is:
+  //
+  //   Spot-start SPxτ:
+  //     P&L_t  = pts_t(τ−1) − pts_{t−1}(τ)
+  //     Carry  = pts_{t−1}(τ−1) − pts_{t−1}(τ)   (roll-down on yesterday's curve)
+  //     Move   = pts_t(τ−1)    − pts_{t−1}(τ−1)  (curve shift at the new tenor)
+  //     ⇒ Carry + Move = P&L_t  (identity)
+  //
+  //   Fwd-fwd N×F (held at constant N×F days):
+  //     spread(d_n,d_f) = pts(d_f) − pts(d_n)
+  //     P&L_t  = spread_t(N−1, F−1) − spread_{t−1}(N, F)
+  //     Carry  = spread_{t−1}(N−1, F−1) − spread_{t−1}(N, F)
+  //     Move   = spread_t(N−1, F−1)    − spread_{t−1}(N−1, F−1)
+  //
+  // Curve construction uses the ricMeta-normalized per-date anchor bars (in
+  // display pips). For weekend/missing days we just skip rather than scaling
+  // by gap-days; the cumulative is still in pips.
   const carryDecomp=useMemo(()=>{
     if(!rawHistData?.history||!isSwapPts)return null;
-    // Determine near/far dates. For spot-start, nearDate=spot, farDate=tenor VD.
-    // For fwd-fwd, both come from the spread row.
-    const spotDate=ad?.SPOT_DATE||computeSpotDate();
-    let nearDate=null,farDate=null;
+
+    // Determine constant target tenor in days (today's snapshot is the
+    // reference for τ — same as live row's curve days).
+    let nearDays=0, farDays=0;
     if(nrM!=null&&frM!=null){
-      // Fwd-fwd spread: use value dates from rows
       const nrRow=ad?.rows?.find(x=>x.month===nrM);
       const frRow=ad?.rows?.find(x=>x.month===frM);
-      nearDate=nrRow?.valDate??(nrM===0?spotDate:null);
-      farDate=frRow?.valDate??null;
+      nearDays=nrRow?.dT??Math.max(0,Math.round(nrM*30));
+      farDays =frRow?.dT??Math.max(0,Math.round(frM*30));
     }else{
-      // Spot-start tenor
-      nearDate=spotDate;
       const mh=monthHint||1;
       const row=ad?.rows?.find(x=>x.month===mh);
-      farDate=row?.valDate??null;
+      nearDays=0;
+      farDays =row?.dT??Math.max(1,Math.round(mh*30));
     }
-    if(!nearDate||!farDate)return null;
-    nearDate=nearDate instanceof Date?nearDate:new Date(nearDate);
-    farDate=farDate instanceof Date?farDate:new Date(farDate);
+    if(farDays<=0||farDays<=nearDays)return null;
 
-    // Build per-date curves from anchor tenor history bars
+    // Build per-date anchor curves from history bars (per-RIC normalized to pips).
+    const ricMeta=rawHistData.ricMeta||{};
+    const spotMap=buildSpotMap(rawHistData);
     const rics=Object.keys(rawHistData.history);
     const anchorData=[];
     for(const ric of rics){
-      const m=ricToMonth(ric);
-      if(m<0)continue;
+      const meta=ricMeta[ric];
+      if(meta?.kind==="spot"||meta?.kind==="sofr"||meta?.kind==="funding")continue;
+      const m=meta?.month!=null?meta.month:ricToMonth(ric);
+      if(m==null||m<=0)continue;
       const bars=rawHistData.history[ric];
       if(!bars||!bars.length)continue;
-      anchorData.push({month:m,bars});
+      anchorData.push({month:m,ric,bars});
     }
     if(anchorData.length<2)return null;
 
-    // Build date-indexed map: date -> {month: value, ...}
+    // date → {months_in_days: pipValue}
     const dateMap=new Map();
-    for(const{month,bars}of anchorData){
+    for(const{month,ric,bars}of anchorData){
       for(const bar of bars){
         const d=bar.Date?.slice(0,10);
         if(!d)continue;
-        const v=barMid(bar);
+        const sp=spotMap[d];
+        const v=barPipValue(bar,ric,ricMeta,sp);
         if(v==null)continue;
         if(!dateMap.has(d))dateMap.set(d,{});
-        dateMap.get(d)[month]=v;
+        dateMap.get(d)[Math.round(month*30)]=v;
       }
     }
-    // Add spot=0 for swap points interpolation
+    // spot anchor at days=0 → 0 pips (always true for swap points)
     for(const d of dateMap.keys())dateMap.get(d)[0]=0;
 
-    const months=[0,...anchorData.map(a=>a.month)].sort((a,b)=>a-b);
     const sortedDates=[...dateMap.keys()].sort();
     if(sortedDates.length<3)return null;
 
-    // For each date, build interpolation function and evaluate at target day-counts
-    function buildCurveForDate(d){
+    function curveForDate(d){
       const vals=dateMap.get(d);
       if(!vals)return null;
-      const xs=[],ys=[];
-      for(const m of months){if(vals[m]!=null){xs.push(m*30);ys.push(vals[m]*pipMul);}}
+      const xs=Object.keys(vals).map(Number).sort((a,b)=>a-b);
+      const ys=xs.map(x=>vals[x]);
       if(xs.length<2)return null;
-      return mcI(xs,ys);
+      const minX=xs[0], maxX=xs[xs.length-1];
+      const interp=mcI(xs,ys);
+      return{eval:(d2)=>{
+        if(d2<=0)return 0;
+        // Refuse extrapolation outside the anchor range — return null so the
+        // day is skipped instead of inventing values past the curve.
+        if(d2<minX||d2>maxX)return null;
+        const v=interp(d2);
+        return(v!=null&&isFinite(v))?v:null;
+      }};
     }
 
-    // Compute the spread for a given curve at given near/far day-counts
-    function spreadOnCurve(curve,dNear,dFar){
+    // Helper: spread on a curve (far - near, in pips).
+    const spreadAt=(curve,dN,dF)=>{
       if(!curve)return null;
-      const ptsNear=dNear<=0?0:curve(dNear);
-      const ptsFar=dFar<=0?0:curve(dFar);
-      if(ptsNear==null||ptsFar==null)return null;
-      return ptsFar-ptsNear;
-    }
+      const pn=curve.eval(dN);
+      const pf=curve.eval(dF);
+      if(pn==null||pf==null)return null;
+      return pf-pn;
+    };
 
     const results=[];
     let cumTotal=0;
     for(let i=1;i<sortedDates.length;i++){
-      const dToday=sortedDates[i];
-      const dYest=sortedDates[i-1];
-      const curveToday=buildCurveForDate(dToday);
-      const curveYest=buildCurveForDate(dYest);
-      if(!curveToday||!curveYest)continue;
+      const dY=sortedDates[i-1], dT=sortedDates[i];
+      const curveY=curveForDate(dY);
+      const curveT=curveForDate(dT);
+      if(!curveY||!curveT)continue;
 
-      const today=new Date(dToday);
-      // Days from today's date to fixed near/far dates
-      const daysToNear=Math.round((nearDate-today)/864e5);
-      const daysToFar=Math.round((farDate-today)/864e5);
-      // Past maturity check
-      if(daysToNear<-5)continue; // well past near date
-      if(daysToFar<0)continue;
+      // Constant-tenor P&L decomposition (see comment block above).
+      const spreadY_at_NF       = spreadAt(curveY, nearDays,     farDays);     // entry mark
+      const spreadY_at_NF_minus = spreadAt(curveY, Math.max(0,nearDays-1), Math.max(0,farDays-1)); // roll on yest curve
+      const spreadT_at_NF_minus = spreadAt(curveT, Math.max(0,nearDays-1), Math.max(0,farDays-1)); // mark on today's curve
 
-      const daysToNearYest=daysToNear+1; // yesterday had 1 more day
-      const daysToFarYest=daysToFar+1;
+      if(spreadY_at_NF==null||spreadY_at_NF_minus==null||spreadT_at_NF_minus==null)continue;
 
-      // Carry = roll-down from 1 day passing on YESTERDAY's curve
-      const spreadYestAtYestDays=spreadOnCurve(curveYest,Math.max(daysToNearYest,0),Math.max(daysToFarYest,0));
-      const spreadYestAtTodayDays=spreadOnCurve(curveYest,Math.max(daysToNear,0),Math.max(daysToFar,0));
-      // Market move = curve shift (today's curve vs yesterday's, both at today's day-counts)
-      const spreadTodayAtTodayDays=spreadOnCurve(curveToday,Math.max(daysToNear,0),Math.max(daysToFar,0));
-
-      if(spreadYestAtYestDays==null||spreadYestAtTodayDays==null||spreadTodayAtTodayDays==null)continue;
-
-      // For spot-start (near=0 days), carry = roll of the far leg only
-      const carry=spreadYestAtTodayDays-spreadYestAtYestDays;
-      const move=spreadTodayAtTodayDays-spreadYestAtTodayDays;
-      const total=carry+move;
-      cumTotal+=total;
-      results.push({date:today,carry,move,total,cumTotal});
+      const carry = spreadY_at_NF_minus - spreadY_at_NF;        // roll-down
+      const move  = spreadT_at_NF_minus - spreadY_at_NF_minus;  // curve shift @ τ−1
+      const total = carry + move;                                // = P&L_t
+      cumTotal += total;
+      results.push({date:new Date(dT),carry,move,total,cumTotal});
     }
     return results.length>5?results:null;
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[rawHistData,nrM,frM,monthHint,ad?.SPOT_DATE,isSwapPts,pipMul]);
+  },[rawHistData,nrM,frM,monthHint,ad?.rows,isSwapPts]);
 
   const dates=hist?hist.map(h=>h.date):[];
   const yLabel=viewMode==="swap"?(isSwapPts?"Swap Points (pips)":"Level")

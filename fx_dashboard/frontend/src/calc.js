@@ -118,21 +118,49 @@ export function calcZDev(d, p = 20) {
 }
 
 // ── Strategies + backtest ──
+//
+// Previously Mean Rev(20), BB Revert(20,2) and Z-Score Mean Rev(20) were
+// mathematically identical: BB upper at SMA+2σ ⇔ z = +2, so trading
+// "value > BB upper → short" is the same threshold-on-z-score signal as
+// "z > 2 → short". The five strategies now produce genuinely different
+// signal series (and thus different P&L curves) by exercising different
+// lookback / threshold / regime dimensions:
+//
+//   - SMA Band Reversion(20): mean-revert with position memory. Enter at
+//     SMA±1σ, exit when value crosses the SMA. Position-stateful, NOT a
+//     pure threshold function of z, so its trade count and turnover differ
+//     from BB and Z-Score Trend strategies.
+//   - SMA Cross(20/50): classic dual-MA trend follower (unchanged).
+//   - BB Revert(20,2): position-stateful band reversion at ±2σ. Same band
+//     as before, but now with the entry-on-touch / exit-on-mid hysteresis
+//     so it differs from Z-Score Trend (which uses a different threshold).
+//   - RSI(14) Fade: oscillator threshold strategy (unchanged).
+//   - Z-Score Trend(20): TREND-following on z-score. Long when z > +1,
+//     short when z < -1. Opposite directional view to mean-rev — doubly
+//     different from the other strategies.
+//   - Donchian Breakout(20): channel breakout (long > 20-day high,
+//     short < 20-day low). Pure trend follower based on ROLLING extremes
+//     (not Gaussian moments), so behaviorally unrelated to the others.
+//
+// Five strategies produce five distinct equity curves, exercising
+// trend/mean-rev/oscillator/breakout regimes.
 export const STRAT_DESCS = {
-  "Mean Rev(20)": "Fade z-score of deviation from 20d SMA. Short when z>2, long when z<-2, exit at 0.",
-  "SMA Cross(20/50)": "Long when SMA20 > SMA50, short when SMA20 < SMA50.",
-  "BB Revert(20,2)": "Fade Bollinger Band extremes: sell at upper, buy at lower, exit at middle.",
-  "RSI(14) Fade": "Buy when RSI dips below 30, sell when RSI rises above 70.",
-  "Z-Score Mean Rev(20)": "Fade z-score extremes past ±2σ. Same as Mean Rev(20) logic.",
+  "SMA Band Rev(20,1σ)":   "Mean-reversion with hysteresis: long at SMA−1σ, short at SMA+1σ, exit when crossing the SMA. Trades the moderate-distortion regime; NOT a threshold function of z.",
+  "SMA Cross(20/50)":      "Trend follower: long when SMA20 > SMA50, short when below.",
+  "BB Revert(20,2)":       "Position-stateful Bollinger reversion: enter at outer band (±2σ), exit when value crosses the SMA (mid-band).",
+  "RSI(14) Fade":          "Oscillator fade: long when RSI<30, short when RSI>70.",
+  "Z-Score Trend(20)":     "Trend on z-score: long when z>+1, short when z<−1. Opposite directional bias to mean-rev.",
+  "Donchian Breakout(20)": "Channel breakout: long when value pierces the prior 20-day high, short when below the prior 20-day low. Trend-following on rolling extremes.",
 };
 
 export function backtest(hist, lookbackDays) {
   const strats = [
-    { name: "Mean Rev(20)", fn: meanRevStrategy },
-    { name: "SMA Cross(20/50)", fn: smaCrossStrategy },
-    { name: "BB Revert(20,2)", fn: bbRevertStrategy },
-    { name: "RSI(14) Fade", fn: rsiFadeStrategy },
-    { name: "Z-Score Mean Rev(20)", fn: zScoreMeanRevStrategy },
+    { name: "SMA Band Rev(20,1σ)",   fn: smaBandRevStrategy },
+    { name: "SMA Cross(20/50)",      fn: smaCrossStrategy },
+    { name: "BB Revert(20,2)",       fn: bbRevertStrategy },
+    { name: "RSI(14) Fade",          fn: rsiFadeStrategy },
+    { name: "Z-Score Trend(20)",     fn: zScoreTrendStrategy },
+    { name: "Donchian Breakout(20)", fn: donchianBreakoutStrategy },
   ];
   const data = hist.slice(-lookbackDays);
   return strats.map(s => {
@@ -143,11 +171,75 @@ export function backtest(hist, lookbackDays) {
     } catch (e) { return { name: s.name, unavail: true, reason: e.message }; }
   });
 }
-function meanRevStrategy(d) { const z = calcZDev(d, 20); return z.map(v => v == null ? 0 : (v > 2 ? -1 : v < -2 ? 1 : 0)); }
-function zScoreMeanRevStrategy(d) { const z = calcZDev(d, 20); return z.map(v => v == null ? 0 : (v > 2 ? -1 : v < -2 ? 1 : 0)); }
+
+// Mean reversion with HYSTERESIS at 1σ. Position carries until value crosses
+// the SMA. This is structurally different from a pure z-threshold map
+// because it has memory: once long at SMA−1σ, you stay long until the value
+// rises back to the SMA, even if z drifts back to zero and then below 1σ
+// again without crossing the mean.
+function smaBandRevStrategy(d) {
+  const sma = calcSMA(d, 20), z = calcZDev(d, 20);
+  const sig = new Array(d.length).fill(0);
+  let pos = 0;
+  for (let i = 0; i < d.length; i++) {
+    if (sma[i] == null || z[i] == null) { sig[i] = pos; continue; }
+    const v = d[i].value, m = sma[i];
+    if (pos === 0) {
+      if (z[i] >  1) pos = -1;
+      else if (z[i] < -1) pos =  1;
+    } else if (pos > 0 && v >= m) pos = 0;
+    else if (pos < 0 && v <= m) pos = 0;
+    sig[i] = pos;
+  }
+  return sig;
+}
 function smaCrossStrategy(d) { const s20 = calcSMA(d, 20), s50 = calcSMA(d, 50); return d.map((_, i) => s20[i] == null || s50[i] == null ? 0 : (s20[i] > s50[i] ? 1 : -1)); }
-function bbRevertStrategy(d) { const bb = calcBB(d, 20, 2); return d.map((v, i) => bb.upper[i] == null ? 0 : (v.value > bb.upper[i] ? -1 : v.value < bb.lower[i] ? 1 : 0)); }
+
+// BB reversion with HYSTERESIS: enter at outer band, exit at mid-band SMA.
+// This differs from a stateless threshold (the previous implementation) in
+// that a brief visit inside the band doesn't flip the position immediately.
+function bbRevertStrategy(d) {
+  const bb = calcBB(d, 20, 2);
+  const sig = new Array(d.length).fill(0);
+  let pos = 0;
+  for (let i = 0; i < d.length; i++) {
+    const u = bb.upper[i], lo = bb.lower[i], mid = bb.mid[i];
+    if (u == null || lo == null || mid == null) { sig[i] = pos; continue; }
+    const v = d[i].value;
+    if (pos === 0) {
+      if (v > u) pos = -1;
+      else if (v < lo) pos =  1;
+    } else if (pos > 0 && v >= mid) pos = 0;
+    else if (pos < 0 && v <= mid) pos = 0;
+    sig[i] = pos;
+  }
+  return sig;
+}
 function rsiFadeStrategy(d) { const rsi = calcRSI(d, 14); return rsi.map(v => v == null ? 0 : (v > 70 ? -1 : v < 30 ? 1 : 0)); }
+// TREND on z-score (note opposite sign convention to mean-rev). Long when
+// z>+1 (price has run UP, ride it), short when z<−1. Strict trend-follower.
+function zScoreTrendStrategy(d) { const z = calcZDev(d, 20); return z.map(v => v == null ? 0 : (v > 1 ? 1 : v < -1 ? -1 : 0)); }
+// Donchian channel breakout (look-back 20). Position only flips on a fresh
+// extreme — totally different signal generator from the SMA/std-dev family.
+function donchianBreakoutStrategy(d) {
+  const N = 20;
+  const sig = new Array(d.length).fill(0);
+  let pos = 0;
+  for (let i = 0; i < d.length; i++) {
+    if (i < N) { sig[i] = 0; continue; }
+    let hi = -Infinity, lo = Infinity;
+    for (let j = i - N; j < i; j++) {
+      const v = d[j].value;
+      if (v > hi) hi = v;
+      if (v < lo) lo = v;
+    }
+    const v = d[i].value;
+    if (v > hi) pos = 1;
+    else if (v < lo) pos = -1;
+    sig[i] = pos;
+  }
+  return sig;
+}
 
 function runBacktest(name, data, signals) {
   // Swap-point backtest: absolute point returns, NOT percentage returns.
