@@ -584,6 +584,22 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
       }
     }
 
+    // Diagnostic snapshot of the IY math inputs — exposed on the row so the
+    // UI can render a hover tooltip showing F, S, sofr, days, F/S. Also used
+    // to flag suspicious "F/S ≈ 1 → IY ≈ SOFR" rows that would indicate a
+    // unit mismatch (e.g. a value_mode mis-tag where swap pts come through
+    // ~100× too small).
+    const iyDiag = (mT != null && sMT != null && sofT != null && daysVal > 0)
+      ? {
+          F: mT, S: sMT, sofr: sofT, days: daysVal,
+          fOverS: mT / sMT,
+          ptsPipsDisplay: spM,
+          ptsOutright: spM != null ? spM / PF : null,
+          suspectIyEqualsSofr: Math.abs(mT - sMT) < Math.max(1e-6 * Math.abs(sMT), 1e-6)
+                               && Math.abs(spM ?? 0) > 0,
+        }
+      : null;
+
     return {
       tenor: label || (month === 0 ? "Spot" : month <= 12 ? `${month}M` : month === 24 ? "2Y" : `${month}M`),
       month, dT, dT1, daysVal, daysVal1, dataSource,
@@ -595,6 +611,7 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
       interp: !isK && month !== 0,
       valDate, fixDate,
       sourcesMeta,
+      iyDiag,
     };
   }
 

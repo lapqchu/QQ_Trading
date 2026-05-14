@@ -87,6 +87,24 @@ function barMid(bar){
   return null;
 }
 
+// Compact tooltip text for an IY cell: shows the math inputs so a wrong-looking
+// implied yield can be debugged at a glance (look for F/S ≈ 1 → unit mismatch).
+function iyDiagTip(r){
+  const d = r && r.iyDiag;
+  if (!d) return undefined;
+  const lines = [
+    "IY math",
+    "F=" + F(d.F, 4),
+    "S=" + F(d.S, 4),
+    "SOFR=" + F(d.sofr, 3) + "%",
+    "days=" + d.days,
+    "F/S=" + F(d.fOverS, 6),
+    "pts(pips)=" + F(d.ptsPipsDisplay, 2),
+  ];
+  if (d.suspectIyEqualsSofr) lines.push("WARN: F~=S so IY collapses to SOFR. Likely a value_mode / pip-factor unit bug.");
+  return lines.join("\n");
+}
+
 // ── Per-RIC bar → display-pip value ──
 // Uses ricMeta from the backend so every RIC is normalized into the same units
 // (display pips), even when one history mixes RICs of different value modes.
@@ -1559,6 +1577,24 @@ export default function Dashboard(){
   },[ccy,mode,snap,backfillT1]);
 
   const ad=useMemo(()=>buildAllData(snap,liveQuotes,selection),[snap,liveQuotes,liveTick,selection]);
+  // Diagnostic: dump per-tenor IY math inputs to window.__qqIyDiag so users can
+  // inspect F/S/sofr/days in DevTools when implied yields look wrong. Logs a
+  // warning to console if any row's F/S is suspiciously close to 1 (a tell-tale
+  // sign of a value_mode / pip-factor unit mismatch — IY collapses to SOFR).
+  useEffect(()=>{
+    if(!ad||!ad.rows)return;
+    const diag=ad.rows.filter(r=>r.iyDiag).map(r=>({tenor:r.tenor,month:r.month,...r.iyDiag,iyM:r.iyM,basisT:r.basisT}));
+    if(typeof window!=="undefined"){
+      window.__qqIyDiag=window.__qqIyDiag||{};
+      window.__qqIyDiag[ccy]=diag;
+    }
+    const suspects=diag.filter(d=>d.suspectIyEqualsSofr);
+    if(suspects.length){
+      // eslint-disable-next-line no-console
+      console.warn(`[IY DIAG] ${ccy}: ${suspects.length} row(s) with F/S≈1 — IY will collapse to SOFR. Check value_mode / pipFactor.`,suspects);
+    }
+  },[ad,ccy]);
+
   const refreshSnap=useCallback(()=>{
     getSnapshot(ccy).then(s=>{
       setSnap(s);
@@ -1728,7 +1764,7 @@ export default function Dashboard(){
                 <td style={cS("#4ADE80")}>{F(r.bT,dp)}</td><td style={cS("#F87171")}>{F(r.aT,dp)}</td><td style={{...cS("#FBBF24",true),borderRight:"1px solid #334155"}}>{F(r.mT,dp)}</td>
                 <td style={cS("#4ADE80")}>{sp?"—":FP(r.spB,pdp)}</td><td style={cS("#FBBF24",true)}>{sp?"—":FP(r.spM,pdp)}</td><td style={cS("#F87171")}>{sp?"—":FP(r.spA,pdp)}</td>
                 <td style={{...cS(CC(r.pipChg)),borderRight:"1px solid #334155",background:sp?"transparent":HB(r.pipChg,mPC)}}>{sp?"—":FP(r.pipChg,pdp)}</td>
-                <td style={cS("#4ADE80")}>{sp?"—":F(r.iyB,2)}</td><td style={cS("#34D399",true)}>{sp?"—":F(r.iyM,2)}</td><td style={cS("#F87171")}>{sp?"—":F(r.iyA,2)}</td>
+                <td style={cS("#4ADE80")}>{sp?"—":F(r.iyB,2)}</td><td style={cS("#34D399",true)} title={iyDiagTip(r)}>{sp?"—":F(r.iyM,2)}{r.iyDiag&&r.iyDiag.suspectIyEqualsSofr?" !":""}</td><td style={cS("#F87171")}>{sp?"—":F(r.iyA,2)}</td>
                 <td style={{...cS(CC(r.iyChg)),borderRight:"1px solid #334155",background:sp?"transparent":HB(r.iyChg,mIC)}}>{sp?"—":FP(r.iyChg!=null?r.iyChg*100:null,2)}</td>
                 <td style={cS("#FB923C")}>{sp?"—":F(r.sofT,2)}</td><td style={{...cS(CC(r.sofChg)),borderRight:"1px solid #334155",background:sp?"transparent":HB(r.sofChg,.005)}}>{sp?"—":FP(r.sofChg*100,1)}</td>
                 <td style={cS(r.basisT!=null&&r.basisT>=0?"#C084FC":"#F472B6",true)}>{sp||r.basisT==null?"—":FP(r.basisT*100,2)}</td>
