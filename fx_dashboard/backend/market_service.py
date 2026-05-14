@@ -144,6 +144,11 @@ class MarketService:
         self._ipa_cache: Dict[str, Any] = {}        # key: f"{pair}@{date}"
         self._tomfix_cache: Dict[str, Any] = {}
         self._t1_cache: Dict[str, Quote] = {}       # key: f"{ric}@{date}"
+        # Auto-detected per-source value_mode overrides ({ccy: {source_name: mode}}).
+        # Populated each time build_snapshot runs auto-detect; consumed by
+        # get_history when tagging RIC metadata so historical bars are
+        # normalized using the same mode the live snapshot uses.
+        self._value_mode_overrides: Dict[str, Dict[str, str]] = {}
 
     def set_loop(self, loop: asyncio.AbstractEventLoop):
         self._loop = loop
@@ -449,7 +454,7 @@ class MarketService:
             base["valueMode"] = cfg.value_mode_for(b)
             brokers_meta[b] = base
 
-        return {
+        snap = {
             "ccy": cfg.code, "pair": cfg.pair, "kind": cfg.kind,
             "pipFactor": cfg.pip_factor, "outrightDp": cfg.outright_dp, "pipDp": cfg.pip_dp,
             "valueMode": cfg.value_mode, "ptsInOutright": cfg.pts_in_outright,
@@ -476,6 +481,161 @@ class MarketService:
             "turnTypes": turn_types_for(cfg),
             "turns": self._build_turns_payload(cfg, ipa),
         }
+        # Auto-detect actual quote convention per-source and override if it
+        # differs from cfg.value_mode_for(...). Some currencies' configs were
+        # calibrated by inspection at one point in time; LSEG occasionally
+        # changes how it quotes a given RIC (units, scale), and a stale config
+        # silently produces F≈S → IY≈SOFR. Self-healing keeps the dashboard
+        # correct without manual config updates per currency.
+        try:
+            self._auto_detect_value_modes(cfg, snap)
+        except Exception as e:
+            log.info("value_mode auto-detect failed for %s: %s", cfg.code, e)
+        return snap
+
+    # ───── value_mode auto-detect ─────
+    def _auto_detect_value_modes(self, cfg: CurrencyConfig, snap: Dict[str, Any]) -> None:
+        """
+        Determine the actual quote convention each source is using and override
+        snap.tenors[*].sources[*].valueMode + snap.valueMode in-place.
+
+        Strategy:
+          NDFs       use the separate 1M outright RIC (`{CCY}1MNDFOR=`) as
+                     ground truth: expected_outright_diff = 1M_outright − spot.
+                     For each source's 1M raw mid, ratio = raw / expected gives
+                     ~1 (outright units) or ~pip_factor (pip units).
+          Deliverables fall back to IPA's impliedYield: pick the value_mode
+                     whose computed IY matches IPA most closely.
+
+        Detection is per-source (composite vs broker can legitimately differ —
+        MXN, for example) but the chosen mode is then propagated to ALL tenors
+        of that source name (one currency uses one convention across tenors).
+
+        If detection is ambiguous (no clear winner), keep cfg.value_mode_for —
+        no false-positive override.
+        """
+        tenors = snap.get("tenors") or {}
+        t1 = tenors.get(1) or tenors.get("1")
+        if not t1 or not t1.get("sources"):
+            return
+        spot = (snap.get("spot") or {}).get("T") or {}
+        spot_mid = spot.get("mid")
+        if spot_mid is None:
+            return
+        PF = float(cfg.pip_factor)
+        if PF <= 0:
+            return
+
+        # Reference outright diff (per-source raw → outright units).
+        # NDF: 1M outright RIC. Deliverable: derive from IPA implied yield.
+        if cfg.kind == "NDF":
+            ndf_1m = snap.get("ndf1mOutright") or {}
+            om = ((ndf_1m.get("T") or {}).get("mid"))
+            if om is None or abs(om - spot_mid) < 1e-9:
+                return
+            expected_diff = om - spot_mid
+            ref_label = f"NDF outright {ndf_1m.get('ric')}"
+        else:
+            ipa = snap.get("ipa") or {}
+            ipa_1m = ipa.get("1M") or {}
+            ipa_iy = ipa_1m.get("impliedYield")
+            ipa_days = ipa_1m.get("days") or 30
+            if ipa_iy is None:
+                return
+            sofr_block = (snap.get("sofr") or {}).get(1) or (snap.get("sofr") or {}).get("1")
+            sofr_mid = (((sofr_block or {}).get("T") or {}).get("mid")
+                        if sofr_block else None)
+            if sofr_mid is None:
+                return
+            # Invert the IY formula to get the implied F → expected_diff = F − S.
+            # F = S × (1 + ipa_iy/100 × d/360) / (1 + sofr/100 × d/360)
+            num = 1.0 + (float(ipa_iy) / 100.0) * float(ipa_days) / 360.0
+            den = 1.0 + (float(sofr_mid) / 100.0) * float(ipa_days) / 360.0
+            if den == 0:
+                return
+            f_implied = spot_mid * num / den
+            expected_diff = f_implied - spot_mid
+            if abs(expected_diff) < 1e-9:
+                return
+            ref_label = f"IPA impliedYield={ipa_iy:.3f}%"
+
+        # Detect per-source.
+        TOL = 0.30  # 30% tolerance on the ratio match
+        detected: Dict[str, str] = {}
+        for name, s in (t1.get("sources") or {}).items():
+            if not s or not s.get("hasData"):
+                continue
+            raw = s.get("mid")
+            if raw is None:
+                bid, ask = s.get("bid"), s.get("ask")
+                if bid is None or ask is None:
+                    continue
+                raw = (bid + ask) / 2.0
+            if abs(raw) < 1e-9:
+                continue
+            ratio = raw / expected_diff
+            r_outright = abs(ratio - 1.0)
+            r_pips = abs(ratio - PF) / PF
+            current = cfg.value_mode_for(name)
+            if r_outright < TOL and r_outright < r_pips:
+                picked = "outright"
+            elif r_pips < TOL and r_pips < r_outright:
+                picked = "pips"
+            else:
+                # Ambiguous: keep config.
+                continue
+            if picked != current:
+                log.warning("value_mode override [%s/%s]: %s → %s (raw=%.6g, expected_diff=%.6g, ratio=%.3f, ref=%s)",
+                            cfg.code, name, current, picked, raw, expected_diff, ratio, ref_label)
+            detected[name] = picked
+
+        if not detected:
+            # Empty the cache for this ccy if we previously had overrides.
+            if cfg.code in self._value_mode_overrides:
+                self._value_mode_overrides[cfg.code] = {}
+            return
+
+        # Cache for use by get_history (so the modal IY view normalizes
+        # historical bars using the same mode the live snapshot uses).
+        self._value_mode_overrides[cfg.code] = dict(detected)
+
+        # Propagate to ALL tenors of each detected source name.
+        for tbundle in tenors.values():
+            sources = (tbundle or {}).get("sources") or {}
+            for name, s in sources.items():
+                if name in detected and s:
+                    s["valueMode"] = detected[name]
+
+        # Also patch funding bundles, weekly, and ndf1mOutright broker sources.
+        for f in (snap.get("funding") or {}).values():
+            for name, s in ((f or {}).get("sources") or {}).items():
+                if name in detected and s:
+                    s["valueMode"] = detected[name]
+        for w in (snap.get("weekly") or {}).values():
+            if w and w.get("hasData"):
+                # weekly carries a single value_mode tag (no source name);
+                # follow the composite override when available.
+                comp = detected.get("composite")
+                if comp:
+                    w["valueMode"] = comp
+
+        # Patch top-level snap.valueMode + brokersMeta to reflect detection so
+        # the frontend valueModeForSource() resolver also sees the corrected
+        # mode (used by the modal IY view, etc.).
+        comp = detected.get("composite")
+        if comp and comp != snap.get("valueMode"):
+            snap.setdefault("valueModeOverridden", {})["composite"] = {
+                "config": snap.get("valueMode"), "detected": comp,
+            }
+            snap["valueMode"] = comp
+        bm = snap.get("brokersMeta") or {}
+        for name, mode in detected.items():
+            if name in bm:
+                if bm[name].get("valueMode") != mode:
+                    snap.setdefault("valueModeOverridden", {})[name] = {
+                        "config": bm[name].get("valueMode"), "detected": mode,
+                    }
+                bm[name]["valueMode"] = mode
 
     # ───── turn calendar payload ─────
     def _build_turns_payload(self, cfg: CurrencyConfig,
@@ -812,6 +972,13 @@ class MarketService:
         cfg = CURRENCIES[ccy]
         start, interval = _resolve_period(period)
 
+        # Auto-detected per-source value_mode overrides from the most recent
+        # snapshot build. Falls back to cfg.value_mode_for(source) if no
+        # override has been recorded yet (cold start / detection ambiguous).
+        overrides = self._value_mode_overrides.get(ccy, {})
+        def vmode(name: str) -> str:
+            return overrides.get(name, cfg.value_mode_for(name))
+
         rics: List[str] = [cfg.spot_ric]
         ric_meta: Dict[str, Dict[str, Any]] = {
             cfg.spot_ric: {"kind": "spot", "month": 0, "source": "spot",
@@ -825,7 +992,7 @@ class MarketService:
                 rics.append(base)
                 ric_meta[base] = {"kind": "funding", "month": None,
                                   "source": "composite",
-                                  "valueMode": cfg.value_mode_for("composite"),
+                                  "valueMode": vmode("composite"),
                                   "pipFactor": cfg.pip_factor, "tenor": t}
             for b in cfg.brokers:
                 br = cfg.funding_ric(t, broker=b)
@@ -833,14 +1000,14 @@ class MarketService:
                     rics.append(br)
                     ric_meta[br] = {"kind": "funding", "month": None,
                                     "source": b,
-                                    "valueMode": cfg.value_mode_for(b),
+                                    "valueMode": vmode(b),
                                     "pipFactor": cfg.pip_factor, "tenor": t}
             if extra_rics:
                 for er in extra_rics:
                     if er not in ric_meta:
                         ric_meta[er] = {"kind": "funding", "month": None,
                                         "source": "extra",
-                                        "valueMode": cfg.value_mode_for("composite"),
+                                        "valueMode": vmode("composite"),
                                         "pipFactor": cfg.pip_factor, "tenor": t}
                 rics = list(dict.fromkeys(rics + extra_rics))
             end = date.today()
@@ -862,7 +1029,7 @@ class MarketService:
                 r = cfg.broker_ric(m, contributor)
                 rics.append(r)
                 ric_meta[r] = {"kind": "swap", "month": m, "source": contributor,
-                               "valueMode": cfg.value_mode_for(contributor),
+                               "valueMode": vmode(contributor),
                                "pipFactor": cfg.pip_factor}
         else:
             if cfg.derive_from_outrights:
@@ -888,9 +1055,10 @@ class MarketService:
                         rics.append(r)
                         # CRITICAL: this broker may quote in a different value_mode
                         # than the composite. ricMeta tags it with the broker's mode
-                        # so the frontend transforms it correctly.
+                        # (post auto-detect override) so the frontend transforms it
+                        # correctly.
                         ric_meta[r] = {"kind": "swap", "month": m, "source": b,
-                                       "valueMode": cfg.value_mode_for(b),
+                                       "valueMode": vmode(b),
                                        "pipFactor": cfg.pip_factor,
                                        "fallback": "composite_missing"}
                     else:
@@ -898,7 +1066,7 @@ class MarketService:
                         rics.append(r)
                         ric_meta[r] = {"kind": "swap", "month": m,
                                        "source": "composite",
-                                       "valueMode": cfg.value_mode_for("composite"),
+                                       "valueMode": vmode("composite"),
                                        "pipFactor": cfg.pip_factor}
 
         if extra_rics:
@@ -907,7 +1075,7 @@ class MarketService:
                     # Best-effort tag for extras (frontend should still work).
                     ric_meta[er] = {"kind": "swap", "month": None,
                                     "source": "extra",
-                                    "valueMode": cfg.value_mode_for("composite"),
+                                    "valueMode": vmode("composite"),
                                     "pipFactor": cfg.pip_factor}
             rics = list(dict.fromkeys(rics + extra_rics))
 
@@ -973,20 +1141,26 @@ class MarketService:
         #       "outright" → bar value × pip_factor = pips
         #       "outright_abs" → bar carries an absolute outright price; pts =
         #                        (out − spot) × pip_factor (used for EGP/NGN)
+        # Auto-detected per-source value_mode overrides from the most recent
+        # snapshot build (same source as get_history). Cold start → cfg defaults.
+        overrides = self._value_mode_overrides.get(ccy, {})
+        def vmode(name: str) -> str:
+            return overrides.get(name, cfg.value_mode_for(name))
+
         rics: List[str] = [cfg.spot_ric]
         ric_mode: Dict[str, str] = {cfg.spot_ric: "spot"}
         if contributor:
             for m in cfg.anchor_tenors_m:
                 r = cfg.broker_ric(m, contributor)
                 rics.append(r)
-                ric_mode[r] = cfg.value_mode_for(contributor)
+                ric_mode[r] = vmode(contributor)
         else:
             for m in cfg.anchor_tenors_m:
                 if cfg.kind == "NDF" and m == 18 and cfg.composite_18m_fallback_brokers:
                     b = cfg.composite_18m_fallback_brokers[0]
                     r = cfg.broker_ric(m, b)
                     rics.append(r)
-                    ric_mode[r] = cfg.value_mode_for(b)
+                    ric_mode[r] = vmode(b)
                 elif cfg.derive_from_outrights and cfg.outright_source_brokers:
                     r = cfg.outright_ric(m, broker=cfg.outright_source_brokers[0])
                     rics.append(r)
@@ -994,7 +1168,7 @@ class MarketService:
                 else:
                     r = cfg.swap_points_ric(m)
                     rics.append(r)
-                    ric_mode[r] = cfg.value_mode_for("composite")
+                    ric_mode[r] = vmode("composite")
 
         end = date.today()
         kwargs = {"rics": rics, "fields": ["BID", "ASK", "TRDPRC_1"],
