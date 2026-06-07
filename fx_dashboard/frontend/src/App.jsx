@@ -101,7 +101,11 @@ function iyDiagTip(r){
     "F/S=" + F(d.fOverS, 6),
     "pts(pips)=" + F(d.ptsPipsDisplay, 2),
   ];
-  if (d.suspectIyEqualsSofr) lines.push("WARN: F~=S so IY collapses to SOFR. Likely a value_mode / pip-factor unit bug.");
+  if (d.iyRef != null) lines.push("IPA IY=" + F(d.iyRef, 2) + "% (independent ref)");
+  if (d.suspectIyEqualsSofr) {
+    lines.push("WARN: IY≈SOFR — likely value_mode / pip-factor unit bug"
+               + (d.suspectReason ? " [" + d.suspectReason + "]" : ""));
+  }
   return lines.join("\n");
 }
 
@@ -222,7 +226,7 @@ function buildHistoryForTenor(data,tenor,isSwapPts,monthHint){
       const pts=bars.map(bar=>{
         const iso=bar.Date?bar.Date.slice(0,10):null;
         const sp=iso?spotMap[iso]:null;
-        return{date:new Date(bar.Date),value:barPipValue(bar,targetRic,ricMeta,sp)};
+        return{date:new Date(bar.Date),iso,value:barPipValue(bar,targetRic,ricMeta,sp)};
       }).filter(p=>p.value!=null&&!isNaN(p.value));
       if(pts.length>10)return{pts,source:'direct'};
     }
@@ -281,7 +285,7 @@ function buildHistoryForTenor(data,tenor,isSwapPts,monthHint){
     if(targetM<xs[0]||targetM>xs[xs.length-1])continue;
     const interp=mcI(xs,ys);
     const v=interp(targetM);
-    if(v!=null&&isFinite(v))pts.push({date:new Date(d),value:v});
+    if(v!=null&&isFinite(v))pts.push({date:new Date(d),iso:String(d).slice(0,10),value:v});
   }
   if(pts.length>10)return{pts,source:'interpolated'};
   return{pts:pts.length>0?pts:null,source:pts.length>0?'interpolated':null};
@@ -378,7 +382,7 @@ function buildSpreadHistory(data,nearM,farM){
   const pts=[];
   for(const d of sortedDates){
     const nv=nearSeries.map.get(d),fv=farSeries.map.get(d);
-    if(nv!=null&&fv!=null)pts.push({date:new Date(d),value:fv-nv});
+    if(nv!=null&&fv!=null)pts.push({date:new Date(d),iso:String(d).slice(0,10),value:fv-nv});
   }
   const source=nearSeries.source==='direct'&&farSeries.source==='direct'?'direct':'interpolated';
   if(pts.length>10)return{pts,source};
@@ -444,7 +448,7 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
         const rawPts=bars.map(b=>{
           const iso=b.Date?b.Date.slice(0,10):null;
           const sp=iso?spotMap[iso]:null;
-          return{date:new Date(b.Date),value:barPipValue(b,chosen,ricMeta,sp)};
+          return{date:new Date(b.Date),iso,value:barPipValue(b,chosen,ricMeta,sp)};
         }).filter(p=>p.value!=null&&!isNaN(p.value));
         if(rawPts.length>10){
           setRawHist(rawPts);
@@ -463,7 +467,7 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
         if(cancelled)return;
         const series=d?.series||[];
         if(series.length>10){
-          const rawPts=series.map(p=>({date:new Date(p.date),value:p.spread})).filter(p=>p.value!=null&&!isNaN(p.value));
+          const rawPts=series.map(p=>({date:new Date(p.date),iso:p.date?String(p.date).slice(0,10):null,value:p.spread})).filter(p=>p.value!=null&&!isNaN(p.value));
           setRawHist(rawPts);
           setHist(transformPts(rawPts));
           setHistSource(d.interpolated?"interpolated":"direct");
@@ -603,8 +607,14 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
       vals=hist.map((h,i)=>{
         const pipVal=rawHist?.[i]?.value;
         if(pipVal==null)return null;
-        const iso=h.date instanceof Date?h.date.toISOString().slice(0,10):null;
-        const spot=spotHist?.[iso]??ad?.sMT;
+        // Key off the raw bar-date string carried on rawHist (set by every
+        // history producer) — NOT h.date.toISOString(), which round-trips
+        // through UTC and can shift the day by one in non-UTC zones, missing
+        // every spotHist/sofrHist key and silently falling back to today's spot.
+        const iso=rawHist?.[i]?.iso??(h.date instanceof Date?h.date.toISOString().slice(0,10):null);
+        // No silent fallback to today's live spot (ad.sMT): a missing per-date
+        // spot must leave a GAP (null) rather than corrupt F/S with a stale spot.
+        const spot=iso?(spotHist?.[iso]??null):null;
         let sofrForDate=null;
         if(sofrHist&&iso){
           sofrForDate=sofrHist[iso];
@@ -781,12 +791,22 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
     :viewMode==="iy"?"Implied Yield (%)"
     :viewMode==="ppd"?"PPD":"Carry Decomp (pips)";
   // Consistency indicator: last bar vs. live mid (swap-pts view only).
-  const lastBar=(vals&&vals.length)?vals[vals.length-1]:null;
+  // History is requested through end=today, so the final bar can be today's
+  // still-forming intraday snapshot — which legitimately differs from a later
+  // live tick and produced spurious "last bar wrong" warnings. Compare live
+  // against the last CLOSED bar instead (skip the final bar if its date is
+  // today or later, using the raw iso carried on rawHist).
+  const _todayIso=(()=>{const t=new Date();return `${t.getFullYear()}-${String(t.getMonth()+1).padStart(2,"0")}-${String(t.getDate()).padStart(2,"0")}`;})();
+  const _lastIdx=(vals&&vals.length)?vals.length-1:-1;
+  const _lastIso=_lastIdx>=0?(rawHist?.[_lastIdx]?.iso||null):null;
+  const _cmpIdx=(_lastIso&&_lastIso>=_todayIso&&_lastIdx>=1)?_lastIdx-1:_lastIdx;
+  const lastBar=(_cmpIdx>=0&&vals&&vals.length)?vals[_cmpIdx]:null;
+  const lastBarForming=_cmpIdx!==_lastIdx;
   const liveVsLast=(()=>{
     if(viewMode!=="swap"||liveMid==null||lastBar==null||!isFinite(lastBar))return null;
     const diff=Math.abs(lastBar-liveMid);
     const tol=Math.max(1,Math.abs(liveMid)*0.05); // 5% or 1 pip, whichever is bigger
-    return{ok:diff<=tol,last:lastBar,live:liveMid,diff};
+    return{ok:diff<=tol,last:lastBar,live:liveMid,diff,forming:lastBarForming};
   })();
   const priceTraces=[
     {x:dates,y:vals,type:"scatter",mode:"lines",name:tenor,line:{color:"#10B981",width:1.8}},

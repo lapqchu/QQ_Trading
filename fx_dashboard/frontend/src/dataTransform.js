@@ -589,14 +589,38 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
     // to flag suspicious "F/S ≈ 1 → IY ≈ SOFR" rows that would indicate a
     // unit mismatch (e.g. a value_mode mis-tag where swap pts come through
     // ~100× too small).
+    // Independent reference: IPA computes its own implied yield from the IPA
+    // forward, so it is immune to our (spot + pts/PF) reconstruction — and thus
+    // to any value_mode / pip_factor mis-scale. When present it is the trusted
+    // ground truth to compare our reconstructed iyM against.
+    const iyRef = ipaD?.impliedYield ?? null;
+    const iyVsRef = (iyM != null && iyRef != null) ? iyM - iyRef : null;
+    // The OLD flag tested |F-S| < 1e-6, which is ~100x too tight to ever fire
+    // for a real mis-tag: a won-denominated feed mistagged as "pips" leaves
+    // F-S ≈ 1e-2 (not 1e-6), so the collapse stayed invisible. Detect it two
+    // robust ways instead:
+    //  (a) IPA disagrees with our reconstruction by >20bp — day-count
+    //      convention slop is <~10bp at 1M, whereas a unit collapse diverges by
+    //      the full basis (>100bp for KRW/INR/etc); or
+    //  (b) no IPA ref → IY sits within 5bp of SOFR, near-impossible for a real
+    //      EM NDF/deliverable, so flag as a likely value_mode/pip_factor bug.
+    const suspectIyEqualsSofr =
+      iyM != null && daysVal > 0 &&
+      ((iyVsRef != null && Math.abs(iyVsRef) > 0.20) ||
+       (iyVsRef == null && basisT != null && Math.abs(basisT) < 0.05));
+    const suspectReason = !suspectIyEqualsSofr ? null
+      : (iyVsRef != null
+          ? `recon IY ${iyM.toFixed(2)}% vs IPA ${iyRef.toFixed(2)}% (Δ${iyVsRef.toFixed(2)}%)`
+          : `basis ${(basisT ?? 0).toFixed(3)}% ≈ 0 → IY≈SOFR`);
     const iyDiag = (mT != null && sMT != null && sofT != null && daysVal > 0)
       ? {
           F: mT, S: sMT, sofr: sofT, days: daysVal,
           fOverS: mT / sMT,
           ptsPipsDisplay: spM,
           ptsOutright: spM != null ? spM / PF : null,
-          suspectIyEqualsSofr: Math.abs(mT - sMT) < Math.max(1e-6 * Math.abs(sMT), 1e-6)
-                               && Math.abs(spM ?? 0) > 0,
+          iyRef, iyVsRef,
+          suspectIyEqualsSofr,
+          suspectReason,
         }
       : null;
 

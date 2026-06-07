@@ -532,6 +532,11 @@ class MarketService:
             ndf_1m = snap.get("ndf1mOutright") or {}
             om = ((ndf_1m.get("T") or {}).get("mid"))
             if om is None or abs(om - spot_mid) < 1e-9:
+                log.warning(
+                    "value_mode auto-detect SKIPPED [%s]: NDF 1M outright ref %s unusable "
+                    "(om=%s, spot=%s) — keeping config value_mode; IY will collapse to SOFR "
+                    "if the live feed units differ from config",
+                    cfg.code, ndf_1m.get("ric"), om, spot_mid)
                 return
             expected_diff = om - spot_mid
             ref_label = f"NDF outright {ndf_1m.get('ric')}"
@@ -541,11 +546,17 @@ class MarketService:
             ipa_iy = ipa_1m.get("impliedYield")
             ipa_days = ipa_1m.get("days") or 30
             if ipa_iy is None:
+                log.warning(
+                    "value_mode auto-detect SKIPPED [%s]: no IPA impliedYield ref — "
+                    "keeping config value_mode; IY may be mis-scaled", cfg.code)
                 return
             sofr_block = (snap.get("sofr") or {}).get(1) or (snap.get("sofr") or {}).get("1")
             sofr_mid = (((sofr_block or {}).get("T") or {}).get("mid")
                         if sofr_block else None)
             if sofr_mid is None:
+                log.warning(
+                    "value_mode auto-detect SKIPPED [%s]: no SOFR ref — "
+                    "keeping config value_mode; IY may be mis-scaled", cfg.code)
                 return
             # Invert the IY formula to get the implied F → expected_diff = F − S.
             # F = S × (1 + ipa_iy/100 × d/360) / (1 + sofr/100 × d/360)
@@ -582,7 +593,13 @@ class MarketService:
             elif r_pips < TOL and r_pips < r_outright:
                 picked = "pips"
             else:
-                # Ambiguous: keep config.
+                # Ambiguous: neither ~1 (outright) nor ~PF (pips). Keep config,
+                # but surface it — a silent skip here is how a mis-scaled feed
+                # slips through and collapses IY onto SOFR.
+                log.warning(
+                    "value_mode AMBIGUOUS [%s/%s]: raw=%.6g expected_diff=%.6g ratio=%.3f "
+                    "(neither ~1 nor ~PF=%g, TOL=%.2f) — keeping config '%s'; IY may be wrong",
+                    cfg.code, name, raw, expected_diff, ratio, PF, TOL, current)
                 continue
             if picked != current:
                 log.warning("value_mode override [%s/%s]: %s → %s (raw=%.6g, expected_diff=%.6g, ratio=%.3f, ref=%s)",
