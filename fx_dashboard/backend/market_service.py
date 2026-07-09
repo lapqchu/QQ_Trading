@@ -481,6 +481,16 @@ class MarketService:
             "turnTypes": turn_types_for(cfg),
             "turns": self._build_turns_payload(cfg, ipa),
         }
+        # WM/Reuters inverted quote (e.g. BWP): reciprocate spot + re-express all
+        # swap points in the conventional local-per-USD orientation BEFORE the
+        # auto-detect below, so the detector sees conventional points against
+        # IPA's conventional implied yield.
+        if getattr(cfg, "inverted", False):
+            try:
+                self._apply_inversion(cfg, snap)
+            except Exception as e:
+                log.warning("inversion failed for %s: %s", cfg.code, e)
+
         # Auto-detect actual quote convention per-source and override if it
         # differs from cfg.value_mode_for(...). Some currencies' configs were
         # calibrated by inspection at one point in time; LSEG occasionally
@@ -654,6 +664,174 @@ class MarketService:
                     }
                 bm[name]["valueMode"] = mode
 
+    # ───── WM/Reuters inverted-quote transform ─────
+    @staticmethod
+    def _recip(x: Optional[float]) -> Optional[float]:
+        """1/x, guarded against None / zero (divide-by-zero → None)."""
+        try:
+            return (1.0 / x) if x else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _inv_point(raw: Optional[float], s_native: Optional[float],
+                   vm: str, PF: float) -> Optional[float]:
+        """Re-express one NATIVE swap-point value in the reciprocal (per-USD)
+        convention. Reconstruct the native outright, reciprocate, re-difference:
+            O_native = S_native + raw/PF   (pips mode)
+            O_native = S_native + raw      (outright mode)
+            point'   = (1/O_native − 1/S_native) · PF     (always emitted as pips)
+        Returns None if S_native or O_native is missing/zero (divide guard)."""
+        if raw is None or not s_native:
+            return None
+        o = s_native + (raw / PF if vm != "outright" else raw)
+        if not o:
+            return None
+        return (1.0 / o - 1.0 / s_native) * PF
+
+    def _invert_price_dict(self, d: Optional[Dict[str, Any]]) -> None:
+        """Reciprocate a spot/outright quote dict {bid,ask,mid,last} in place.
+        bid/ask swap under the reciprocal: bid'=1/ask, ask'=1/bid."""
+        if not d:
+            return
+        b, a, m, l = d.get("bid"), d.get("ask"), d.get("mid"), d.get("last")
+        nb = self._recip(a)
+        na = self._recip(b)
+        nm = ((nb + na) / 2.0) if (nb is not None and na is not None) else self._recip(m)
+        d["bid"], d["ask"], d["mid"], d["last"] = nb, na, nm, self._recip(l)
+
+    def _invert_points_dict(self, d: Optional[Dict[str, Any]],
+                            s_native: Optional[float], vm: str, PF: float) -> None:
+        """Re-express a swap-point quote dict {bid,ask,mid,last} in the per-USD
+        convention in place. bid/ask swap because 1/O is monotone-decreasing in
+        the raw point."""
+        if not d or not s_native:
+            return
+        b, a, m, l = d.get("bid"), d.get("ask"), d.get("mid"), d.get("last")
+        nb = self._inv_point(a, s_native, vm, PF)   # bid' from ask raw
+        na = self._inv_point(b, s_native, vm, PF)   # ask' from bid raw
+        nm = ((nb + na) / 2.0) if (nb is not None and na is not None) else \
+            self._inv_point(m, s_native, vm, PF)
+        d["bid"], d["ask"], d["mid"], d["last"] = nb, na, nm, \
+            self._inv_point(l, s_native, vm, PF)
+
+    @staticmethod
+    def _dict_mid(d: Optional[Dict[str, Any]]) -> Optional[float]:
+        if not d:
+            return None
+        m = d.get("mid")
+        if m is None and d.get("bid") is not None and d.get("ask") is not None:
+            m = (d["bid"] + d["ask"]) / 2.0
+        return m
+
+    def _apply_inversion(self, cfg: CurrencyConfig, snap: Dict[str, Any]) -> None:
+        """WM/Reuters inverted quote (cfg.inverted): the RIC chain returns USD per
+        1 local unit (reciprocal of cfg.pair). Rewrite the whole live snapshot into
+        the conventional local-per-USD orientation so the frontend stays
+        convention-agnostic. MUST run BEFORE _auto_detect_value_modes so the
+        detector compares the (now conventional) points against IPA's conventional
+        implied yield. Points become value_mode='pips'; pip_factor is unchanged."""
+        PF = float(cfg.pip_factor)
+        spot_blk = snap.get("spot") or {}
+        # Capture native (USD-per-local) spot mids BEFORE reciprocating spot.
+        s_t = self._dict_mid(spot_blk.get("T"))
+        s_t1 = self._dict_mid(spot_blk.get("T1"))
+        # Spot itself → reciprocal (used elsewhere as spot.T / spot.T1).
+        self._invert_price_dict(spot_blk.get("T"))
+        self._invert_price_dict(spot_blk.get("T1"))
+        # ndf1mOutright carries outright PRICES — reciprocate if present.
+        # (BWP is deliverable, so this is usually absent.)
+        ndf = snap.get("ndf1mOutright")
+        if ndf:
+            self._invert_price_dict(ndf.get("T"))
+            self._invert_price_dict(ndf.get("T1"))
+            for sblk in (ndf.get("sources") or {}).values():
+                if isinstance(sblk, dict):
+                    self._invert_price_dict(sblk.get("T"))
+                    self._invert_price_dict(sblk.get("T1"))
+        if not s_t:
+            log.warning("inversion [%s]: no native spot mid — points left native", cfg.code)
+            return
+
+        def _do_source(src: Optional[Dict[str, Any]]) -> None:
+            if not src:
+                return
+            vm = src.get("valueMode") or cfg.value_mode
+            self._invert_points_dict(src, s_t, vm, PF)               # T points
+            self._invert_points_dict(src.get("T1"), s_t1 or s_t, vm, PF)
+            src["valueMode"] = "pips"
+
+        # Every tenor source (composite + brokers) and every funding source.
+        for bundle in (snap.get("tenors") or {}).values():
+            for src in ((bundle or {}).get("sources") or {}).values():
+                _do_source(src)
+        for bundle in (snap.get("funding") or {}).values():
+            for src in ((bundle or {}).get("sources") or {}).values():
+                _do_source(src)
+        # Weekly block (flat dicts with a single valueMode tag, no T1 sub-dict).
+        for wk in (snap.get("weekly") or {}).values():
+            if not wk:
+                continue
+            vm = wk.get("valueMode") or cfg.value_mode
+            self._invert_points_dict(wk, s_t, vm, PF)
+            wk["valueMode"] = "pips"
+
+        snap["valueMode"] = "pips"
+        snap["inverted"] = True
+
+    def _invert_history(self, cfg: CurrencyConfig,
+                        hist: Dict[str, List[Dict[str, Any]]],
+                        ric_meta: Dict[str, Dict[str, Any]]) -> None:
+        """WM/Reuters inverted quote: rewrite native (USD-per-local) history bars
+        into the conventional local-per-USD orientation IN PLACE, so the history
+        modal / backtests see the same numbers as the live snapshot.
+          - spot / outright PRICE bars → reciprocated (bid'=1/ask, ask'=1/bid);
+          - swap / funding POINT bars → reconstructed to native outright per date
+            (O = S_native + raw/PF or +raw) then re-expressed points'=(1/O−1/S)·PF;
+          - SOFR (pct) is a USD rate → left untouched.
+        Bars with no same-date native spot, or zero divisors, are left as-is."""
+        if not hist:
+            return
+        PF = float(cfg.pip_factor)
+        spot_ric = cfg.spot_ric
+        # Native per-date spot mid, built BEFORE we reciprocate the spot bars.
+        native_spot: Dict[str, float] = {}
+        for b in (hist.get(spot_ric) or []):
+            d = (b.get("Date") or "")[:10]
+            if not d:
+                continue
+            bid, ask = _num(b.get("BID")), _num(b.get("ASK"))
+            last = _num(b.get("TRDPRC_1"))
+            mid = (bid + ask) / 2.0 if (bid is not None and ask is not None) else last
+            if mid:
+                native_spot[d] = mid
+        for ric, bars in hist.items():
+            meta = ric_meta.get(ric) or {}
+            kind = meta.get("kind")
+            vm = meta.get("valueMode")
+            if kind == "sofr" or vm == "pct":
+                continue
+            # Price series (spot, or an outright RIC the frontend diffs vs spot):
+            # reciprocate both and the diff stays conventional — leave valueMode.
+            if kind in ("spot", "outright") or ric == spot_ric:
+                for b in (bars or []):
+                    b["BID"] = self._recip(_num(b.get("ASK")))
+                    b["ASK"] = self._recip(_num(b.get("BID")))
+                    b["TRDPRC_1"] = self._recip(_num(b.get("TRDPRC_1")))
+                continue
+            # Swap / funding POINT series → per-USD points using per-date spot.
+            for b in (bars or []):
+                d = (b.get("Date") or "")[:10]
+                s = native_spot.get(d)
+                if not s:
+                    continue
+                rb, ra = _num(b.get("BID")), _num(b.get("ASK"))
+                rl = _num(b.get("TRDPRC_1"))
+                b["BID"] = self._inv_point(ra, s, vm, PF)   # bid' from ask raw
+                b["ASK"] = self._inv_point(rb, s, vm, PF)   # ask' from bid raw
+                b["TRDPRC_1"] = self._inv_point(rl, s, vm, PF)
+            meta["valueMode"] = "pips"
+
     # ───── turn calendar payload ─────
     def _build_turns_payload(self, cfg: CurrencyConfig,
                              ipa: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -738,10 +916,20 @@ class MarketService:
             fix_date = ipa_entry.get("fixDate")
         if days is None:
             days = _days_for_tenor(m)  # IPA-approx: fallback when IPA unreachable
-        # daysFix: calendar days from today to fixDate (null if IPA didn't return one)
+        # daysFix: calendar days from SPOT (IPA startDate) to fixDate — spot-origin,
+        # matching the sibling `days` field (spot→VD). Fix precedes value, so daysFix
+        # must be ≤ days. (Was today→fix, which inflated it by the today→spot gap:
+        # e.g. KRW showed days=31 but daysFix=33, an impossible ordering.)
         days_fix = None
         fix_lag_days = None
-        if fix_date:
+        if fix_date and ipa_entry and ipa_entry.get("startDate"):
+            try:
+                days_fix = (date.fromisoformat(fix_date)
+                            - date.fromisoformat(ipa_entry["startDate"])).days
+            except Exception:
+                days_fix = None
+        elif fix_date:
+            # Last-resort fallback (pre-fix behaviour) when IPA gave no startDate.
             try:
                 days_fix = (date.fromisoformat(fix_date) - date.today()).days
             except Exception:
@@ -1033,6 +1221,8 @@ class MarketService:
             if start is not None:
                 kwargs["start"] = start.isoformat()
             hist = self.lseg.get_history(**kwargs)
+            if getattr(cfg, "inverted", False):
+                self._invert_history(cfg, hist, ric_meta)
             return {
                 "ccy": ccy, "pair": cfg.pair, "kind": cfg.kind,
                 "period": period, "interval": interval,
@@ -1123,6 +1313,13 @@ class MarketService:
         # don't re-fetch.
         if interval == "daily":
             self.absorb_history_as_t1(hist)
+
+        # WM/Reuters inverted quote: reciprocate spot + re-express swap-point bars
+        # into the conventional local-per-USD orientation. Run AFTER the T-1
+        # absorb above so the T-1 cache keeps NATIVE quotes (the live snapshot
+        # inverts those T-1 sub-dicts itself in _apply_inversion).
+        if getattr(cfg, "inverted", False):
+            self._invert_history(cfg, hist, ric_meta)
 
         return {
             "ccy": ccy, "pair": cfg.pair, "kind": cfg.kind,
@@ -1225,6 +1422,13 @@ class MarketService:
         if near_d is None or far_d is None:
             raise ValueError(f"invalid dates: near={near_date} far={far_date}")
 
+        # TODO(inverted): WM/Reuters inverted quotes (cfg.inverted, e.g. BWP) are
+        # NOT yet transformed on this fwd-fwd custom-dates path. The raw bars here
+        # are native (USD-per-local), so this derived spread series would be in the
+        # native orientation. The safe reconstruction (two-pass: native per-date
+        # spot, then points'=(1/O−1/S)·PF via _inv_point, reciprocate spot_by_date)
+        # mirrors _invert_history. Live snapshot + get_history are already inverted;
+        # this secondary path is left native until it's exercised for an inverted ccy.
         # Build per-day curves of swap points (in display pips).
         by_date: Dict[str, Dict[int, float]] = {}
         spot_by_date: Dict[str, float] = {}

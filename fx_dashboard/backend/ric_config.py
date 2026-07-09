@@ -281,6 +281,13 @@ class CurrencyConfig:
     # For outright-derived mode: broker tenor codes use 1Y/2Y not 12M/24M
     outright_prefer_year_code: bool = False
 
+    # WM/Reuters inverted quote: the RIC chain returns USD per 1 local unit
+    # (reciprocal of `pair`). When True the backend reciprocates spot and
+    # re-expresses swap points in the conventional local-per-USD orientation
+    # so the frontend stays convention-agnostic. E.g. BWP: BWP= ≈ 0.07085
+    # (USD per pula) = 1 / 14.11.
+    inverted: bool = False
+
     # NDF-only: weekly tenor collapses to single SW code (1W display label).
     ndf_weekly_single: bool = True
 
@@ -556,6 +563,7 @@ CURRENCIES: Dict[str, CurrencyConfig] = {
     "BWP": CurrencyConfig("BWP","USDBWP","DELIVERABLE", 1e4, 4, 1,
         [1,2,3,6,9,12,18,24], 24, "BWP=", "DELIVERABLE",
         value_mode="pips",
+        inverted=True,   # WM/Reuters INVERTED: BWP= returns USD per pula (~0.07085 = 1/14.11)
         brokers=["BGCP","ICAP","TDS","PYNY","TPTS"]),
 
     # ═══════ Deliverables — GCC + North Africa ═══════
