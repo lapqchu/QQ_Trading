@@ -440,9 +440,24 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
         const rics=Object.keys(data?.history||{});
         const ricMeta=data?.ricMeta||{};
         const spotMap=buildSpotMap(data);
-        // Pick the first funding RIC (prefer one matching contributor suffix, else base).
+        // Pick the funding RIC. D1: a contributor-matched RIC that is all-null
+        // (e.g. SGDON=ICAP/PYNY/TPTS) must NOT shadow the base {ccy}{tenor}= RIC
+        // which carries the real series — so only accept a RIC that has data.
+        const ricHasBars=(r)=>{
+          const bars=r?data.history[r]:null;
+          return !!(bars&&bars.some(b=>barMid(b)!=null));
+        };
         let chosen=null;
-        for(const r of rics){if(r.includes(`${fundingTenor}=`)&&(!contributor||r.endsWith(contributor))){chosen=r;break;}}
+        // 1) contributor-matched RIC, but only if it actually has data
+        if(contributor){
+          for(const r of rics){if(r.includes(`${fundingTenor}=`)&&r.endsWith(contributor)&&ricHasBars(r)){chosen=r;break;}}
+        }
+        // 2) base {ccy}{tenor}= RIC (composite) with data
+        const baseRic=`${ccy}${fundingTenor}=`;
+        if(!chosen&&ricHasBars(baseRic))chosen=baseRic;
+        // 3) any funding RIC with data
+        if(!chosen)for(const r of rics){if(r.includes(`${fundingTenor}=`)&&ricHasBars(r)){chosen=r;break;}}
+        // 4) last resort: any funding RIC by name (drives the >10 gate → unavailable if truly empty)
         if(!chosen)for(const r of rics){if(r.includes(`${fundingTenor}=`)){chosen=r;break;}}
         const bars=chosen?data.history[chosen]:[];
         const rawPts=bars.map(b=>{
@@ -498,8 +513,10 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
       });
       return()=>{cancelled=true;};
     }
-    getHistory(ccy,{period,contributor}).then(data=>{
-      if(cancelled)return;
+    // Process one history response: on success (>10 pts) set all state and
+    // return true; on failure return {pts,isSpread} so the caller can decide
+    // whether to retry (A2) or report unavailable.
+    const applyStd=(data)=>{
       setRawHistData(data); // store full response for carry decomp
       // If nrM/frM provided, this is a spread — compute from individual tenor legs
       const isSpread=nrM!=null&&frM!=null;
@@ -514,14 +531,38 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
         setSpotHist(buildSpotMap(data));
         // Build SOFR-per-date history for IY view: pick RIC matching current tenor, else fall back.
         setSofrHist(buildSofrHist(data,monthHint||(nrM!=null&&frM!=null?(frM-nrM):null)));
-      }else{
-        setHist(null);
-        setUnavailReason(pts&&pts.length>0
-          ?`Only ${pts.length} data points available (minimum 10 required)`
-          :isSpread
-            ?`No anchor data to build spread history (${nrM}M vs ${frM}M legs)`
-            :"No anchor data available from LSEG to build history for this tenor");
+        return true;
       }
+      return{pts,isSpread};
+    };
+    const reportUnavail=(res)=>{
+      const{pts,isSpread}=res;
+      setHist(null);
+      setUnavailReason(pts&&pts.length>0
+        ?`Only ${pts.length} data points available (minimum 10 required)`
+        :isSpread
+          ?`No anchor data to build spread history (${nrM}M vs ${frM}M legs)`
+          :"No anchor data available from LSEG to build history for this tenor");
+    };
+    getHistory(ccy,{period,contributor}).then(data=>{
+      if(cancelled)return;
+      const res=applyStd(data);
+      if(res===true){setLoading(false);return;}
+      // A2: an explicitly-picked broker that quotes only into the composite
+      // returns 0 bars on its own broker RICs. Retry the composite (no
+      // contributor) before declaring unavailable. Fallback ONLY — a broker
+      // that HAS its own history already succeeded above, so its own series
+      // still wins.
+      if(contributor){
+        getHistory(ccy,{period}).then(data2=>{
+          if(cancelled)return;
+          const res2=applyStd(data2);
+          if(res2!==true)reportUnavail(res2);
+          setLoading(false);
+        }).catch(()=>{if(!cancelled){reportUnavail(res);setLoading(false);}});
+        return;
+      }
+      reportUnavail(res);
       setLoading(false);
     }).catch((err)=>{
       if(!cancelled){

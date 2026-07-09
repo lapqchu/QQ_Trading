@@ -1233,11 +1233,26 @@ class MarketService:
             }
         if contributor:
             for m in cfg.anchor_tenors_m:
-                r = cfg.broker_ric(m, contributor)
-                rics.append(r)
-                ric_meta[r] = {"kind": "swap", "month": m, "source": contributor,
-                               "valueMode": vmode(contributor),
-                               "pipFactor": cfg.pip_factor}
+                if cfg.derive_from_outrights:
+                    # NGN etc: the broker SWAP-POINT RIC ({code}{t}NDF={broker})
+                    # is null — the only data lives in the broker OUTRIGHT RIC
+                    # ({code}{t}NDFOR={broker}). Tag it "outright_abs" +
+                    # deriveFromSpot (mirroring the custom endpoint) so the
+                    # frontend computes (raw − spot) × pf ≈ swap points instead
+                    # of requesting a dead swap-point RIC → 0 bars.
+                    r = cfg.outright_ric(m, broker=contributor)
+                    rics.append(r)
+                    ric_meta[r] = {"kind": "outright", "month": m,
+                                   "source": contributor,
+                                   "valueMode": "outright_abs",
+                                   "pipFactor": cfg.pip_factor,
+                                   "deriveFromSpot": True}
+                else:
+                    r = cfg.broker_ric(m, contributor)
+                    rics.append(r)
+                    ric_meta[r] = {"kind": "swap", "month": m, "source": contributor,
+                                   "valueMode": vmode(contributor),
+                                   "pipFactor": cfg.pip_factor}
         else:
             if cfg.derive_from_outrights:
                 # NGN: "composite" history = use first outright broker
@@ -1247,16 +1262,22 @@ class MarketService:
                         r = cfg.outright_ric(m, broker=pri)
                         rics.append(r)
                         # outright_ric carries OUTRIGHT prices (not swap pts);
-                        # frontend will diff against spot to derive pts.
+                        # frontend diffs against spot to derive pts. Tag
+                        # "outright_abs" (matching the custom endpoint) so the
+                        # frontend computes (raw − spot) × pf ≈ 11-160 swap pts
+                        # instead of charting the raw ~1400 outright price.
                         ric_meta[r] = {"kind": "outright", "month": m,
                                        "source": pri,
-                                       "valueMode": "outright",
+                                       "valueMode": "outright_abs",
                                        "pipFactor": cfg.pip_factor,
                                        "deriveFromSpot": True}
             else:
                 for m in cfg.anchor_tenors_m:
-                    if cfg.kind == "NDF" and m == 18 and cfg.composite_18m_fallback_brokers:
-                        # use first fallback broker for 18M composite history
+                    if (cfg.kind == "NDF" and m in (18, 24)
+                            and cfg.composite_18m_fallback_brokers):
+                        # NDF composite has no 18M ({code}18MNDF=) or 24M/2Y
+                        # ({code}2YNDF=) RIC — both are always null. Use the
+                        # first fallback broker's swap-point RIC for these tenors.
                         b = cfg.composite_18m_fallback_brokers[0]
                         r = cfg.broker_ric(m, b)
                         rics.append(r)
@@ -1308,6 +1329,56 @@ class MarketService:
         if start is not None:
             kwargs["start"] = start.isoformat()
         hist = self.lseg.get_history(**kwargs)
+
+        # Composite→broker fallback for DELIVERABLE 18M/24M: LSEG's composite
+        # {code}18M= / {code}2Y= RICs are null for several ccys even though a
+        # broker RIC ({code}18M=FMD, {code}18M=TDS, …) carries a full series
+        # (proven: THB/MXN 18M via TDS, SAR/QAR 18M via FMD, TWD/IDR/PHP 2Y).
+        # Only trigger when the composite RIC returned NO non-null bars, so
+        # genuine no-data ccys (KZT/UGX/MUR/BWP) correctly stay unavailable.
+        if not contributor and cfg.kind == "DELIVERABLE" and not cfg.derive_from_outrights:
+            # Prefer FMD then TDS (common cross-broker sources), then this ccy's
+            # own broker list, deduped in priority order.
+            fb_brokers = list(dict.fromkeys(["FMD", "TDS"] + list(cfg.brokers)))
+            fb_rics: List[str] = []
+            fb_targets: List[Tuple[int, str]] = []
+            for m in (18, 24):
+                if m not in cfg.anchor_tenors_m:
+                    continue
+                if _hist_has_bars(hist, cfg.swap_points_ric(m)):
+                    continue  # composite already has data — nothing to fix
+                for b in fb_brokers:
+                    br = cfg.broker_ric(m, b)
+                    if br in ric_meta:
+                        continue
+                    fb_rics.append(br)
+                    fb_targets.append((m, b))
+            if fb_rics:
+                fb_kwargs = {"rics": fb_rics, "fields": ["BID", "ASK", "TRDPRC_1"],
+                             "interval": interval, "end": end.isoformat()}
+                if start is not None:
+                    fb_kwargs["start"] = start.isoformat()
+                try:
+                    fb_hist = self.lseg.get_history(**fb_kwargs)
+                except Exception as e:
+                    log.info("deliverable 18M/24M fallback fetch failed: %s", e)
+                    fb_hist = {}
+                # First broker (in preference order) with non-null bars wins per tenor.
+                filled: Set[int] = set()
+                for (m, b) in fb_targets:
+                    if m in filled:
+                        continue
+                    br = cfg.broker_ric(m, b)
+                    if _hist_has_bars(fb_hist, br):
+                        hist[br] = fb_hist[br]
+                        ric_meta[br] = {"kind": "swap", "month": m, "source": b,
+                                        "valueMode": vmode(b),
+                                        "pipFactor": cfg.pip_factor,
+                                        "fallback": "composite_missing"}
+                        if br not in rics:
+                            rics.append(br)
+                        filled.add(m)
+
         # Opportunistic: every RIC in this daily history carries T-1 as its
         # penultimate bar — absorb into t1 cache so future IY D/D lookups
         # don't re-fetch.
@@ -1564,6 +1635,20 @@ def _num(x) -> Optional[float]:
         return v
     except (TypeError, ValueError):
         return None
+
+
+def _hist_has_bars(hist: Dict[str, List[Dict[str, Any]]], ric: str) -> bool:
+    """True iff `ric` has ≥1 bar with a non-null BID/ASK/TRDPRC_1.
+    Zero is a valid value (_num(0.0) → 0.0, not None), so 0-valued bars count."""
+    bars = (hist or {}).get(ric)
+    if not bars:
+        return False
+    for b in bars:
+        if (_num(b.get("BID")) is not None
+                or _num(b.get("ASK")) is not None
+                or _num(b.get("TRDPRC_1")) is not None):
+            return True
+    return False
 
 
 def _age(ts: Optional[float]) -> Optional[float]:
