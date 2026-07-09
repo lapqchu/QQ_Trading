@@ -1187,6 +1187,32 @@ class MarketService:
                     rics.append(r)
                     ric_mode[r] = vmode("composite")
 
+        # SOFR history for the USD leg of a fwd-fwd implied yield. Request the
+        # full SOFR anchor set (same as get_history) so a rate can be
+        # interpolated at BOTH the near and far value-date windows per bar.
+        sofr_rics: List[str] = list(SOFR_RICS.values())
+        sofr_ric_months: Dict[str, int] = {v: k for k, v in SOFR_RICS.items()}
+        for sr in sofr_rics:
+            ric_mode[sr] = "sofr"
+        rics = list(dict.fromkeys(rics + sofr_rics))
+
+        # ricMeta mirrors get_history's conventions (kind / valueMode /
+        # pipFactor) so the frontend can reuse buildSpotMap / buildSofrHist on
+        # this response to populate per-date spot + SOFR for the IY view.
+        ric_meta: Dict[str, Dict[str, Any]] = {}
+        for r, md in ric_mode.items():
+            if md == "spot":
+                ric_meta[r] = {"kind": "spot", "month": 0, "source": "spot",
+                               "valueMode": "outright", "pipFactor": cfg.pip_factor}
+            elif md == "sofr":
+                ric_meta[r] = {"kind": "sofr", "month": None, "source": "USD",
+                               "valueMode": "pct", "pipFactor": 1}
+            else:
+                ric_meta[r] = {"kind": "swap",
+                               "month": _tenor_months_from_ric(r, cfg),
+                               "source": contributor or "composite",
+                               "valueMode": md, "pipFactor": cfg.pip_factor}
+
         end = date.today()
         kwargs = {"rics": rics, "fields": ["BID", "ASK", "TRDPRC_1"],
                   "interval": interval, "end": end.isoformat()}
@@ -1202,6 +1228,7 @@ class MarketService:
         # Build per-day curves of swap points (in display pips).
         by_date: Dict[str, Dict[int, float]] = {}
         spot_by_date: Dict[str, float] = {}
+        sofr_by_date: Dict[str, Dict[int, float]] = {}
         PF = float(cfg.pip_factor)
         for ric, bars in (hist or {}).items():
             mode = ric_mode.get(ric, "pips")
@@ -1216,6 +1243,11 @@ class MarketService:
                     continue
                 if mode == "spot":
                     spot_by_date[d[:10]] = mid
+                    continue
+                if mode == "sofr":
+                    sm = sofr_ric_months.get(ric)
+                    if sm is not None:
+                        sofr_by_date.setdefault(d[:10], {})[sm] = mid
                     continue
                 m = _tenor_months_from_ric(ric, cfg)
                 if m is None:
@@ -1246,11 +1278,18 @@ class MarketService:
             if near_val is None or far_val is None:
                 skipped_curve_sparse += 1
                 continue
+            # USD leg (SOFR) interpolated to each value-date window so the
+            # frontend can build a proper fwd-fwd implied yield per bar.
+            sofr_curve = sofr_by_date.get(d_str)
+            sofr_near = _interp_curve_days(sofr_curve, near_days) if sofr_curve else None
+            sofr_far = _interp_curve_days(sofr_curve, far_days) if sofr_curve else None
             series.append({
                 "date": d_str,
                 "near": near_val, "far": far_val,
                 "spread": far_val - near_val,
                 "nearDays": near_days, "farDays": far_days,
+                "spot": spot_by_date.get(d_str),
+                "sofrNear": sofr_near, "sofrFar": sofr_far,
             })
 
         # Diagnostic reason when series is empty so the frontend can surface a
@@ -1266,6 +1305,8 @@ class MarketService:
             elif skipped_curve_sparse:
                 reason = "anchor curve too sparse to interpolate at requested days"
 
+        # Count of anchor RICs requested (exclude spot + SOFR) for diagnostics.
+        n_anchor_rics = sum(1 for md in ric_mode.values() if md not in ("spot", "sofr"))
         return {
             "ccy": ccy, "pair": cfg.pair,
             "nearDate": near_date, "farDate": far_date,
@@ -1274,8 +1315,11 @@ class MarketService:
             "series": series,
             "interpolated": True,
             "reason": reason,
-            "ricsRequested": len(rics) - 1,  # exclude spot
+            "ricsRequested": n_anchor_rics,
             "ricsWithData": len({m for c in by_date.values() for m in c.keys()}),
+            "history": hist,
+            "ricMeta": ric_meta,
+            "sofrRics": sofr_rics,
         }
 
 
@@ -1327,7 +1371,9 @@ def _age(ts: Optional[float]) -> Optional[float]:
 def _derive_pts_from_outright(spot_q: Quote, out_q: Quote,
                               cfg: CurrencyConfig) -> Optional[Dict[str, Any]]:
     """Convert broker outright → market-pts entry.  Bid/ask mapped 1:1.
-    Display convention follows ccy value_mode (outright here since NGN=outright)."""
+    The entry's raw values are outright−spot differences, so valueMode is
+    always "outright" (independent of cfg.value_mode). Applies to every
+    derive_from_outrights ccy (NGN outright-mode, EGP pips-mode, etc.)."""
     if out_q.bid is None and out_q.ask is None and out_q.last is None:
         return None
     sbid, sask = spot_q.bid, spot_q.ask
@@ -1344,7 +1390,12 @@ def _derive_pts_from_outright(spot_q: Quote, out_q: Quote,
         mid = out_q.mid() - smid
     return {
         "bid": bid, "ask": ask, "mid": mid, "last": None,
-        "valueMode": cfg.value_mode,
+        # Derived pts = outright − spot (absolute price diff) → ALWAYS
+        # outright-diff units, independent of the ccy's configured
+        # value_mode. Tagging cfg.value_mode mis-scales pips-mode
+        # derive-from-outright ccys (e.g. EGP). See diag: EGP FMD raw
+        # ~0.95 EGP must display ×pip_factor, not ×1.
+        "valueMode": "outright",
         "hasData": bid is not None or ask is not None or mid is not None,
     }
 

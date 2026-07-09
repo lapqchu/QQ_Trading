@@ -467,10 +467,21 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
         if(cancelled)return;
         const series=d?.series||[];
         if(series.length>10){
-          const rawPts=series.map(p=>({date:new Date(p.date),iso:p.date?String(p.date).slice(0,10):null,value:p.spread})).filter(p=>p.value!=null&&!isNaN(p.value));
+          // Carry both legs' swap pips + true spot→VD day windows (and per-window
+          // SOFR) alongside the pips spread so the IY view can build a proper
+          // forward-forward implied yield, not a mis-scaled single-leg 30d one.
+          const rawPts=series.map(p=>({
+            date:new Date(p.date),iso:p.date?String(p.date).slice(0,10):null,value:p.spread,
+            near:p.near,far:p.far,nearDays:p.nearDays,farDays:p.farDays,
+            spot:p.spot,sofrNear:p.sofrNear,sofrFar:p.sofrFar,
+          })).filter(p=>p.value!=null&&!isNaN(p.value));
           setRawHist(rawPts);
           setHist(transformPts(rawPts));
           setHistSource(d.interpolated?"interpolated":"direct");
+          // SOFR + spot now travel with the custom response — populate them the
+          // same way the standard history path does, else IY is all-null.
+          setSpotHist(buildSpotMap(d));
+          setSofrHist(buildSofrHist(d,frM??nrM??null));
         }else{
           setHist(null);
           // Backend now returns a `reason` field describing why series is empty
@@ -624,9 +635,43 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
           }
         }
         if(sofrForDate==null)sofrForDate=currentSofr;
+        // ── Forward-forward IY (custom absolute-date view) ──
+        // The custom backend carries both legs' swap pips + their true spot→VD
+        // day windows per bar. Build each leg's outright, its FX-implied yield,
+        // then the fwd-fwd rate across the near→far window (dF−dN) — NOT a fixed
+        // 30d single-leg reading of the spread. Falls back to per-window SOFR
+        // (sofrNear/sofrFar) with the single sofrHist value as backstop.
+        const rb=rawHist?.[i];
+        if(rb&&rb.near!=null&&rb.far!=null&&rb.nearDays&&rb.farDays&&rb.farDays>rb.nearDays){
+          const sp=spot!=null?spot:(rb.spot!=null?rb.spot:null);
+          if(sp==null)return null;
+          const sofrN=rb.sofrNear!=null?rb.sofrNear:sofrForDate;
+          const sofrF=rb.sofrFar!=null?rb.sofrFar:sofrForDate;
+          if(sofrN==null||sofrF==null)return null;
+          const iyN=implYld(sp+rb.near/PF,sp,sofrN,rb.nearDays);
+          const iyF=implYld(sp+rb.far/PF,sp,sofrF,rb.farDays);
+          return fwdFwdIy(iyN,rb.nearDays,iyF,rb.farDays);
+        }
         if(spot==null||sofrForDate==null)return null;
         const fwd=spot+pipVal/PF;
-        return implYld(fwd,spot,sofrForDate,tenorDaysVal);
+        // Per-bar spot→value-date day count for SPOT-START monthly tenors.
+        // Reusing today's tenorDaysVal for every historical bar mis-scales the
+        // displayed IY−SOFR basis: the true spot→VD calendar count drifts across
+        // the year (e.g. 1M is 28-31d), so today's constant scales old bars by
+        // d_true/d_today. Recompute from each bar's own date via the shared
+        // date helpers. Only for genuine month tenors (integer monthHint) that
+        // are not spreads/funding; otherwise fall back to tenorDaysVal.
+        let iyDays=tenorDaysVal;
+        if(monthHint!=null&&Number.isInteger(monthHint)&&nrM==null&&frM==null&&iso){
+          const barDate=new Date(iso+"T00:00:00");
+          if(!isNaN(barDate)){
+            const barSpot=computeSpotDate(barDate);    // ≈ spot = T+2 business days
+            const barVD=addMon(barSpot,monthHint);      // value date = spot + monthHint months
+            const perBarDays=daysBtwn(barSpot,barVD);   // calendar-day spot→VD count
+            if(perBarDays>0)iyDays=perBarDays;
+          }
+        }
+        return implYld(fwd,spot,sofrForDate,iyDays);
       });
     }
   }
@@ -1006,7 +1051,7 @@ function FundingTbl({ad,brokersMeta,onDbl}){
 }
 
 // ══════════════════════ SPREAD TABLE ══════════════════════
-function SprTbl({spreads,title,color,mx,onDbl,pdp=1}){
+function SprTbl({spreads,title,color,mx,onDbl,pdp=1,isNDF=true}){
   if(!spreads||!spreads.length){
     // Empty-state placeholder: keeps the table card present so two ccys of
     // the same kind always render the same set of sections.
@@ -1020,10 +1065,10 @@ function SprTbl({spreads,title,color,mx,onDbl,pdp=1}){
   return(<div style={{background:"#131C2E",borderRadius:5,padding:6,marginBottom:6}}>
     <div style={{fontSize:9.5,fontWeight:800,color,marginBottom:3,letterSpacing:".05em"}}>{title}</div>
     <div style={{overflowX:"auto"}}><table style={{borderCollapse:"collapse",width:"100%",minWidth:1080,fontSize:9}}>
-      <thead><tr><th style={{...tS(),textAlign:"left",minWidth:60,...STICKY_TH}}>Spread</th><th style={tS()}>Near Val</th><th style={tS()}>Near Fix</th><th style={tS()}>Far Val</th><th style={tS()}>Far Fix</th><th style={tS()}>Days</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#F87171")}>Ask</th><th style={tS()}>D/D</th><th style={tS()}>Pts/D</th><th style={tS("#4ADE80")}>Iy Bid</th><th style={tS("#34D399")}>Iy Mid</th><th style={tS("#F87171")}>Iy Ask</th><th style={tS()}>Iy D/D</th><th style={tS("#A78BFA")} title="Roll-down in pips: static-curve P&L from rolling forward by the spread horizon (1M for spot-start, near-leg days for fwd-fwd)">Roll Pip</th><th style={tS("#A78BFA")} title="Roll-down IY (bps): change in implied yield from rolling forward (post-roll = SPx(F-horizon))">Roll IY</th><th style={tS("#FB923C")}>SOFR%</th><th style={tS("#C084FC")}>Basis</th></tr></thead>
+      <thead><tr><th style={{...tS(),textAlign:"left",minWidth:60,...STICKY_TH}}>Spread</th><th style={tS()}>Near Val</th>{isNDF&&<th style={tS()}>Near Fix</th>}<th style={tS()}>Far Val</th>{isNDF&&<th style={tS()}>Far Fix</th>}<th style={tS()}>Days</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#F87171")}>Ask</th><th style={tS()}>D/D</th><th style={tS()}>Pts/D</th><th style={tS("#4ADE80")}>Iy Bid</th><th style={tS("#34D399")}>Iy Mid</th><th style={tS("#F87171")}>Iy Ask</th><th style={tS()}>Iy D/D</th><th style={tS("#A78BFA")} title="Roll-down in pips: static-curve P&L from rolling forward by the spread horizon (1M for spot-start, near-leg days for fwd-fwd)">Roll Pip</th><th style={tS("#A78BFA")} title="Roll-down IY (bps): change in implied yield from rolling forward (post-roll = SPx(F-horizon))">Roll IY</th><th style={tS("#FB923C")}>SOFR%</th><th style={tS("#C084FC")}>Basis</th></tr></thead>
       <tbody>{spreads.map((s,i)=>{const iso=d=>{if(!d)return null;const x=d instanceof Date?d:new Date(d);if(isNaN(x))return null;return x.toISOString().slice(0,10);};const ndIso=iso(s.nrVD),fdIso=iso(s.frVD);const rowBg=i%2===0?"#0F172A":"#131C2E";const isInterp=s.interp||s.dataSource==="interpolated";return(<tr key={i} style={{background:rowBg,cursor:s.unavailable?"default":"pointer",opacity:s.unavailable?.55:(isInterp?.78:1)}} onDoubleClick={()=>!s.unavailable&&onDbl&&onDbl(s.label,Math.abs(s.pM)||1,true,null,s.nrM,s.frM,ndIso,fdIso,s.fundingTenor||null)}>
         <td style={{...cS(isInterp?"#64748B":color,true),textAlign:"left",...stickyTd(rowBg)}} title={s.unavailable?s.unavailableReason:(isInterp?"interpolated — no direct RIC data":undefined)}>{s.label}{s.unavailable?" *":(isInterp?" \u2071":"")}</td>
-        <td style={cS("#475569")}>{fD(s.nrVD)}</td><td style={cS("#475569")}>{fD(s.nrFxD)}</td><td style={cS("#475569")}>{fD(s.frVD)}</td><td style={cS("#475569")}>{fD(s.frFxD)}</td><td style={cS("#475569",false,true)}>{s.days}</td>
+        <td style={cS("#475569")}>{fD(s.nrVD)}</td>{isNDF&&<td style={cS("#475569")}>{fD(s.nrFxD)}</td>}<td style={cS("#475569")}>{fD(s.frVD)}</td>{isNDF&&<td style={cS("#475569")}>{fD(s.frFxD)}</td>}<td style={cS("#475569",false,true)}>{s.days}</td>
         <td style={cS("#4ADE80")}>{FP(s.pB,pdp)}</td><td style={cS("#FBBF24",true)}>{FP(s.pM,pdp)}</td><td style={cS("#F87171")}>{FP(s.pA,pdp)}</td>
         <td style={{...cS(CC(s.chg)),background:HB(s.chg,mx)}}>{FP(s.chg,pdp)}</td><td style={cS("#64748B",false,true)}>{F(s.ppd,2)}</td>
         <td style={cS("#4ADE80")}>{F(s.fIyB,2)}</td><td style={cS("#34D399",true)}>{F(s.fIy,2)}</td><td style={cS("#F87171")}>{F(s.fIyA,2)}</td>
@@ -1173,9 +1218,9 @@ function ToolsPanel({ad,onDbl,ccy}){
           <div><span style={{color:"#64748B"}}>PPD: </span><span style={{color:"#22D3EE",fontFamily:"monospace"}}>{custom.ppd!=null?F(custom.ppd,2):"—"}</span></div>
           <div><span style={{color:"#64748B"}}>Fwd Impl: </span><span style={{color:"#10B981",fontFamily:"monospace"}}>{custom.fIy!=null?F(custom.fIy,2)+"%":"—"}</span></div>
           <div><span style={{color:"#64748B"}}>Near Val: </span><span style={{color:"#E2E8F0",fontFamily:"monospace"}}>{fD(custom.nrVD)}</span></div>
-          <div><span style={{color:"#64748B"}}>Near Fix: </span><span style={{color:"#E2E8F0",fontFamily:"monospace"}}>{fD(custom.nrFxD)}</span></div>
+          {ad?.cfg?.kind==="NDF"&&(<div><span style={{color:"#64748B"}}>Near Fix: </span><span style={{color:"#E2E8F0",fontFamily:"monospace"}}>{fD(custom.nrFxD)}</span></div>)}
           <div><span style={{color:"#64748B"}}>Far Val: </span><span style={{color:"#E2E8F0",fontFamily:"monospace"}}>{fD(custom.frVD)}</span></div>
-          <div><span style={{color:"#64748B"}}>Far Fix: </span><span style={{color:"#E2E8F0",fontFamily:"monospace"}}>{fD(custom.frFxD)}</span></div>
+          {ad?.cfg?.kind==="NDF"&&(<div><span style={{color:"#64748B"}}>Far Fix: </span><span style={{color:"#E2E8F0",fontFamily:"monospace"}}>{fD(custom.frFxD)}</span></div>)}
         </div></div>);})()}
     </div>
     <div style={{background:"#131C2E",borderRadius:5,padding:8}}>
@@ -1764,12 +1809,12 @@ export default function Dashboard(){
         <div style={{overflowX:"auto",overflowY:"auto",maxHeight:"34vh",borderRadius:5,border:"1px solid #1E293B",marginBottom:6}}>
           <table style={{borderCollapse:"collapse",width:"100%",minWidth:1700}}>
             <thead><tr>
-              <td colSpan={4} style={sS("#64748B")}>TENOR</td><td colSpan={3} style={sS("#60A5FA")}>{cfg.kind} OUTRIGHT</td>
+              <td colSpan={cfg.kind==="NDF"?4:3} style={sS("#64748B")}>TENOR</td><td colSpan={3} style={sS("#60A5FA")}>{cfg.kind} OUTRIGHT</td>
               <td colSpan={4} style={sS("#FBBF24")}>SWAP POINTS</td><td colSpan={4} style={sS("#34D399")}>IMPLIED YIELD*</td>
               <td colSpan={2} style={sS("#FB923C")}>SOFR</td><td colSpan={2} style={sS("#C084FC")}>BASIS</td>
               <td colSpan={2} style={sS("#A78BFA")}>ROLL-DOWN</td>
             </tr><tr>
-              <th style={{...tS(),textAlign:"left",minWidth:36,...STICKY_TH}}>Tnr</th><th style={tS()}>Val</th><th style={tS()}>Fix</th><th style={{...tS(),borderRight:"1px solid #334155"}}>D</th>
+              <th style={{...tS(),textAlign:"left",minWidth:36,...STICKY_TH}}>Tnr</th><th style={tS()}>Val</th>{cfg.kind==="NDF"&&<th style={tS()}>Fix</th>}<th style={{...tS(),borderRight:"1px solid #334155"}}>D</th>
               <th style={tS("#4ADE80")}>Bid</th><th style={tS("#F87171")}>Ask</th><th style={{...tS("#FBBF24"),borderRight:"1px solid #334155"}}>Mid</th>
               <th style={tS("#4ADE80")}>Bid</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#F87171")}>Ask</th><th style={{...tS(),borderRight:"1px solid #334155"}}>D/D</th>
               <th style={tS("#4ADE80")}>Bid</th><th style={tS("#34D399")}>Mid</th><th style={tS("#F87171")}>Ask</th><th style={{...tS(),borderRight:"1px solid #334155"}}>D/D</th>
@@ -1780,7 +1825,7 @@ export default function Dashboard(){
             <tbody>{filt.map((r,i)=>{const sp=r.month===0,mj=[0,1,2,3,6,9,12,24].includes(r.month);const bg=sp?"#1a2744":(i%2===0?"#0F172A":"#111827");const tc=r.suspect?"#78350F":(r.interp?"#475569":(mj?"#F8FAFC":"#94A3B8"));
               return(<tr key={r.tenor} style={{background:bg,borderBottom:[3,6,9,12].includes(r.month)?"1px solid #334155":"none",cursor:"pointer",opacity:r.suspect?0.5:1}} onDoubleClick={()=>dblR(r.tenor,r.spM,true,r.month)} title={r.suspect?r.suspectReason:undefined}>
                 <td style={{...cS(tc,mj),textAlign:"left",borderRight:"1px solid #1E293B",...stickyTd(bg)}}>{r.suspect?"\u26A0 ":""}{r.tenor}{r.interpolated?"\u2071":(r.interp?"*":"")}</td>
-                <td style={cS("#475569")}>{fD(r.valDate)}</td><td style={cS("#475569")}>{fD(r.fixDate)}</td><td style={{...cS("#475569"),borderRight:"1px solid #334155"}}>{r.dT||"—"}</td>
+                <td style={cS("#475569")}>{fD(r.valDate)}</td>{cfg.kind==="NDF"&&<td style={cS("#475569")}>{fD(r.fixDate)}</td>}<td style={{...cS("#475569"),borderRight:"1px solid #334155"}}>{r.dT||"—"}</td>
                 <td style={cS("#4ADE80")}>{F(r.bT,dp)}</td><td style={cS("#F87171")}>{F(r.aT,dp)}</td><td style={{...cS("#FBBF24",true),borderRight:"1px solid #334155"}}>{F(r.mT,dp)}</td>
                 <td style={cS("#4ADE80")}>{sp?"—":FP(r.spB,pdp)}</td><td style={cS("#FBBF24",true)}>{sp?"—":FP(r.spM,pdp)}</td><td style={cS("#F87171")}>{sp?"—":FP(r.spA,pdp)}</td>
                 <td style={{...cS(CC(r.pipChg)),borderRight:"1px solid #334155",background:sp?"transparent":HB(r.pipChg,mPC)}}>{sp?"—":FP(r.pipChg,pdp)}</td>
@@ -1797,9 +1842,9 @@ export default function Dashboard(){
             ccy of the same kind has the same layout. SprChart/SprTbl render
             an empty-state placeholder if rows is empty. */}
         <SprChart rows={pkM1} title={`${cfg.pair} 1M Forward-Forward chain`} color="#22D3EE" height={180}/>
-        <SprTbl spreads={pkM1} title={`${cfg.pair} 1M FWD-FWD CHAIN`} color="#22D3EE" mx={mSC} onDbl={dblR} pdp={pdp}/>
+        <SprTbl spreads={pkM1} title={`${cfg.pair} 1M FWD-FWD CHAIN`} color="#22D3EE" mx={mSC} onDbl={dblR} pdp={pdp} isNDF={cfg.kind==="NDF"}/>
         <SprChart rows={pkM3} title={`${cfg.pair} 3M Forward-Forward chain`} color="#8B5CF6"/>
-        <SprTbl spreads={pkM3} title={`${cfg.pair} 3M FWD-FWD CHAIN`} color="#8B5CF6" mx={mSC} onDbl={dblR} pdp={pdp}/>
+        <SprTbl spreads={pkM3} title={`${cfg.pair} 3M FWD-FWD CHAIN`} color="#8B5CF6" mx={mSC} onDbl={dblR} pdp={pdp} isNDF={cfg.kind==="NDF"}/>
       </>)}
 
       {/* SPREADS & ROLLS TAB — interbank anchors (NDF-only by trading-desk
@@ -1808,7 +1853,7 @@ export default function Dashboard(){
       {tab==="spreads"&&(<div>
         {cfg.kind==="NDF"&&(<>
           <SprChart rows={pkInterbank} title={`${cfg.pair} Interbank Anchors`} color="#10B981"/>
-          <SprTbl spreads={pkInterbank} title={`${cfg.pair} INTERBANK ANCHOR SPREADS`} color="#10B981" mx={mSC} onDbl={dblR} pdp={pdp}/>
+          <SprTbl spreads={pkInterbank} title={`${cfg.pair} INTERBANK ANCHOR SPREADS`} color="#10B981" mx={mSC} onDbl={dblR} pdp={pdp} isNDF={cfg.kind==="NDF"}/>
         </>)}
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginTop:6,marginBottom:6}}>
           <PChart traces={immR.length>0?[{x:immR.map(r=>r.tenor.split(" ")[1]),y:immR.map(r=>r.spM),type:"bar",name:"SwPts",marker:{color:"#3B82F6"}},{x:immR.map(r=>r.tenor.split(" ")[1]),y:immR.map(r=>r.iyM),type:"scatter",mode:"lines+markers",name:"Impl%",line:{color:"#10B981"},yaxis:"y2"}]:[]}
@@ -1822,9 +1867,9 @@ export default function Dashboard(){
             <div style={{color:"#475569",fontSize:9,fontStyle:"italic",padding:"6px 0"}}>no IMM data for this currency</div>
           ):(
             <div style={{overflowX:"auto"}}><table style={{borderCollapse:"collapse",width:"100%",minWidth:1200,fontSize:9}}>
-              <thead><tr><th style={{...tS(),textAlign:"left"}}>IMM</th><th style={tS()}>Val Date</th><th style={tS()}>Fix Date</th><th style={tS()}>Days</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#F87171")}>Ask</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#FBBF24")}>Pips</th><th style={tS()}>D/D</th><th style={tS("#34D399")}>Iy Mid</th><th style={tS()}>Iy D/D</th><th style={tS("#FB923C")}>SOFR</th><th style={tS("#C084FC")}>Basis</th><th style={tS("#A78BFA")}>FF</th><th style={tS()}>FF D/D</th><th style={tS("#34D399")}>FF Iy</th></tr></thead>
+              <thead><tr><th style={{...tS(),textAlign:"left"}}>IMM</th><th style={tS()}>Val Date</th>{cfg.kind==="NDF"&&<th style={tS()}>Fix Date</th>}<th style={tS()}>Days</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#F87171")}>Ask</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#FBBF24")}>Pips</th><th style={tS()}>D/D</th><th style={tS("#34D399")}>Iy Mid</th><th style={tS()}>Iy D/D</th><th style={tS("#FB923C")}>SOFR</th><th style={tS("#C084FC")}>Basis</th><th style={tS("#A78BFA")}>FF</th><th style={tS()}>FF D/D</th><th style={tS("#34D399")}>FF Iy</th></tr></thead>
               <tbody>{immR.map((r,i)=>(<tr key={i} style={{background:i%2===0?"#0F172A":"#131C2E",cursor:"pointer"}} onDoubleClick={()=>dblR(r.tenor,r.spM,true,r.month)}>
-                <td style={{...cS("#FB923C",true),textAlign:"left"}}>{r.tenor}</td><td style={cS("#475569")}>{fD(r.valDate)}</td><td style={cS("#475569")}>{fD(r.fixDate)}</td><td style={cS("#475569")}>{r.dT}</td>
+                <td style={{...cS("#FB923C",true),textAlign:"left"}}>{r.tenor}</td><td style={cS("#475569")}>{fD(r.valDate)}</td>{cfg.kind==="NDF"&&<td style={cS("#475569")}>{fD(r.fixDate)}</td>}<td style={cS("#475569")}>{r.dT}</td>
                 <td style={cS("#4ADE80")}>{F(r.bT,dp)}</td><td style={cS("#F87171")}>{F(r.aT,dp)}</td><td style={cS("#FBBF24",true)}>{F(r.mT,dp)}</td>
                 <td style={cS("#FBBF24",true)}>{FP(r.spM,pdp)}</td><td style={{...cS(CC(r.pipChg)),background:HB(r.pipChg,mPC)}}>{FP(r.pipChg,pdp)}</td>
                 <td style={cS("#34D399",true)}>{F(r.iyM,2)}</td><td style={{...cS(CC(r.iyChg)),background:HB(r.iyChg,mIC)}}>{FP(r.iyChg,2)}</td>
@@ -1834,7 +1879,7 @@ export default function Dashboard(){
               </tr>))}</tbody></table></div>
           )}
         </div>
-        <SprTbl spreads={immSpr} title={`${cfg.pair} IMM ROLL SPREADS`} color="#F59E0B" mx={mSC} onDbl={dblR} pdp={pdp}/>
+        <SprTbl spreads={immSpr} title={`${cfg.pair} IMM ROLL SPREADS`} color="#F59E0B" mx={mSC} onDbl={dblR} pdp={pdp} isNDF={cfg.kind==="NDF"}/>
       </div>)}
 
       {tab==="clean"&&<CleanDirtyPanel ad={ad} snap={snap} onDbl={dblR}/>}

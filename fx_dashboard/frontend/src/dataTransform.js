@@ -434,14 +434,18 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
       const rawT = snap.tenors?.[m] || snap.tenors?.[String(m)];
       if (!rawT) return;
       const picked = pickSource(applyLiveToTenor(rawT), selection);
-      if (picked && picked.source.outright) {
-        const o = picked.source.outright;
+      if (picked && picked.source) {
+        // Reconstruct outright for ANY source kind via outrightFromSource:
+        // outright_derived sources carry .outright; plain-broker swap sources
+        // (e.g. EGP GMGM, tagged pips) are rebuilt from spot + pts/PF. Prevents
+        // a plain-broker-only tenor from dropping out of the interpolation curve.
+        const o = outrightFromSource(picked.source, sMT, PF);
         const d = daysForCurve(snap, m);
-        if (d != null && o.mid != null) {
+        if (d != null && o.m != null) {
           outDays.push(d);
-          outM.push(o.mid);
-          outB.push(o.bid ?? o.mid);
-          outA.push(o.ask ?? o.mid);
+          outM.push(o.m);
+          outB.push(o.b ?? o.m);
+          outA.push(o.a ?? o.m);
         }
       }
     });
@@ -510,12 +514,16 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
       bT = spotT.b; aT = spotT.a; mT = spotT.m;
       bT1 = spotT1.b; aT1 = spotT1.a; mT1 = spotT1.m;
     } else if (deriveFromOutrights && isK) {
-      // NGN and similar: sources carry outright.{bid,ask,mid} — use them directly (pick first selected).
+      // Derive-from-outright ccys: rebuild the outright for whichever source is
+      // picked. outright_derived sources (NGN MBGL, EGP FMD/TDS) carry .outright;
+      // plain-broker swap sources (EGP GMGM, tagged pips) are rebuilt from
+      // spot + pts/PF via outrightFromSource so a broker-only tenor still shows
+      // an outright instead of blanking.
       const rawT = snap.tenors?.[month] || snap.tenors?.[String(month)];
       const picked = pickSource(applyLiveToTenor(rawT), selection);
-      if (picked && picked.source.outright) {
-        const o = picked.source.outright;
-        bT = o.bid; aT = o.ask; mT = o.mid;
+      const o = picked && picked.source ? outrightFromSource(picked.source, sMT, PF) : null;
+      if (o && o.m != null) {
+        bT = o.b; aT = o.a; mT = o.m;
       } else {
         bT = null; aT = null; mT = null;
       }

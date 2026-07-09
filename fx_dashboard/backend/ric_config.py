@@ -574,7 +574,11 @@ CURRENCIES: Dict[str, CurrencyConfig] = {
         value_mode="pips",
         brokers=["BGCP","ICAP","TDS","PYNY","TPTS"]),
 
-    "TND": CurrencyConfig("TND","USDTND","DELIVERABLE", 1e3, 3, 1,
+    "TND": CurrencyConfig("TND","USDTND","DELIVERABLE", 1e4, 4, 1,  # was 1e3,3 (wrong):
+        # USDTND spot is quoted to 4dp → 1 pip = 1e-4, so pip_factor must be 1e4
+        # (matches ILS/PLN peers). Live 1M fwd pts ~67.5 reconcile to IY ~7% (≈ BCT
+        # TMM 6.99%) only at 1e4; 1e3 produced a bogus ~29.5%. Same class as the
+        # earlier ZAR/TRY 1e2→1e4 corrections.
         [1,2,3,6,9,12,18,24], 24, "TND=", "DELIVERABLE",
         value_mode="pips",
         brokers=["BGCP","ICAP","TDS","PYNY","TPTS"]),
