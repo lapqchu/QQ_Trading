@@ -102,6 +102,11 @@ function iyDiagTip(r){
     "pts(pips)=" + F(d.ptsPipsDisplay, 2),
   ];
   if (d.iyRef != null) lines.push("IPA IY=" + F(d.iyRef, 2) + "% (independent ref)");
+  if (d.iyDf != null) {
+    lines.push("DF IY=" + F(d.iyDf, 2) + "% (firm-standard OIS"
+               + (d.iyDfVsM != null ? ", Δ" + (d.iyDfVsM >= 0 ? "+" : "") + F(d.iyDfVsM, 2) : "")
+               + ")");
+  }
   if (d.suspectIyEqualsSofr) {
     lines.push("WARN: IY≈SOFR — likely value_mode / pip-factor unit bug"
                + (d.suspectReason ? " [" + d.suspectReason + "]" : ""));

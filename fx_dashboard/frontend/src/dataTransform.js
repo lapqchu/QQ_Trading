@@ -544,6 +544,15 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
     const sofT = sofTRaw != null && isFinite(sofTRaw) ? sofTRaw : (month === 0 ? 0 : null);
     const sofT1 = sofT1Raw != null && isFinite(sofT1Raw) ? sofT1Raw : (month === 0 ? 0 : null);
 
+    // Backend discount-factor IY (firm-standard OIS methodology, composite-based):
+    // a selection-independent reference shown alongside the selection-aware CIP
+    // iyM. At anchor tenors iyM(composite)==iyDf exactly (co-located SOFR node);
+    // the DF value additionally interpolates the USD leg at off-node day counts.
+    const iyDfRef = (() => {
+      const rb = snap.tenors?.[month] || snap.tenors?.[String(month)];
+      return rb && typeof rb.iyDf === "number" ? rb.iyDf : null;
+    })();
+
     // IY math: ALWAYS use spot→value-date days (daysVal). Using dT (= daysFix
     // for NDFs) systematically biases the implied yield by ~2bd worth of
     // discount, which materially distorts KRW/INR/CNY/etc IY values.
@@ -627,6 +636,8 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
           ptsPipsDisplay: spM,
           ptsOutright: spM != null ? spM / PF : null,
           iyRef, iyVsRef,
+          iyDf: iyDfRef,
+          iyDfVsM: (iyDfRef != null && iyM != null) ? iyM - iyDfRef : null,
           suspectIyEqualsSofr,
           suspectReason,
         }
@@ -639,6 +650,7 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
       spB, spM, spA, spB1, spM1, spA1,
       ptsPerDay: dT > 0 && spM != null ? spM / dT : null,
       sofT, sofT1, iyB, iyM, iyA, iyB1, iyM1, iyA1,
+      iyDf: iyDfRef,
       basisT, basisT1, iyBpD,
       interp: !isK && month !== 0,
       valDate, fixDate,
