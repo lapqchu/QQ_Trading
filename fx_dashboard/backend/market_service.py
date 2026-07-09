@@ -31,6 +31,7 @@ from dataclasses import dataclass
 
 from lseg_client import LsegClient
 from turns import generate_turns, turn_types_for
+from discount_curve import DiscountCurve, implied_yield
 from ric_config import (
     CURRENCIES, SOFR_RICS, FUNDING_TENORS, BROKER_META,
     CurrencyConfig,
@@ -501,7 +502,77 @@ class MarketService:
             self._auto_detect_value_modes(cfg, snap)
         except Exception as e:
             log.info("value_mode auto-detect failed for %s: %s", cfg.code, e)
+
+        # Discount-factor (OIS) implied yields alongside the frontend's CIP.
+        # Runs LAST so it reads the finalized valueMode/inversion per source. The
+        # frontend prefers iyDf when present and falls back to CIP otherwise.
+        try:
+            self._apply_df_yields(cfg, snap)
+        except Exception as e:
+            log.info("DF-yield computation failed for %s: %s", cfg.code, e)
         return snap
+
+    # ───── discount-factor implied yields ─────
+    def _apply_df_yields(self, cfg: CurrencyConfig, snap: Dict[str, Any]) -> None:
+        """
+        Per-tenor implied yield via the discount-factor curve (firm-standard
+        methodology): build a USD DF curve from the SOFR block, form each ccy
+        forward outright, and compute the ccy zero from DF_ccy = DF_usd*S/F.
+
+        Writes snap.tenors[m]['iyDf'] (percent) + ['iyMethod']='df' in-place.
+        Left absent when spot/curve/outright are unavailable (frontend -> CIP).
+        The USD leg co-locates each SOFR node at the matching ccy tenor's day
+        count, so DF_usd(days) is exact at the tenor and log-linear between.
+        """
+        spot_mid = ((snap.get("spot") or {}).get("T") or {}).get("mid")
+        if not spot_mid or spot_mid <= 0:
+            return
+        tenors = snap.get("tenors") or {}
+        sofr = snap.get("sofr") or {}
+
+        # USD DF curve: {day_count: SOFR mid pct}, keyed off the co-located tenor.
+        usd_nodes: Dict[float, float] = {}
+        for mk, sblk in sofr.items():
+            rate = ((sblk or {}).get("T") or {}).get("mid")
+            bundle = tenors.get(mk) or tenors.get(str(mk))
+            days_m = (bundle or {}).get("days")
+            if rate is not None and days_m:
+                usd_nodes[float(days_m)] = float(rate)
+        if not usd_nodes:
+            return
+        usd_curve = DiscountCurve.from_ois(usd_nodes)
+        PF = cfg.pip_factor or 1.0
+
+        for mk, bundle in tenors.items():
+            days = bundle.get("days")
+            if not days or days <= 0:
+                continue
+            srcs = bundle.get("sources") or {}
+            src = srcs.get("composite")
+            if not (isinstance(src, dict) and src.get("hasData")):
+                src = next((v for v in srcs.values()
+                            if isinstance(v, dict) and v.get("hasData")), None)
+            if not isinstance(src, dict):
+                continue
+            pts_mid = src.get("mid")
+            if pts_mid is None:
+                b, a = src.get("bid"), src.get("ask")
+                pts_mid = (b + a) / 2.0 if (b is not None and a is not None) else None
+            if pts_mid is None:
+                continue
+            vm = src.get("valueMode") or cfg.value_mode
+            if vm == "outright_abs":
+                outright = pts_mid                       # points ARE the outright
+            elif vm == "outright":
+                outright = spot_mid + pts_mid            # outright-diff price units
+            else:                                        # "pips"
+                outright = spot_mid + pts_mid / PF
+            if not outright or outright <= 0:
+                continue
+            iy = implied_yield(outright, spot_mid, usd_curve, float(days))
+            if iy is not None:
+                bundle["iyDf"] = round(iy, 4)
+                bundle["iyMethod"] = "df"
 
     # ───── value_mode auto-detect ─────
     def _auto_detect_value_modes(self, cfg: CurrencyConfig, snap: Dict[str, Any]) -> None:
