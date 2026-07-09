@@ -606,7 +606,27 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
   let vals=[];
   if(hist){
     if(viewMode==="swap"){vals=hist.map(h=>h.value);}
-    else if(viewMode==="ppd"){vals=hist.map(h=>h.value*365/Math.max(tenorDays,1)/PF);}
+    else if(viewMode==="ppd"){
+      // Per-bar spot→VD day count for integer-month spot-start tenors (mirror of
+      // the IY branch below). Reusing today's constant tenorDays for every bar
+      // mis-scales old bars because the true spot→VD window drifts across the year
+      // (e.g. 1M is 28-31d). Recompute from each bar's own date; fall back to
+      // tenorDays for spreads/funding/non-integer tenors.
+      vals=hist.map((h,i)=>{
+        let ppdDays=tenorDays;
+        const iso=rawHist?.[i]?.iso??(h.date instanceof Date?h.date.toISOString().slice(0,10):null);
+        if(monthHint!=null&&Number.isInteger(monthHint)&&nrM==null&&frM==null&&iso){
+          const barDate=new Date(iso+"T00:00:00");
+          if(!isNaN(barDate)){
+            const barSpot=computeSpotDate(barDate);
+            const barVD=addMon(barSpot,monthHint);
+            const perBarDays=daysBtwn(barSpot,barVD);
+            if(perBarDays>0)ppdDays=perBarDays;
+          }
+        }
+        return h.value*365/Math.max(ppdDays,1)/PF;
+      });
+    }
     else if(viewMode==="iy"){
       // hist[i].value is in display PIPS (per-RIC normalized). For a spot-start
       // tenor: fwd outright = spot + pips/pipFactor.
@@ -835,6 +855,14 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
   const yLabel=viewMode==="swap"?(isSwapPts?"Swap Points (pips)":"Level")
     :viewMode==="iy"?"Implied Yield (%)"
     :viewMode==="ppd"?"PPD":"Carry Decomp (pips)";
+  // Stat/backtest unit labels + precision must follow the VIEW (swap/iy/ppd), not
+  // the instrument flag isSwapPts (which never changes with the toggle). In IY/PPD
+  // views a swap-pts row otherwise shows swap precision + "pts" for values that are
+  // really % / ppd. showSwapPts is true only when we are actually rendering swap
+  // points, so swap-view output stays byte-identical (it collapses to isSwapPts there).
+  const showSwapPts=isSwapPts&&viewMode==="swap";
+  const unitLbl=viewMode==="iy"?"%":viewMode==="ppd"?"ppd":"pts";
+  const btYLbl=viewMode==="iy"?"Implied Yield (%)":viewMode==="ppd"?"PPD":"Points";
   // Consistency indicator: last bar vs. live mid (swap-pts view only).
   // History is requested through end=today, so the final bar can be today's
   // still-forming intraday snapshot — which legitimately differs from a later
@@ -962,21 +990,21 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
           </div>)}
           {viewMode!=="carryDecomp"&&<div style={{background:"#131C2E",borderRadius:5,padding:6,overflow:"auto",maxHeight:460}}>
             <div style={{fontSize:8,fontWeight:800,color:"#60A5FA",marginBottom:3,letterSpacing:".1em"}}>HIGH / LOW</div>
-            {stats&&Object.entries(stats.ranges).map(([k,v])=>(<div key={k} style={{display:"flex",justifyContent:"space-between",padding:"1px 0",fontSize:8.5,borderBottom:"1px solid #1E293B"}}><span style={{color:"#64748B",width:22}}>{k}</span><span style={{color:"#4ADE80",fontFamily:"monospace"}}>{v.low.toFixed(isSwapPts?1:3)}</span><span style={{color:"#64748B"}}>—</span><span style={{color:"#F87171",fontFamily:"monospace"}}>{v.high.toFixed(isSwapPts?1:3)}</span></div>))}
+            {stats&&Object.entries(stats.ranges).map(([k,v])=>(<div key={k} style={{display:"flex",justifyContent:"space-between",padding:"1px 0",fontSize:8.5,borderBottom:"1px solid #1E293B"}}><span style={{color:"#64748B",width:22}}>{k}</span><span style={{color:"#4ADE80",fontFamily:"monospace"}}>{v.low.toFixed(showSwapPts?1:3)}</span><span style={{color:"#64748B"}}>—</span><span style={{color:"#F87171",fontFamily:"monospace"}}>{v.high.toFixed(showSwapPts?1:3)}</span></div>))}
             <div style={{fontSize:8,fontWeight:800,color:"#10B981",marginTop:5,marginBottom:3,letterSpacing:".1em"}}>STATISTICS</div>
-            {stats&&<><SR l="Current" v={stats.current} dp={isSwapPts?1:(dpOverride||3)}/><SR l="Mean" v={stats.mean} dp={isSwapPts?1:(dpOverride||3)}/><SR l="Std Dev" v={stats.sd} dp={isSwapPts?1:4}/><SR l="Skewness" v={stats.skew} dp={2}/><SR l="Kurtosis" v={stats.kurt} dp={2}/><SR l="Pctl Rank" v={`${stats.pctR.toFixed(0)}%`}/></>}
+            {stats&&<><SR l="Current" v={stats.current} dp={showSwapPts?1:(dpOverride||3)}/><SR l="Mean" v={stats.mean} dp={showSwapPts?1:(dpOverride||3)}/><SR l="Std Dev" v={stats.sd} dp={showSwapPts?1:4}/><SR l="Skewness" v={stats.skew} dp={2}/><SR l="Kurtosis" v={stats.kurt} dp={2}/><SR l="Pctl Rank" v={`${stats.pctR.toFixed(0)}%`}/></>}
             <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginTop:5,marginBottom:3}}>
               <span style={{fontSize:8,fontWeight:800,color:"#F87171",letterSpacing:".1em"}}>SIGMA-MOVE</span>
               <div style={{display:"flex",alignItems:"center",gap:2}}><span style={{fontSize:7,color:"#64748B"}}>N:</span>
                 <input type="number" value={sigN} onChange={e=>setSigN(Math.max(5,Math.min(252,+e.target.value||20)))} style={{background:"#0F172A",border:"1px solid #334155",color:"#E2E8F0",borderRadius:3,padding:"0 3px",fontSize:8,width:34,fontFamily:"monospace"}}/></div>
             </div>
-            {stats&&<><SR l="Today's Δ" v={stats.dayChg!=null?stats.dayChg:"—"} dp={isSwapPts?1:4}/>
-            <SR l={`${sigN}d σ(Δ)`} v={stats.rollSd!=null?stats.rollSd:"—"} dp={isSwapPts?2:5}/>
+            {stats&&<><SR l="Today's Δ" v={stats.dayChg!=null?stats.dayChg:"—"} dp={showSwapPts?1:4}/>
+            <SR l={`${sigN}d σ(Δ)`} v={stats.rollSd!=null?stats.rollSd:"—"} dp={showSwapPts?2:5}/>
             <div style={{display:"flex",justifyContent:"space-between",padding:"1px 0",borderBottom:"1px solid #1E293B",fontSize:8.5}}><span style={{color:"#64748B"}}>σ-Move</span><span style={{color:stats.sigmaMove==null?"#475569":(Math.abs(stats.sigmaMove)>=2?"#F87171":Math.abs(stats.sigmaMove)>=1?"#FBBF24":"#4ADE80"),fontFamily:"monospace",fontWeight:700}}>{stats.sigmaMove!=null?stats.sigmaMove.toFixed(2)+"σ":"—"}</span></div></>}
             <div style={{fontSize:8,fontWeight:800,color:"#FBBF24",marginTop:5,marginBottom:3,letterSpacing:".1em"}}>INDICATORS</div>
-            <SR l="SMA(20)" v={s20[s20.length-1]} dp={isSwapPts?1:(dpOverride||3)}/><SR l="SMA(50)" v={s50[s50.length-1]} dp={isSwapPts?1:(dpOverride||3)}/><SR l="RSI(14)" v={rsiD[rsiD.length-1]} dp={1}/><SR l="MACD" v={macdD.line[macdD.line.length-1]} dp={4}/><SR l="BB Upper" v={bb.upper[bb.upper.length-1]} dp={isSwapPts?1:(dpOverride||3)}/><SR l="BB Lower" v={bb.lower[bb.lower.length-1]} dp={isSwapPts?1:(dpOverride||3)}/>
-            {stats&&<><SR l={`SMA(${sigN})`} v={stats.smaN!=null?stats.smaN:"—"} dp={isSwapPts?1:(dpOverride||3)}/>
-            <SR l="Dev from MA" v={stats.devMA!=null?stats.devMA:"—"} dp={isSwapPts?1:4}/>
+            <SR l="SMA(20)" v={s20[s20.length-1]} dp={showSwapPts?1:(dpOverride||3)}/><SR l="SMA(50)" v={s50[s50.length-1]} dp={showSwapPts?1:(dpOverride||3)}/><SR l="RSI(14)" v={rsiD[rsiD.length-1]} dp={1}/><SR l="MACD" v={macdD.line[macdD.line.length-1]} dp={4}/><SR l="BB Upper" v={bb.upper[bb.upper.length-1]} dp={showSwapPts?1:(dpOverride||3)}/><SR l="BB Lower" v={bb.lower[bb.lower.length-1]} dp={showSwapPts?1:(dpOverride||3)}/>
+            {stats&&<><SR l={`SMA(${sigN})`} v={stats.smaN!=null?stats.smaN:"—"} dp={showSwapPts?1:(dpOverride||3)}/>
+            <SR l="Dev from MA" v={stats.devMA!=null?stats.devMA:"—"} dp={showSwapPts?1:4}/>
             <div style={{display:"flex",justifyContent:"space-between",padding:"1px 0",borderBottom:"1px solid #1E293B",fontSize:8.5}}><span style={{color:"#64748B"}}>Z(Dev,{sigN})</span><span style={{color:stats.zDev==null?"#475569":(Math.abs(stats.zDev)>=2?"#F472B6":Math.abs(stats.zDev)>=1?"#FBBF24":"#4ADE80"),fontFamily:"monospace",fontWeight:700}}>{stats.zDev!=null?stats.zDev.toFixed(2):"—"}</span></div></>}
           </div>}
         </div>
@@ -1000,15 +1028,15 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
               <tbody>{btRes.map((s,i)=>(<tr key={i} style={{background:selSt===i?"#1E3A5F":i%2===0?"#0F172A":"#131C2E",cursor:s.unavail?"default":"pointer"}} onClick={()=>!s.unavail&&setSelSt(selSt===i?null:i)} onMouseEnter={()=>setHovSt(s.name)} onMouseLeave={()=>setHovSt(null)}>
                 <td style={{...cS("#CBD5E1",true),textAlign:"left"}}>{s.name}</td>
                 <td style={cS(s.unavail?"#475569":(s.sharpe>0?"#FBBF24":"#F472B6"),!s.unavail)}>{s.unavail?"—":s.sharpe.toFixed(2)}</td>
-                <td style={cS(s.unavail?"#475569":(s.cumRet>=0?"#4ADE80":"#F87171"))}>{s.unavail?"—":FP(s.cumRet,isSwapPts?1:3)+" pts"}</td>
-                <td style={cS(s.unavail?"#475569":"#F87171")}>{s.unavail?"—":F(s.maxDD,isSwapPts?1:3)+" pts"}</td>
+                <td style={cS(s.unavail?"#475569":(s.cumRet>=0?"#4ADE80":"#F87171"))}>{s.unavail?"—":FP(s.cumRet,showSwapPts?1:3)+" "+unitLbl}</td>
+                <td style={cS(s.unavail?"#475569":"#F87171")}>{s.unavail?"—":F(s.maxDD,showSwapPts?1:3)+" "+unitLbl}</td>
                 <td style={cS("#64748B")}>{s.unavail?"—":(s.winRate*100).toFixed(0)+"%"}</td>
                 <td style={cS(s.unavail?"#F87171":"#4ADE80")}>{s.unavail?<span title={s.reason}>N/A</span>:"OK"}</td>
               </tr>))}</tbody>
             </table>
             {selSt!=null&&btRes[selSt]&&!btRes[selSt].unavail&&(()=>{const st=btRes[selSt];
               return(<div>
-                <PChart traces={[{x:st.dates,y:st.eqC.slice(1),type:"scatter",mode:"lines",name:"Cum P&L (pts)",line:{color:"#10B981",width:1.5}}]} layout={{title:{text:`${st.name} — Cumulative P&L (pts)`,font:{size:9,color:"#94A3B8"}},yaxis:{title:"Points"},shapes:[{type:"line",y0:0,y1:0,x0:0,x1:1,xref:"paper",line:{color:"#475569",dash:"dot"}}]}} height={110} revisionKey={`bt-eq-${tenor}-${selSt}-${btPeriod}`}/>
+                <PChart traces={[{x:st.dates,y:st.eqC.slice(1),type:"scatter",mode:"lines",name:`Cum P&L (${unitLbl})`,line:{color:"#10B981",width:1.5}}]} layout={{title:{text:`${st.name} — Cumulative P&L (${unitLbl})`,font:{size:9,color:"#94A3B8"}},yaxis:{title:btYLbl},shapes:[{type:"line",y0:0,y1:0,x0:0,x1:1,xref:"paper",line:{color:"#475569",dash:"dot"}}]}} height={110} revisionKey={`bt-eq-${tenor}-${selSt}-${btPeriod}`}/>
                 <PChart traces={[{x:st.dates,y:st.rollSh,type:"scatter",mode:"lines",name:"Roll 20d Sharpe",line:{color:"#FBBF24",width:1.3}}]} layout={{title:{text:"Rolling 20d Sharpe",font:{size:9,color:"#94A3B8"}},shapes:[{type:"line",y0:0,y1:0,x0:0,x1:1,xref:"paper",line:{color:"#475569",dash:"dot"}}]}} height={100} revisionKey={`bt-sh-${tenor}-${selSt}-${btPeriod}`}/>
               </div>);})()}
           </div>
@@ -1862,21 +1890,21 @@ export default function Dashboard(){
             layout={{title:{text:`${cfg.pair} IMM Roll Spreads${immSpr.length===0?" — no data":""}`,font:{size:10}},yaxis:{title:"Pips"},yaxis2:{title:"%",overlaying:"y",side:"right",gridcolor:"transparent"}}} height={185} revisionKey={`imm-rolls-${ccy}`}/>
         </div>
         <div style={{background:"#131C2E",borderRadius:5,padding:6,marginBottom:6}}>
-          <div style={{fontSize:9.5,fontWeight:800,color:"#FB923C",marginBottom:3}}>{cfg.pair} IMM OUTRIGHTS</div>
+          <div style={{fontSize:9.5,fontWeight:800,color:"#FB923C",marginBottom:3}}>{cfg.pair} IMM OUTRIGHTS <span style={{fontWeight:400,fontSize:7.5,color:"#64748B"}}>ⁱ interpolated from the curve — not broker-quoted</span></div>
           {immR.length===0?(
             <div style={{color:"#475569",fontSize:9,fontStyle:"italic",padding:"6px 0"}}>no IMM data for this currency</div>
           ):(
             <div style={{overflowX:"auto"}}><table style={{borderCollapse:"collapse",width:"100%",minWidth:1200,fontSize:9}}>
               <thead><tr><th style={{...tS(),textAlign:"left"}}>IMM</th><th style={tS()}>Val Date</th>{cfg.kind==="NDF"&&<th style={tS()}>Fix Date</th>}<th style={tS()}>Days</th><th style={tS("#4ADE80")}>Bid</th><th style={tS("#F87171")}>Ask</th><th style={tS("#FBBF24")}>Mid</th><th style={tS("#FBBF24")}>Pips</th><th style={tS()}>D/D</th><th style={tS("#34D399")}>Iy Mid</th><th style={tS()}>Iy D/D</th><th style={tS("#FB923C")}>SOFR</th><th style={tS("#C084FC")}>Basis</th><th style={tS("#A78BFA")}>FF</th><th style={tS()}>FF D/D</th><th style={tS("#34D399")}>FF Iy</th></tr></thead>
-              <tbody>{immR.map((r,i)=>(<tr key={i} style={{background:i%2===0?"#0F172A":"#131C2E",cursor:"pointer"}} onDoubleClick={()=>dblR(r.tenor,r.spM,true,r.month)}>
-                <td style={{...cS("#FB923C",true),textAlign:"left"}}>{r.tenor}</td><td style={cS("#475569")}>{fD(r.valDate)}</td>{cfg.kind==="NDF"&&<td style={cS("#475569")}>{fD(r.fixDate)}</td>}<td style={cS("#475569")}>{r.dT}</td>
+              <tbody>{immR.map((r,i)=>{const isInterp=r.interp||r.dataSource==="interp"||r.dataSource==="interpolated";return(<tr key={i} style={{background:i%2===0?"#0F172A":"#131C2E",cursor:"pointer",opacity:isInterp?.78:1}} onDoubleClick={()=>dblR(r.tenor,r.spM,true,r.month)}>
+                <td style={{...cS(isInterp?"#64748B":"#FB923C",true),textAlign:"left"}} title={isInterp?"interpolated — no direct RIC data (curve-derived, not broker-quoted)":undefined}>{r.tenor}{isInterp?" ⁱ":""}</td><td style={cS("#475569")}>{fD(r.valDate)}</td>{cfg.kind==="NDF"&&<td style={cS("#475569")}>{fD(r.fixDate)}</td>}<td style={cS("#475569")}>{r.dT}</td>
                 <td style={cS("#4ADE80")}>{F(r.bT,dp)}</td><td style={cS("#F87171")}>{F(r.aT,dp)}</td><td style={cS("#FBBF24",true)}>{F(r.mT,dp)}</td>
                 <td style={cS("#FBBF24",true)}>{FP(r.spM,pdp)}</td><td style={{...cS(CC(r.pipChg)),background:HB(r.pipChg,mPC)}}>{FP(r.pipChg,pdp)}</td>
                 <td style={cS("#34D399",true)}>{F(r.iyM,2)}</td><td style={{...cS(CC(r.iyChg)),background:HB(r.iyChg,mIC)}}>{FP(r.iyChg,2)}</td>
                 <td style={cS("#FB923C")}>{F(r.sofT,2)}</td><td style={cS(r.basisT!=null&&r.basisT>=0?"#C084FC":"#F472B6")}>{r.basisT!=null?FP(r.basisT*100,1):"—"}</td>
                 <td style={cS(r.ffM>=0?"#A78BFA":"#F472B6")}>{FP(r.ffM,pdp)}</td><td style={{...cS(CC(r.ffChg)),background:HB(r.ffChg,mFC)}}>{FP(r.ffChg,pdp)}</td>
                 <td style={cS("#34D399")}>{F(r.ffIyM,2)}</td>
-              </tr>))}</tbody></table></div>
+              </tr>);})}</tbody></table></div>
           )}
         </div>
         <SprTbl spreads={immSpr} title={`${cfg.pair} IMM ROLL SPREADS`} color="#F59E0B" mx={mSC} onDbl={dblR} pdp={pdp} isNDF={cfg.kind==="NDF"}/>

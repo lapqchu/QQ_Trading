@@ -569,7 +569,7 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
     const ipaValDate = ipaD?.valueDate ? new Date(ipaD.valueDate) : null;
     const ipaFixDate = ipaD?.fixDate ? new Date(ipaD.fixDate) : null;
     const valDate = immVD || ipaValDate || td.valDate || (daysOvr ? dateFromSpot(SPOT_DATE, daysOvr) : null);
-    const fixDate = ipaFixDate || (valDate ? bizBefore(valDate, 2) : td.fixDate);
+    const fixDate = ipaFixDate || (valDate ? (isNDF ? bizBefore(valDate, 2) : valDate) : td.fixDate);
 
     // Source metadata for UI (staleness + n/N fresh). Only populated for anchor tenors.
     let sourcesMeta = null;
@@ -1251,6 +1251,9 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
       carry: computeCarry(nr, fr),
       carryY: computeCarryY(nr, fr),
       iyBpD: fIy != null ? fIy / 360 * 100 : null,
+      // IMM rolls are always curve-interpolated (no broker IMM RIC); flag so SprTbl
+      // renders its dimmed-row + interpolated marker and traders never read these as quotes.
+      interp: true, dataSource: "interpolated",
     });
   }
 
