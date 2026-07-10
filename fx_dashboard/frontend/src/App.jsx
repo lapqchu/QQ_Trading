@@ -1456,15 +1456,28 @@ function CleanDirtyPanel({ad,snap,onDbl}){
   // turn premium kicks in at VALUE-date boundaries, not fixing-date ones.
   const anchorRows=useMemo(()=>{
     if(!ad?.rows||!ad?.SPOT_DATE)return[];
-    return ad.rows
+    // De-seam the turn-bootstrap input: feed ONLY genuine (non-interpolated)
+    // anchor tenors. Gap-filled extended tenors (4/5/7/8/10/11M) are mcI fills
+    // over the sparse real grid — they carry no independent turn signal and,
+    // when sourced from mixed stale/fresh broker RICs, disagree with the
+    // composite by ~tens of pips, injecting false "turns" at the seams. Dropping
+    // them cuts spurious turn magnitude materially. (Residual long-end turn size
+    // when the market is near-closed reflects very-stale quotes + a sparse
+    // 12/18/24M grid — data quality, not the estimator; see task #19 memo.)
+    const base=ad.rows
       .filter(r=>r.month>0&&!r.isWeekly&&r.spM!=null&&isFinite(r.spM)&&r.valDate)
       .map(r=>({
         tenor:r.tenor,
         month:r.month,
         days:Math.round((r.valDate-ad.SPOT_DATE)/86400000),
         pts:r.spM,
+        interp:!!(r.interp||r.interpolated),
       }))
       .filter(a=>a.days>0);
+    const real=base.filter(a=>!a.interp);
+    // Fall back to the full set only if de-seaming would leave too few points to
+    // bootstrap (needs a spanning grid); otherwise use the clean real-anchor grid.
+    return (real.length>=3?real:base).map(({interp,...a})=>a);
   },[ad?.rows,ad?.SPOT_DATE]);
 
   // Bootstrap on snapshot refresh (NOT on every live tick — turns move slowly).
