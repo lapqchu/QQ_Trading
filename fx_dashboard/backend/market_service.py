@@ -627,9 +627,13 @@ class MarketService:
             ipa_iy = ipa_1m.get("impliedYield")
             ipa_days = ipa_1m.get("days") or 30
             if ipa_iy is None:
-                log.warning(
-                    "value_mode auto-detect SKIPPED [%s]: no IPA impliedYield ref — "
-                    "keeping config value_mode; IY may be mis-scaled", cfg.code)
+                # Expected when the Workspace subscription lacks IPA pricing
+                # analytics (impliedYield returns null). The dashboard prices from
+                # entitled market data (spot + swap points + SOFR) via the DF
+                # engine and keeps the verified config convention — debug, not warn.
+                log.debug(
+                    "value_mode auto-detect skipped [%s]: no IPA impliedYield ref "
+                    "(IPA pricing not entitled) — keeping config value_mode", cfg.code)
                 return
             sofr_block = (snap.get("sofr") or {}).get(1) or (snap.get("sofr") or {}).get("1")
             sofr_mid = (((sofr_block or {}).get("T") or {}).get("mid")
@@ -1507,9 +1511,17 @@ class MarketService:
         ric_mode: Dict[str, str] = {cfg.spot_ric: "spot"}
         if contributor:
             for m in cfg.anchor_tenors_m:
-                r = cfg.broker_ric(m, contributor)
-                rics.append(r)
-                ric_mode[r] = vmode(contributor)
+                # derive-from-outright ccys (e.g. NGN) carry data only in the
+                # outright RIC {code}{t}NDFOR={broker}; the swap-point RIC is dead.
+                # Mirror get_history's A1 fix so a pinned broker still returns bars.
+                if cfg.derive_from_outrights:
+                    r = cfg.outright_ric(m, broker=contributor)
+                    rics.append(r)
+                    ric_mode[r] = "outright_abs"
+                else:
+                    r = cfg.broker_ric(m, contributor)
+                    rics.append(r)
+                    ric_mode[r] = vmode(contributor)
         else:
             for m in cfg.anchor_tenors_m:
                 if cfg.kind == "NDF" and m == 18 and cfg.composite_18m_fallback_brokers:
@@ -1564,14 +1576,9 @@ class MarketService:
         if near_d is None or far_d is None:
             raise ValueError(f"invalid dates: near={near_date} far={far_date}")
 
-        # TODO(inverted): WM/Reuters inverted quotes (cfg.inverted, e.g. BWP) are
-        # NOT yet transformed on this fwd-fwd custom-dates path. The raw bars here
-        # are native (USD-per-local), so this derived spread series would be in the
-        # native orientation. The safe reconstruction (two-pass: native per-date
-        # spot, then points'=(1/O−1/S)·PF via _inv_point, reciprocate spot_by_date)
-        # mirrors _invert_history. Live snapshot + get_history are already inverted;
-        # this secondary path is left native until it's exercised for an inverted ccy.
-        # Build per-day curves of swap points (in display pips).
+        # Build per-day curves of swap points (in display pips), NATIVELY first.
+        # WM/Reuters inverted quotes (cfg.inverted, e.g. BWP) are reciprocated in a
+        # post-pass below, once per-date spot + points are all available.
         by_date: Dict[str, Dict[int, float]] = {}
         spot_by_date: Dict[str, float] = {}
         sofr_by_date: Dict[str, Dict[int, float]] = {}
@@ -1608,6 +1615,26 @@ class MarketService:
                 else:  # "pips"
                     pts_pips = mid
                 by_date.setdefault(d[:10], {})[m] = pts_pips
+
+        # WM/Reuters inverted quote (cfg.inverted, e.g. BWP): the bars above are
+        # native (USD-per-local). Reciprocate spot and re-express each tenor's
+        # points in the conventional local-per-USD orientation per date, using that
+        # date's native spot: O_native = S + pts/PF → points' = (1/O − 1/S)·PF,
+        # spot' = 1/S. Mirrors _apply_inversion / _invert_history so this derived
+        # fwd-fwd series matches the live snapshot's orientation. Runs after the
+        # full native pass so every date's spot is available.
+        if getattr(cfg, "inverted", False):
+            for d_str, native_spot in list(spot_by_date.items()):
+                if not native_spot or native_spot <= 0:
+                    continue
+                curve = by_date.get(d_str)
+                if curve:
+                    for mm, pts_pips in list(curve.items()):
+                        o_native = native_spot + pts_pips / PF
+                        if o_native <= 0:
+                            continue
+                        curve[mm] = (1.0 / o_native - 1.0 / native_spot) * PF
+                spot_by_date[d_str] = 1.0 / native_spot
 
         # Curves are now uniformly in display pips → spread = (far − near) pips.
         series = []
