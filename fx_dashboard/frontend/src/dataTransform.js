@@ -9,7 +9,7 @@
  * NGN sources have sourceKind="outright_derived" with source.outright.{bid,ask,mid};
  *   outrightFromSource returns those directly.
  */
-import { mcI, mid, implYld, fwdFwdIy } from "./calc.js";
+import { mcI, mid, implYld, fwdFwdIy, usdCurveFromSofr, ccyCurveFromForwards, fwdFwdIyDf } from "./calc.js";
 import { buildIMMDates, buildTenorDates, computeSpotDate, bizBefore, dateFromSpot, daysBtwn, fD } from "./dates.js";
 
 // ── Curve-days policy ───────────────────────────────────────────────────
@@ -774,6 +774,19 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
   const immR = IMM_DATES.filter(im => im.days <= maxT * 31)
     .map(im => getRow(im.days / 30.44, im.days, im.label, im.valDate));
 
+  // DF curves for DF-consistent forward-forward IY (IMM rolls / custom dates).
+  // Firm-standard OIS methodology: interpolate the ccy discount factor log-linearly
+  // (arbitrage-free) rather than the zero rate. Built from REAL anchor tenors only
+  // (skip gap-interpolated rows so curve seams don't distort it): USD from SOFR,
+  // ccy from forward outrights via DF_ccy(d) = DF_usd(d)·S/F(d). At anchor day
+  // counts fwdFwdIyDf reproduces the CIP fwd-fwd exactly; the gain is off-node.
+  const _usdDfCurve = usdCurveFromSofr(
+    rows.filter(r => r.month > 0 && r.daysVal > 0 && r.sofT != null && !r.interp)
+        .map(r => [r.daysVal, r.sofT]));
+  const _ccyDfCurve = ccyCurveFromForwards(
+    rows.filter(r => r.month > 0 && r.daysVal > 0 && r.mT > 0 && !r.interp)
+        .map(r => [r.daysVal, r.mT]), sMT, _usdDfCurve);
+
   // Fwd-fwd chain
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i], p = i > 0 ? rows[i - 1] : null;
@@ -1039,6 +1052,8 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
     const fIy = fwdFwdIy(nr.iyM, nVal, fr.iyM, fVal);
     const fIyA = fwdFwdIy(nr.iyB, nVal, fr.iyA, fVal);
     const fIy1 = fwdFwdIy(nr.iyM1, nVal1, fr.iyM1, fVal1);
+    // DF-consistent fwd-fwd reference (arb-free ccy-DF interpolation, firm-standard).
+    const fIyDf = fwdFwdIyDf(_ccyDfCurve, nVal, fVal);
     const haveSof = dsVal > 0 && fr.sofT != null && nr.sofT != null;
     const haveSof1 = dsVal > 0 && fr.sofT1 != null && nr.sofT1 != null;
     const fSof = haveSof ? ((1 + fr.sofT / 100 * fVal / 360) / (1 + nr.sofT / 100 * nVal / 360) - 1) * 360 / dsVal * 100 : null;
@@ -1050,7 +1065,7 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
       label, nrM, frM, pB, pM, pA, pB1, pM1, pA1, chg: pM != null && pM1 != null ? pM - pM1 : null, days: ds,
       nrVD: nr.valDate, frVD: fr.valDate, nrFxD: nr.fixDate, frFxD: fr.fixDate,
       nrDT: nr.dT, frDT: fr.dT,
-      fIyB, fIy, fIyA, fIy1,
+      fIyB, fIy, fIyA, fIy1, fIyDf,
       iyChg: fIy != null && fIy1 != null ? fIy - fIy1 : null,
       fSof, fSof1, sofChg: fSof != null && fSof1 != null ? fSof - fSof1 : null,
       bas, basChg: bas != null && fIy1 != null && fSof1 != null ? bas - (fIy1 - fSof1) : null,
@@ -1245,6 +1260,8 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
     const ds = fr.dT - nr.dT;
     const fIy = fwdFwdIy(nr.iyM, nr.dT, fr.iyM, fr.dT);
     const fIy1 = fwdFwdIy(nr.iyM1, nr.dT1, fr.iyM1, fr.dT1);
+    // DF-consistent fwd-fwd reference (arb-free ccy-DF interpolation, firm-standard).
+    const fIyDf = fwdFwdIyDf(_ccyDfCurve, nr.daysVal ?? nr.dT, fr.daysVal ?? fr.dT);
     const haveSofImm = ds > 0 && fr.sofT != null && nr.sofT != null;
     const fSof = haveSofImm ? ((1 + fr.sofT / 100 * fr.dT / 360) / (1 + nr.sofT / 100 * nr.dT / 360) - 1) * 360 / ds * 100 : null;
     const haveSofImm1 = ds > 0 && fr.sofT1 != null && nr.sofT1 != null;
@@ -1255,7 +1272,7 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
       pB, pM, pA, pB1: null, pM1, pA1: null, chg: pM != null && pM1 != null ? pM - pM1 : null, days: ds,
       nrVD: nr.valDate, frVD: fr.valDate, nrFxD: nr.fixDate, frFxD: fr.fixDate,
       nrDT: nr.dT, frDT: fr.dT,
-      fIyB: null, fIy, fIyA: null, fIy1,
+      fIyB: null, fIy, fIyA: null, fIy1, fIyDf,
       iyChg: fIy != null && fIy1 != null ? fIy - fIy1 : null,
       fSof, fSof1, sofChg: fSof != null && fSof1 != null ? fSof - fSof1 : null,
       bas: fIy != null && fSof != null ? fIy - fSof : null, basChg: null,
@@ -1348,6 +1365,7 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
     SPOT_DATE, TENOR_DATES,
     lastReloadTs: snap.lastReloadTs,
     selection,
+    ccyDfCurve: _ccyDfCurve, usdDfCurve: _usdDfCurve,
   };
 }
 
@@ -1381,9 +1399,10 @@ export function calcCustom(ad, nearM, farM, nearDate, farDate, ipaCustom) {
       const pA = snapFr.spA != null && snapNr.spB != null ? snapFr.spA - snapNr.spB : null;
       const ds = snapFr.dT - snapNr.dT;
       const fIy = fwdFwdIy(snapNr.iyM, snapNr.dT, snapFr.iyM, snapFr.dT);
+      const fIyDf = fwdFwdIyDf(ad.ccyDfCurve, snapNr.daysVal ?? snapNr.dT, snapFr.daysVal ?? snapFr.dT);
       return {
         label: `${fD(nearDate)} × ${fD(farDate)}`,
-        pB, pM, pA, days: ds, fIy,
+        pB, pM, pA, days: ds, fIy, fIyDf,
         nrVD: snapNr.valDate, frVD: snapFr.valDate,
         nrFxD: snapNr.fixDate, frFxD: snapFr.fixDate,
         nrDT: snapNr.dT, frDT: snapFr.dT,
@@ -1410,10 +1429,11 @@ export function calcCustom(ad, nearM, farM, nearDate, farDate, ipaCustom) {
       const ds = fDays - nDays;
       const nIy = ipaN.impliedYield, fIy_raw = ipaF.impliedYield;
       const fIy = nIy != null && fIy_raw != null ? fwdFwdIy(nIy, nDays, fIy_raw, fDays) : null;
+      const fIyDf = fwdFwdIyDf(ad.ccyDfCurve, nDays, fDays);
       const parseD = (s) => s ? new Date(s) : null;
       return {
         label: `${nearDate ? fD(nearDate) : `${Math.floor(nM)}M`} × ${farDate ? fD(farDate) : `${Math.floor(fM)}M`}`,
-        pB, pM, pA, days: ds, fIy,
+        pB, pM, pA, days: ds, fIy, fIyDf,
         nrVD: parseD(ipaN.valueDate) || nVD, frVD: parseD(ipaF.valueDate) || fVD,
         nrFxD: parseD(ipaN.fixDate), frFxD: parseD(ipaF.fixDate),
         nrDT: nDays, frDT: fDays,
@@ -1441,9 +1461,12 @@ export function calcCustom(ad, nearM, farM, nearDate, farDate, ipaCustom) {
   const pA = fr.spA != null && nrSpB != null ? fr.spA - nrSpB : null;
   const ds = fr.dT - nr.dT;
   const fIy = isSpotNear ? fr.iyM : fwdFwdIy(nr.iyM, nr.dT, fr.iyM, fr.dT);
+  const fIyDf = isSpotNear
+    ? (ad.ccyDfCurve ? ad.ccyDfCurve.zero(fr.daysVal ?? fr.dT) : null)
+    : fwdFwdIyDf(ad.ccyDfCurve, nr.daysVal ?? nr.dT, fr.daysVal ?? fr.dT);
   return {
     label: `${nearDate ? fD(nearDate) : `${nrI}M`} × ${farDate ? fD(farDate) : `${frI}M`}`,
-    pB, pM, pA, days: ds, fIy,
+    pB, pM, pA, days: ds, fIy, fIyDf,
     nrVD: nVD || nr.valDate, frVD: fVD || fr.valDate,
     nrFxD: nr.fixDate, frFxD: fr.fixDate,
     nrDT: nr.dT, frDT: fr.dT,

@@ -1145,7 +1145,7 @@ function SprTbl({spreads,title,color,mx,onDbl,pdp=1,isNDF=true}){
         <td style={cS("#475569")}>{fD(s.nrVD)}</td>{isNDF&&<td style={cS("#475569")}>{fD(s.nrFxD)}</td>}<td style={cS("#475569")}>{fD(s.frVD)}</td>{isNDF&&<td style={cS("#475569")}>{fD(s.frFxD)}</td>}<td style={cS("#475569",false,true)}>{s.days}</td>
         <td style={cS("#4ADE80")}>{FP(s.pB,pdp)}</td><td style={cS("#FBBF24",true)}>{FP(s.pM,pdp)}</td><td style={cS("#F87171")}>{FP(s.pA,pdp)}</td>
         <td style={{...cS(CC(s.chg)),background:HB(s.chg,mx)}}>{FP(s.chg,pdp)}</td><td style={cS("#64748B",false,true)}>{F(s.ppd,2)}</td>
-        <td style={cS("#4ADE80")}>{F(s.fIyB,2)}</td><td style={cS("#34D399",true)}>{F(s.fIy,2)}</td><td style={cS("#F87171")}>{F(s.fIyA,2)}</td>
+        <td style={cS("#4ADE80")}>{F(s.fIyB,2)}</td><td style={cS("#34D399",true)} title={s.fIyDf!=null?`DF fwd-fwd (firm-standard OIS): ${F(s.fIyDf,2)}%`+(s.fIy!=null?` — Δ${(s.fIy-s.fIyDf)>=0?"+":""}${F(s.fIy-s.fIyDf,2)}`:""):undefined}>{F(s.fIy,2)}{s.fIyDf!=null?"ᵈ":""}</td><td style={cS("#F87171")}>{F(s.fIyA,2)}</td>
         <td style={{...cS(CC(s.iyChg)),background:HB(s.iyChg,.1)}}>{FP(s.iyChg!=null?s.iyChg*100:null,2)}</td>
         <td style={cS(s.carry!=null&&s.carry>=0?"#A78BFA":"#F472B6")}>{s.carry!=null?FP(s.carry,pdp):"—"}</td>
         <td style={cS(s.carryY!=null&&s.carryY>=0?"#A78BFA":"#F472B6")}>{s.carryY!=null?FP(s.carryY*100,2):"—"}</td>
@@ -1291,6 +1291,7 @@ function ToolsPanel({ad,onDbl,ccy}){
           <div><span style={{color:"#64748B"}}>Days: </span><span style={{color:"#E2E8F0",fontFamily:"monospace"}}>{custom.days}</span></div>
           <div><span style={{color:"#64748B"}}>PPD: </span><span style={{color:"#22D3EE",fontFamily:"monospace"}}>{custom.ppd!=null?F(custom.ppd,2):"—"}</span></div>
           <div><span style={{color:"#64748B"}}>Fwd Impl: </span><span style={{color:"#10B981",fontFamily:"monospace"}}>{custom.fIy!=null?F(custom.fIy,2)+"%":"—"}</span></div>
+          <div title="Firm-standard OIS discount-factor methodology (arb-free ccy-DF interpolation)"><span style={{color:"#64748B"}}>Fwd Impl (DF): </span><span style={{color:"#34D399",fontFamily:"monospace"}}>{custom.fIyDf!=null?F(custom.fIyDf,2)+"%":"—"}</span></div>
           <div><span style={{color:"#64748B"}}>Near Val: </span><span style={{color:"#E2E8F0",fontFamily:"monospace"}}>{fD(custom.nrVD)}</span></div>
           {ad?.cfg?.kind==="NDF"&&(<div><span style={{color:"#64748B"}}>Near Fix: </span><span style={{color:"#E2E8F0",fontFamily:"monospace"}}>{fD(custom.nrFxD)}</span></div>)}
           <div><span style={{color:"#64748B"}}>Far Val: </span><span style={{color:"#E2E8F0",fontFamily:"monospace"}}>{fD(custom.frVD)}</span></div>

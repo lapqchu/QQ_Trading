@@ -34,6 +34,57 @@ export function fwdFwdIy(iyN, dN, iyF, dF) {
   return ((1 + (iyF / 100) * dF / 360) / (1 + (iyN / 100) * dN / 360) - 1) * 360 / (dF - dN) * 100;
 }
 
+// ── Discount-factor curve (log-linear in days) — mirrors backend discount_curve.py ──
+// Arbitrage-free, monotone DF interpolation (the market-standard choice). Used to
+// compute DF-consistent implied yields at off-node day counts (IMM rolls, custom
+// dates) instead of linearly interpolating the zero rate.
+export function dfCurve(nodes) {
+  // nodes: [[days, df], ...], days>0, df in (0,1]. Sorted + deduped.
+  const pts = (nodes || []).filter(p => p && p[0] > 0 && p[1] > 0).sort((a, b) => a[0] - b[0]);
+  const days = [], ln = [];
+  for (const [d, v] of pts) {
+    if (days.length && Math.abs(days[days.length - 1] - d) < 1e-9) continue;
+    days.push(d); ln.push(Math.log(v));
+  }
+  if (!days.length) return null;
+  const n = days.length;
+  const df = (d) => {
+    d = +d;
+    if (d <= days[0]) return Math.exp((ln[0] / days[0]) * d);           // flat fwd from origin
+    if (d >= days[n - 1]) {
+      const slope = n >= 2 ? (ln[n - 1] - ln[n - 2]) / (days[n - 1] - days[n - 2]) : ln[n - 1] / days[n - 1];
+      return Math.exp(ln[n - 1] + slope * (d - days[n - 1]));           // flat fwd extrapolation
+    }
+    let i = 1; while (d > days[i]) i++;
+    const w = (d - days[i - 1]) / (days[i] - days[i - 1]);
+    return Math.exp(ln[i - 1] + w * (ln[i] - ln[i - 1]));
+  };
+  return { df, zero: (d) => (d > 0 ? (1 / df(d) - 1) * 360 / d * 100 : 0), n };
+}
+
+// USD DF curve from SOFR par rates: sofrByDays = [[days, ratePct], ...] (simple-interest DF nodes).
+export function usdCurveFromSofr(sofrByDays) {
+  const nodes = (sofrByDays || []).filter(p => p && p[0] > 0 && p[1] != null)
+    .map(([d, r]) => [d, 1 / (1 + (r / 100) * d / 360)]);
+  return dfCurve(nodes);
+}
+
+// CCY DF curve from forward outrights: DF_ccy(d) = DF_usd(d) * S / F(d). fwdNodes = [[days, fwdOutright], ...].
+export function ccyCurveFromForwards(fwdNodes, spot, usd) {
+  if (!usd || !spot || spot <= 0) return null;
+  const nodes = (fwdNodes || []).filter(p => p && p[0] > 0 && p[1] > 0)
+    .map(([d, f]) => [d, usd.df(d) * spot / f]);
+  return dfCurve(nodes);
+}
+
+// Forward-forward ccy zero (percent) over [dN, dF] from a ccy DF curve.
+export function fwdFwdIyDf(ccy, dN, dF) {
+  if (!ccy || !dN || !dF || dF <= dN) return null;
+  const a = ccy.df(dN), b = ccy.df(dF);
+  if (!a || !b || b <= 0) return null;
+  return (a / b - 1) * 360 / (dF - dN) * 100;
+}
+
 // ── Formatting ──
 export const F = (v, dp = 3) => (v != null && isFinite(v)) ? v.toFixed(dp) : "—";
 export const FP = (v, dp = 1) => { if (v == null || !isFinite(v)) return "—"; const s = v.toFixed(dp); return v > 0.0001 ? `+${s}` : s; };
