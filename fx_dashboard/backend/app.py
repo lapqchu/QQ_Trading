@@ -32,6 +32,7 @@ from dotenv import load_dotenv
 
 from lseg_client import LsegClient
 from market_service import MarketService
+from neer_service import NeerService, MAS_MEETINGS
 from ric_config import CURRENCIES, NDF_CURRENCIES, DELIVERABLE_CURRENCIES, get_spread_pack, get_spread_packs, FUNDING_TENORS
 
 load_dotenv()
@@ -44,11 +45,12 @@ log = logging.getLogger("app")
 # Globals wired in lifespan
 lseg: LsegClient | None = None
 market: MarketService | None = None
+neer: NeerService | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global lseg, market
+    global lseg, market, neer
     lseg = LsegClient(app_key=os.environ.get("LSEG_APP_KEY"))
     try:
         lseg.open()
@@ -57,6 +59,7 @@ async def lifespan(app: FastAPI):
         log.error("Make sure Workspace is running and LSEG_APP_KEY is set in .env")
     market = MarketService(lseg)
     market.set_loop(asyncio.get_running_loop())
+    neer = NeerService(lseg)   # SGD NEER deep-dive service (shares the LSEG session)
     log.info("FX dashboard backend ready")
     yield
     log.info("Shutting down")
@@ -237,6 +240,49 @@ def status() -> Dict[str, Any]:
         "tickCounts": dict(market._tick_counts) if market else {},
         "wsSubscribers": {ch: len(subs) for ch, subs in (market._subscribers if market else {}).items()},
     }
+
+
+# ─────────────────────────── NEER deep-dive (SGD) ───────────────────────────
+@app.get("/api/neer/sgd")
+def neer_sgd() -> Dict[str, Any]:
+    """Live SGD NEER snapshot: index, band position, per-leg contributions, SORA,
+    carry, and trading metrics."""
+    if not lseg or not lseg.is_open():
+        raise HTTPException(503, "LSEG session not open — check Workspace app & APP_KEY")
+    try:
+        return neer.build_sgd()
+    except Exception as e:
+        log.exception("neer_sgd failed")
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/neer/sgd/history")
+def neer_sgd_history() -> Dict[str, Any]:
+    """NEER index history + crawling policy band (for the band chart)."""
+    if not lseg or not lseg.is_open():
+        raise HTTPException(503, "LSEG session not open — check Workspace app & APP_KEY")
+    try:
+        s = neer.neer_series()
+        return {"dates": s.get("dates", []), "neer": s.get("neer", []),
+                "midpoint": s.get("midpoint", []), "upper": s.get("upper", []),
+                "lower": s.get("lower", []), "posBp": s.get("posBp", []),
+                "meetings": MAS_MEETINGS}
+    except Exception as e:
+        log.exception("neer_sgd_history failed")
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/neer/sgd/calibration")
+def neer_sgd_calibration() -> Dict[str, Any]:
+    """Replica-vs-official calibration: tracking error, correlation, and a
+    constrained-LSQ weight refit (gated on fit quality)."""
+    if not lseg or not lseg.is_open():
+        raise HTTPException(503, "LSEG session not open — check Workspace app & APP_KEY")
+    try:
+        return neer.calibration()
+    except Exception as e:
+        log.exception("neer_sgd_calibration failed")
+        raise HTTPException(500, str(e))
 
 
 # ─────────────────────────── WebSockets ───────────────────────────
