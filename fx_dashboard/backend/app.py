@@ -272,6 +272,30 @@ def neer_sgd_history() -> Dict[str, Any]:
         raise HTTPException(500, str(e))
 
 
+@app.get("/api/neer/sgd/intraday")
+def neer_sgd_intraday(window: str = Query("1d", description="1d|3d|5d|20d")) -> Dict[str, Any]:
+    """Intraday live NEER series (tick chart) for the selected window."""
+    if not lseg or not lseg.is_open():
+        raise HTTPException(503, "LSEG session not open — check Workspace app & APP_KEY")
+    try:
+        return neer.intraday_neer(window)
+    except Exception as e:
+        log.exception("neer_sgd_intraday failed")
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/neer/sgd/analysis")
+def neer_sgd_analysis() -> Dict[str, Any]:
+    """Strategy scan: mean-reversion / trend signals + backtest on the band position."""
+    if not lseg or not lseg.is_open():
+        raise HTTPException(503, "LSEG session not open — check Workspace app & APP_KEY")
+    try:
+        return neer.analysis()
+    except Exception as e:
+        log.exception("neer_sgd_analysis failed")
+        raise HTTPException(500, str(e))
+
+
 @app.get("/api/neer/sgd/calibration")
 def neer_sgd_calibration() -> Dict[str, Any]:
     """Replica-vs-official calibration: tracking error, correlation, and a
