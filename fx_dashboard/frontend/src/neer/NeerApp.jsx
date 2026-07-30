@@ -3,6 +3,7 @@
 import React, { useEffect, useState, useCallback } from "react";
 import Plot from "react-plotly.js";
 import { F, FP } from "../calc.js";
+import NeerAnalysis from "./NeerAnalysis.jsx";
 
 // ── Dark theme (mirrors the pricer) ──
 const C = {
@@ -116,8 +117,10 @@ function BandGauge({ neer, metrics }) {
   );
 }
 
-// ── Section 3: band history chart ──
-function HistoryChart({ hist }) {
+// ── Section 3: band history chart with MAS meeting annotations ──
+// action → colour: ease green, tighten red, recentre blue, hold grey.
+const ACTION_COLOR = { ease: C.up, tighten: C.down, recentre: C.blue, hold: C.dim };
+function HistoryChart({ hist, meetingActions }) {
   const dates = hist?.dates || [];
   if (!dates.length) {
     return <div style={{ color: C.dim, fontSize: 11, padding: "120px 0", textAlign: "center" }}>history unavailable</div>;
@@ -128,16 +131,172 @@ function HistoryChart({ hist }) {
     { x: dates, y: hist.midpoint, name: "Midpoint", type: "scatter", mode: "lines", line: { color: C.sub, width: 1, dash: "dash" } },
     { x: dates, y: hist.neer, name: "NEER", type: "scatter", mode: "lines", line: { color: C.cyan, width: 2 } },
   ];
-  const shapes = (hist.meetings || []).map((d) => ({
-    type: "line", x0: d, x1: d, y0: 0, y1: 1, yref: "paper",
-    line: { color: "rgba(251,191,36,0.35)", width: 1, dash: "dash" },
+  // Prefer rich meeting actions (date/action/label); fall back to plain meeting dates.
+  const acts = (Array.isArray(meetingActions) && meetingActions.length)
+    ? meetingActions
+    : (hist.meetings || []).map((d) => ({ date: d, action: "hold", label: "" }));
+  const shapes = acts.map((m) => ({
+    type: "line", x0: m.date, x1: m.date, y0: 0, y1: 1, yref: "paper",
+    line: { color: ACTION_COLOR[m.action] || C.dim, width: 1.2, dash: "dash" },
+  }));
+  const annotations = acts.filter((m) => m.label).map((m) => ({
+    x: m.date, y: 1, xref: "x", yref: "paper", text: m.label,
+    showarrow: false, textangle: -38, xanchor: "left", yanchor: "bottom",
+    font: { size: 7, color: ACTION_COLOR[m.action] || C.dim },
+    bgcolor: "rgba(11,18,32,0.55)",
   }));
   const layout = {
-    ...PLAYOUT, height: 300, shapes,
-    title: { text: "SGD NEER vs Policy Band", font: { size: 11, color: C.text }, x: 0.01, y: 0.98 },
-    margin: { l: 48, r: 16, t: 40, b: 26 },
+    ...PLAYOUT, height: 320, shapes, annotations,
+    title: { text: "SGD NEER vs Policy Band — MAS meeting actions", font: { size: 11, color: C.text }, x: 0.01, y: 0.995 },
+    margin: { l: 48, r: 16, t: 58, b: 26 },
   };
   return <Plot data={traces} layout={layout} config={PCFG_BAR} style={{ width: "100%" }} useResizeHandler />;
+}
+
+// ── Section 4: live intraday chart (self-contained: own window state + 15s poll) ──
+const INTRADAY_WINDOWS = [["1d", "1D"], ["3d", "3D"], ["5d", "5D"], ["20d", "20D"]];
+function IntradayPanel() {
+  const [win, setWin] = useState("1d");
+  const [d, setD] = useState(null);
+  const [stale, setStale] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    async function poll() {
+      try {
+        const r = await fetch(`/api/neer/sgd/intraday?window=${win}`);
+        if (!r.ok) throw new Error();
+        const j = await r.json();
+        if (alive) { setD(j); setStale(false); }
+      } catch { if (alive) setStale(true); }
+    }
+    poll();
+    const id = setInterval(poll, 15000);   // live feel — refresh every 15s
+    return () => { alive = false; clearInterval(id); };
+  }, [win]);
+
+  const times = d?.times || [];
+  const hasData = times.length > 0;
+  const last = hasData ? d.neer[d.neer.length - 1] : null;
+  const btns = (
+    <div style={{ display: "flex", gap: 4 }}>
+      {INTRADAY_WINDOWS.map(([w, lbl]) => (
+        <button key={w} onClick={() => setWin(w)} style={{
+          fontSize: 8.5, fontWeight: 700, padding: "2px 9px", borderRadius: 4, cursor: "pointer",
+          border: `1px solid ${win === w ? C.cyan : C.border}`,
+          background: win === w ? "rgba(34,211,238,0.12)" : "transparent",
+          color: win === w ? C.cyan : C.sub, letterSpacing: ".05em",
+        }}>{lbl}</button>
+      ))}
+    </div>
+  );
+
+  let body;
+  if (!hasData) {
+    body = <div style={{ color: C.dim, fontSize: 11, padding: "90px 0", textAlign: "center" }}>{stale ? "intraday feed unavailable" : "loading intraday…"}</div>;
+  } else {
+    const ys = (d.neer || []).filter((v) => v != null && isFinite(v));
+    const dataMin = ys.length ? Math.min(...ys) : 0, dataMax = ys.length ? Math.max(...ys) : 1;
+    const inRange = [d.midpoint, d.upper].filter((v) => v != null && isFinite(v));
+    const rLo = Math.min(dataMin, ...inRange), rHi = Math.max(dataMax, ...inRange);
+    const pad = (rHi - rLo) * 0.06 || 0.05;
+    const refLine = (y, col) => (y == null || !isFinite(y)) ? null : ({
+      type: "line", xref: "paper", x0: 0, x1: 1, y0: y, y1: y, line: { color: col, width: 1, dash: "dash" },
+    });
+    const shapes = [refLine(d.upper, C.down), refLine(d.midpoint, C.sub), refLine(d.lower, C.up)].filter(Boolean);
+    const traces = [{
+      x: times, y: d.neer, type: "scatter", mode: "lines", name: "S$NEER",
+      line: { color: C.cyan, width: 1.4 }, hovertemplate: "%{x}<br>%{y:.4f}<extra></extra>",
+    }];
+    const layout = {
+      ...PLAYOUT, height: 240, shapes, legend: undefined,
+      title: { text: `Intraday S$NEER (${String(d.window || win).toUpperCase()})`, font: { size: 11, color: C.text }, x: 0.01, y: 0.98 },
+      margin: { l: 48, r: 16, t: 30, b: 30 },
+      xaxis: { ...PLAYOUT.xaxis, type: "date" },
+      yaxis: { ...PLAYOUT.yaxis, range: [rLo - pad, rHi + pad] },
+    };
+    body = <Plot data={traces} layout={layout} config={PCFG} style={{ width: "100%" }} useResizeHandler />;
+  }
+  return (
+    <Panel title="Live Intraday"
+      right={<div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+        <span style={{ fontFamily: C.mono, fontSize: 12, fontWeight: 700, color: C.cyan }}>{num(last, 3)}</span>
+        {btns}
+      </div>}
+      note={hasData ? `${d.interval || ""} bars · ${d.count ?? times.length} pts · ceiling ${num(d.upper, 2)} / mid ${num(d.midpoint, 2)} / floor ${num(d.lower, 2)} · polls 15s` : null}>
+      {body}
+    </Panel>
+  );
+}
+
+// ── Section 5: SORA / OIS panel ──
+function SoraPanel({ sora }) {
+  const curve = Array.isArray(sora?.oisCurve) ? sora.oisCurve : [];
+  return (
+    <Panel title="SORA / OIS" note="O/N SORA OIS swap vs published O/N fixing; full OIS term structure O/N → 30Y.">
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 8 }}>
+        <Stat label="O/N SORA OIS" value={num(sora?.onSoraOis, 3)} sub={sora?.onOisRic || "%"} color={C.cyan} tip="Overnight SORA OIS swap rate" />
+        <Stat label="O/N SORA fixing" value={num(sora?.onSoraFixing, 4)} sub={sora?.onFixingRic || "%"} tip="Published overnight SORA fixing" />
+      </div>
+      <div style={{ fontSize: 8, fontWeight: 800, color: C.dim, letterSpacing: ".06em", textTransform: "uppercase", marginBottom: 2 }}>SORA OIS Curve (O/N–30Y)</div>
+      <SoraCurveChart curve={curve} />
+      {curve.length > 0 && (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(56px,1fr))", gap: 4, marginTop: 6 }}>
+          {curve.map((p) => (
+            <div key={p.label} title={p.ric || ""} style={{ background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 4, padding: "3px 5px" }}>
+              <div style={{ fontSize: 7.5, fontWeight: 700, color: C.dim }}>{p.label}</div>
+              <div style={{ fontFamily: C.mono, fontSize: 10, color: C.text }}>{num(p.rate, 3)}</div>
+            </div>
+          ))}
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+// ── Section 6: carry panel ──
+function CarryPanel({ carry }) {
+  const tenors = Array.isArray(carry?.tenors) ? carry.tenors : [];
+  const byTenor = (t) => tenors.find((x) => x.tenor === t);
+  const t3m = byTenor("3M"), t1y = byTenor("1Y");
+  const th = { padding: "3px 6px", fontSize: 8, fontWeight: 800, color: C.dim, textTransform: "uppercase", letterSpacing: ".04em", borderBottom: `2px solid #334155`, whiteSpace: "nowrap" };
+  const td = { padding: "3px 6px", fontSize: 9.5, fontFamily: C.mono, color: C.text, whiteSpace: "nowrap", borderBottom: `1px solid ${C.border}` };
+  return (
+    <Panel title="Carry" note="Carry = forward NEER − spot NEER; net = policy slope − forward-priced appreciation (negative ⇒ costs carry to be long).">
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(96px,1fr))", gap: 8, marginBottom: 8 }}>
+        <Stat label="Policy slope" value={sgn(carry?.slope, 2)} sub="%/yr" color={C.cyan} tip="MAS appreciation slope of the band midpoint" />
+        <Stat label="NET carry 3M" value={sgn(t3m?.netAnnPct, 2)} sub="%/yr" color={scol(t3m?.netAnnPct)} tip="3M net carry: slope − forward-priced appreciation" />
+        <Stat label="NET carry 1Y" value={sgn(t1y?.netAnnPct, 2)} sub="%/yr" color={scol(t1y?.netAnnPct)} tip="1Y net carry: slope − forward-priced appreciation" />
+      </div>
+      {tenors.length > 0 ? (
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ borderCollapse: "collapse", width: "100%", minWidth: 360 }}>
+            <thead>
+              <tr>
+                <th style={{ ...th, textAlign: "left" }}>TENOR</th>
+                <th style={{ ...th, textAlign: "right" }}>CARRY pts</th>
+                <th style={{ ...th, textAlign: "right" }}>FWD−SPOT %</th>
+                <th style={{ ...th, textAlign: "right" }}>ANN %</th>
+                <th style={{ ...th, textAlign: "right" }}>NET %/yr</th>
+              </tr>
+            </thead>
+            <tbody>
+              {tenors.map((t) => (
+                <tr key={t.tenor}>
+                  <td style={{ ...td, textAlign: "left", fontWeight: 700 }}>{t.tenor}</td>
+                  <td style={{ ...td, textAlign: "right", color: C.sub }}>{num(t.carryPts, 3)}</td>
+                  <td style={{ ...td, textAlign: "right" }}>{sgn(t.fwdVsSpotPct, 3)}</td>
+                  <td style={{ ...td, textAlign: "right" }}>{sgn(t.annPct, 3)}</td>
+                  <td style={{ ...td, textAlign: "right", fontWeight: 700, color: scol(t.netAnnPct) }}>{sgn(t.netAnnPct, 3)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <div style={{ fontSize: 9, color: C.dim, fontStyle: "italic" }}>carry data unavailable</div>
+      )}
+    </Panel>
+  );
 }
 
 // ── Section 5 mini: SORA OIS curve ──
@@ -259,6 +418,7 @@ function CalibrationPanel({ cal, legs, loading, onRefresh }) {
 
 // ── Main app ──
 export default function NeerApp() {
+  const [activeTab, setActiveTab] = useState("monitor");
   const [snap, setSnap] = useState(null);
   const [hist, setHist] = useState(null);
   const [cal, setCal] = useState(null);
@@ -317,7 +477,6 @@ export default function NeerApp() {
   const metrics = snap?.metrics;
   const sora = snap?.sora;
   const carry = snap?.carry;
-  const basis = snap?.sorSoraBasisBp;
   const live = lastOk && (Date.now() - lastOk < 20000) && !error;
 
   const wrap = { maxWidth: 1360, margin: "0 auto", padding: "12px 16px 40px" };
@@ -330,7 +489,7 @@ export default function NeerApp() {
         {/* ── 1. Header bar ── */}
         <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "space-between", alignItems: "center", gap: 10, paddingBottom: 10, borderBottom: `1px solid ${C.border}` }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <span style={{ fontSize: 16, fontWeight: 900, letterSpacing: ".06em", color: C.text }}>SGD NEER MONITOR</span>
+            <span style={{ fontSize: 16, fontWeight: 900, letterSpacing: ".06em", color: C.text }}>SGD NEER</span>
             <span style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 9, fontWeight: 800, letterSpacing: ".08em", color: live ? C.up : C.dim }}>
               <span style={{ width: 8, height: 8, borderRadius: "50%", background: live ? C.up : C.down, boxShadow: live ? `0 0 6px ${C.up}` : "none", animation: live ? "pulse 1.6s infinite" : "none" }} />
               {live ? "LIVE" : "STALE"}
@@ -342,6 +501,21 @@ export default function NeerApp() {
           </div>
         </div>
 
+        {/* ── Tab bar ── */}
+        <div style={{ display: "flex", gap: 4, marginTop: 10, borderBottom: `1px solid ${C.border}` }}>
+          {[["monitor", "MONITOR"], ["analysis", "ANALYSIS"]].map(([id, lbl]) => {
+            const on = activeTab === id;
+            return (
+              <button key={id} onClick={() => setActiveTab(id)} style={{
+                fontSize: 11, fontWeight: 800, letterSpacing: ".08em", padding: "8px 18px",
+                background: "transparent", border: "none", cursor: "pointer",
+                color: on ? C.cyan : C.dim,
+                borderBottom: `2px solid ${on ? C.cyan : "transparent"}`, marginBottom: -1,
+              }}>{lbl}</button>
+            );
+          })}
+        </div>
+
         {/* ── error banner ── */}
         {error && (
           <div style={{ marginTop: 10, padding: "8px 12px", borderRadius: 6, background: "rgba(248,113,113,0.10)", border: `1px solid ${C.down}55`, color: C.down, fontSize: 10.5, fontWeight: 600 }}>
@@ -349,11 +523,17 @@ export default function NeerApp() {
           </div>
         )}
 
+        {activeTab === "monitor" && (<>
+
         {/* ── 1b. Big readout ── */}
         <div style={{ display: "flex", flexWrap: "wrap", gap: 26, alignItems: "flex-end", padding: "14px 2px 4px" }}>
           <div>
-            <div style={{ fontSize: 9, fontWeight: 700, color: C.dim, letterSpacing: ".08em", textTransform: "uppercase" }}>NEER Live Index (base {num(neer?.base, 1)})</div>
+            <div style={{ fontSize: 9, fontWeight: 700, color: C.dim, letterSpacing: ".08em", textTransform: "uppercase" }}>S$NEER Live Index</div>
             <div style={{ fontFamily: C.mono, fontSize: 34, fontWeight: 800, color: C.text, lineHeight: 1 }}>{num(neer?.live, 3)}</div>
+            <div style={{ fontFamily: C.mono, fontSize: 9, color: C.sub, marginTop: 3 }}>
+              official aSGDEOP <b style={{ color: C.text }}>{num(neer?.official?.lastValue, 3)}</b> ({neer?.official?.lastDate || "—"})
+            </div>
+            <div style={{ fontSize: 8, color: C.dim, marginTop: 1 }}>{neer?.scaleSource || ""}</div>
           </div>
           <div>
             <div style={{ fontSize: 9, fontWeight: 700, color: C.dim, letterSpacing: ".08em", textTransform: "uppercase" }}>Band Position</div>
@@ -384,10 +564,15 @@ export default function NeerApp() {
           </Panel>
         </div>
 
+        {/* ── 2b. Live intraday chart ── */}
+        <div style={{ marginTop: 12 }}>
+          <IntradayPanel />
+        </div>
+
         {/* ── 3. Band history chart ── */}
         <div style={{ marginTop: 12 }}>
           <Panel title="Band History">
-            <HistoryChart hist={hist} />
+            <HistoryChart hist={hist} meetingActions={snap?.meetingActions} />
           </Panel>
         </div>
 
@@ -397,30 +582,12 @@ export default function NeerApp() {
             <BasketTable legs={snap?.legs} />
           </Panel>
 
-          <Panel title="SORA / OIS">
-            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 8 }}>
-              <Stat label="O/N SORA" value={num(sora?.onSora, 3)} sub={sora?.onRic} color={C.cyan} />
-              <Stat label="Compounded 1M" value={num(sora?.compounded?.["1M"], 3)} sub="%" />
-              <Stat label="Compounded 3M" value={num(sora?.compounded?.["3M"], 3)} sub="%" />
-              <Stat label="SOR/SORA 2Y" value={num(basis?.["2Y"], 1)} sub="bp" tip="SOR–SORA basis, 2Y" color={C.amber} />
-              <Stat label="SOR/SORA 5Y" value={num(basis?.["5Y"], 1)} sub="bp" tip="SOR–SORA basis, 5Y" color={C.amber} />
-            </div>
-            <div style={{ fontSize: 8, fontWeight: 800, color: C.dim, letterSpacing: ".06em", textTransform: "uppercase", marginBottom: 2 }}>SORA OIS Curve (1M–30Y)</div>
-            <SoraCurveChart curve={sora?.oisCurve} />
-          </Panel>
+          <SoraPanel sora={sora} />
         </div>
 
         {/* ── 6 + 8: carry & calibration ── */}
         <div style={{ ...gridStyle, marginTop: 12, gridTemplateColumns: "repeat(auto-fit,minmax(340px,1fr))" }}>
-          <Panel title="Carry" note="net = policy slope − forward-implied SGD appreciation; negative = costs carry to be long.">
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(96px,1fr))", gap: 8 }}>
-              <Stat label="Policy slope" value={sgn(carry?.slope, 2)} sub="%/yr" color={C.cyan} tip="MAS appreciation slope of the band midpoint" />
-              <Stat label="Fwd prem 1M" value={sgn(carry?.fwdPremium1M, 3)} sub="%/yr" tip="Forward-implied SGD appreciation, 1M annualised" />
-              <Stat label="Fwd prem 3M" value={sgn(carry?.fwdPremium3M, 3)} sub="%/yr" tip="Forward-implied SGD appreciation, 3M annualised" />
-              <Stat label="NET carry 1M" value={sgn(carry?.net1M, 3)} sub="%/yr" color={scol(carry?.net1M)} tip="slope − fwd premium (1M)" />
-              <Stat label="NET carry 3M" value={sgn(carry?.net3M, 3)} sub="%/yr" color={scol(carry?.net3M)} tip="slope − fwd premium (3M)" />
-            </div>
-          </Panel>
+          <CarryPanel carry={carry} />
 
           <CalibrationPanel cal={cal} legs={snap?.legs} loading={calLoading} onRefresh={loadCal} />
         </div>
@@ -444,8 +611,14 @@ export default function NeerApp() {
         </div>
 
         <div style={{ marginTop: 16, textAlign: "center", fontSize: 8.5, color: C.dim }}>
-          SGD NEER deep-dive · snapshot polled every 8s · history 60s · replicated basket (Barclays weights)
+          SGD NEER deep-dive · snapshot polled every 8s · history 60s · intraday 15s · replicated basket (Barclays weights)
         </div>
+
+        </>)}
+
+        {/* ── ANALYSIS tab ── */}
+        {activeTab === "analysis" && <NeerAnalysis />}
+
       </div>
 
       <style>{`@keyframes pulse{0%{opacity:1}50%{opacity:.35}100%{opacity:1}}`}</style>
