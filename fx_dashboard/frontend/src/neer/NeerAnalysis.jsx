@@ -27,6 +27,7 @@ const PLAYOUT = {
   yaxis: { gridcolor: C.border, zerolinecolor: "#475569", tickfont: { size: 8 }, automargin: true },
   hovermode: "x unified",
   legend: { font: { size: 8 }, bgcolor: "transparent", orientation: "h", x: 0, y: 1.16 },
+  uirevision: "keep",   // preserve pan/zoom across refreshes
 };
 const PCFG = {
   responsive: true, displaylogo: false,

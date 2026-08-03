@@ -44,6 +44,9 @@ const PLAYOUT = {
   yaxis: { gridcolor: C.border, zerolinecolor: "#475569", tickfont: { size: 8 }, automargin: true },
   hovermode: "x unified",
   legend: { font: { size: 8 }, bgcolor: "transparent", orientation: "h", x: 0, y: 1.14 },
+  // Preserve user pan/zoom across the periodic data refreshes (constant → Plotly
+  // keeps the current view when only the data updates).
+  uirevision: "keep",
 };
 const PCFG = { responsive: true, displayModeBar: false, displaylogo: false };
 const PCFG_BAR = {
@@ -196,10 +199,12 @@ function IntradayPanel() {
   } else {
     const ys = (d.neer || []).filter((v) => v != null && isFinite(v));
     const dataMin = ys.length ? Math.min(...ys) : 0, dataMax = ys.length ? Math.max(...ys) : 1;
-    const inRange = [d.midpoint, d.upper].filter((v) => v != null && isFinite(v));
-    const rLo = Math.min(dataMin, ...inRange), rHi = Math.max(dataMax, ...inRange);
-    const pad = (rHi - rLo) * 0.06 || 0.05;
-    const refLine = (y, col) => (y == null || !isFinite(y)) ? null : ({
+    // Scale the y-axis to the intraday TICK range so movement is visible — do NOT
+    // stretch it to the full ±2% band. Only draw a band reference line if it happens
+    // to fall inside the tick range (so it never widens the view). autorange +
+    // uirevision → auto-fits the data yet preserves the user's manual zoom.
+    const within = (y) => y != null && isFinite(y) && y >= dataMin && y <= dataMax;
+    const refLine = (y, col) => !within(y) ? null : ({
       type: "line", xref: "paper", x0: 0, x1: 1, y0: y, y1: y, line: { color: col, width: 1, dash: "dash" },
     });
     const shapes = [refLine(d.upper, C.down), refLine(d.midpoint, C.sub), refLine(d.lower, C.up)].filter(Boolean);
@@ -212,7 +217,7 @@ function IntradayPanel() {
       title: { text: `Intraday S$NEER (${String(d.window || win).toUpperCase()})`, font: { size: 11, color: C.text }, x: 0.01, y: 0.98 },
       margin: { l: 48, r: 16, t: 30, b: 30 },
       xaxis: { ...PLAYOUT.xaxis, type: "date" },
-      yaxis: { ...PLAYOUT.yaxis, range: [rLo - pad, rHi + pad] },
+      yaxis: { ...PLAYOUT.yaxis, autorange: true },
     };
     body = <Plot data={traces} layout={layout} config={PCFG} style={{ width: "100%" }} useResizeHandler />;
   }
@@ -312,6 +317,9 @@ function SoraCurveChart({ curve }) {
   const layout = {
     ...PLAYOUT, height: 130, margin: { l: 40, r: 10, t: 10, b: 22 },
     legend: undefined,
+    // force a categorical tenor axis — otherwise Plotly tries to date-parse the
+    // labels ("O/N","1M",…), fails, and renders an empty chart on a ~2000 date axis.
+    xaxis: { ...PLAYOUT.xaxis, type: "category" },
     yaxis: { ...PLAYOUT.yaxis, ticksuffix: "%" },
   };
   return <Plot data={traces} layout={layout} config={PCFG} style={{ width: "100%" }} useResizeHandler />;
