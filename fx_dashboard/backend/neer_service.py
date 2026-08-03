@@ -867,64 +867,115 @@ class NeerService:
                     z[i] = (dev[i] - mu) / sd
         sma20, sma50 = rollmean(dev, 20), rollmean(dev, 50)
 
-        # signal markers: fade band-position z extremes
+        # signal markers: fade band-position z extremes. Tag each with a band-EDGE
+        # conviction: a SELL (short SGD) while rich near the +2% ceiling is structure-
+        # confirmed (MAS caps upside); a BUY (long SGD) up there fights the cap. The
+        # absolute level is a conviction FILTER, not a fair-value anchor (in a ±2% band
+        # the NEER can hover rich for months, so we fade the rolling MA, not the mid).
+        def conviction(kind, d):
+            near_ceil = d >= 1.4          # within ~60bp of the +2% wall
+            near_floor = d <= -1.4
+            if (kind == "sell" and near_ceil) or (kind == "buy" and near_floor):
+                return "confirmed"        # fade agrees with the structural cap
+            if (kind == "buy" and near_ceil) or (kind == "sell" and near_floor):
+                return "fighting-cap"     # low conviction — against the wall
+            return "neutral"
         signals = []
         for i in range(n):
             if z[i] is None:
                 continue
-            if z[i] >= K:
-                signals.append({"date": dates[i], "type": "sell", "z": round(z[i], 2), "dev": round(dev[i], 3)})
-            elif z[i] <= -K:
-                signals.append({"date": dates[i], "type": "buy", "z": round(z[i], 2), "dev": round(dev[i], 3)})
+            kind = "sell" if z[i] >= K else "buy" if z[i] <= -K else None
+            if kind:
+                signals.append({"date": dates[i], "type": kind, "z": round(z[i], 2),
+                                "dev": round(dev[i], 3), "conviction": conviction(kind, dev[i])})
 
-        # mean-reversion backtest on NEER returns: position from yesterday's z
-        rets = [0.0] + [math.log(neer[i] / neer[i - 1]) if (neer[i] and neer[i - 1]) else 0.0
-                        for i in range(1, n)]
-        pos, strat = 0, [0.0]
+        # position series from yesterday's z (long SGD = +1). Shared by both backtests.
+        positions = [0] * n
+        p = 0
         for i in range(1, n):
             zi = z[i - 1]
             if zi is not None:
                 if zi >= K:
-                    pos = -1
+                    p = -1
                 elif zi <= -K:
-                    pos = 1
+                    p = 1
                 elif abs(zi) < 0.5:
-                    pos = 0
-            strat.append(pos * rets[i])
-        equity = [1.0]
-        for r in strat[1:]:
-            equity.append(equity[-1] * (1 + r))
-        rsharpe = [None] * n
-        W = 60
-        for i in range(n):
-            if i >= W:
-                seg = strat[i - W + 1:i + 1]
-                sd = st.pstdev(seg) or 1e-9
-                rsharpe[i] = round(math.sqrt(252) * (sum(seg) / len(seg)) / sd, 2)
-        peak, maxdd = equity[0], 0.0
-        for v in equity:
-            peak = max(peak, v); maxdd = min(maxdd, v / peak - 1)
-        active = [r for r in strat[1:] if r != 0.0]
-        hit = (sum(1 for r in active if r > 0) / len(active) * 100.0) if active else None
-        sd_all = st.pstdev(strat[1:]) or 1e-9
-        sharpe = math.sqrt(252) * (st.mean(strat[1:]) / sd_all)
+                    p = 0
+            positions[i] = p
+
+        # SGD-vs-USD return (the tradable proxy leg): e_usd = USD per SGD, up = SGD stronger.
+        h = self._history_bilaterals()
+        e_usd = h["e"].get("USD", [])
+        neer_ret = [0.0] + [math.log(neer[i] / neer[i - 1]) if (neer[i] and neer[i - 1]) else 0.0
+                            for i in range(1, n)]
+        usd_ret = [0.0] + [math.log(e_usd[i] / e_usd[i - 1])
+                           if (i < len(e_usd) and e_usd[i] and e_usd[i - 1]) else 0.0
+                           for i in range(1, n)]
+
+        def run_bt(ret_long_sgd, cost_bp_side=0.0, carry_ann=0.0):
+            strat = [0.0]; turn = 0.0
+            for i in range(1, n):
+                dpos = abs(positions[i] - positions[i - 1])
+                turn += dpos
+                pnl = positions[i] * ret_long_sgd[i]
+                pnl -= dpos * (cost_bp_side / 1e4)                  # bid/offer on each leg of a flip
+                pnl -= positions[i] * (carry_ann / 100.0 / 252.0)  # long SGD pays the rate differential
+                strat.append(pnl)
+            eq = [1.0]
+            for r in strat[1:]:
+                eq.append(eq[-1] * (1 + r))
+            rs = [None] * n
+            W = 60
+            for i in range(n):
+                if i >= W:
+                    seg = strat[i - W + 1:i + 1]
+                    sd = st.pstdev(seg) or 1e-9
+                    rs[i] = round(math.sqrt(252) * (sum(seg) / len(seg)) / sd, 2)
+            peak, mdd = eq[0], 0.0
+            for v in eq:
+                peak = max(peak, v); mdd = min(mdd, v / peak - 1)
+            active = [r for r in strat[1:] if r != 0.0]
+            hit = (sum(1 for r in active if r > 0) / len(active) * 100.0) if active else None
+            sd_all = st.pstdev(strat[1:]) or 1e-9
+            sharpe = math.sqrt(252) * (st.mean(strat[1:]) / sd_all)
+            yrs = max(n / 252.0, 1e-6)
+            return {
+                "equity": [round(v, 5) for v in eq],
+                "rollingSharpe": rs,
+                "totalReturnPct": round((eq[-1] - 1) * 100.0, 2),
+                "annReturnPct": round((eq[-1] ** (252.0 / n) - 1) * 100.0, 2),
+                "sharpe": round(sharpe, 2),
+                "maxDrawdownPct": round(mdd * 100.0, 2),
+                "hitRatePct": round(hit, 1) if hit is not None else None,
+                "turnover": round(turn, 1), "tradesPerYr": round(turn / yrs, 1),
+            }
+
+        CARRY_ANN = 3.0   # long-SGD carry drag (~SOFR − SORA); estimate, see note.
+        COST_BP_SIDE = 0.4
+        signal_bt = run_bt(neer_ret, 0.0, 0.0)          # gross NEER — signal predictive value only
+        traded_bt = run_bt(usd_ret, COST_BP_SIDE, CARRY_ANN)  # tradable via USD/SGD, net of cost+carry
         return {
             "dates": dates, "neer": neer, "devPct": dev,
             "bollinger": {"sma": sma, "upper": upper, "lower": lower, "z": z, "n": N, "k": K},
             "trend": {"sma20": sma20, "sma50": sma50},
-            "signals": signals,
-            "backtest": {
-                "equity": [round(v, 5) for v in equity],
-                "rollingSharpe": rsharpe,
-                "totalReturnPct": round((equity[-1] - 1) * 100.0, 2),
-                "annReturnPct": round((equity[-1] ** (252.0 / n) - 1) * 100.0, 2),
-                "sharpe": round(sharpe, 2),
-                "maxDrawdownPct": round(maxdd * 100.0, 2),
-                "hitRatePct": round(hit, 1) if hit is not None else None,
-                "nSignals": len(signals),
-                "strategy": "Mean-reversion: fade band-position z-score (enter |z|≥2, exit |z|<0.5). "
-                            "Detrended vs the crawling midpoint; policy slope booked separately as carry.",
-            },
+            "signals": signals, "nSignals": len(signals),
+            "strategy": "Mean-reversion: fade the band-position z-score vs its 20d MA "
+                        "(enter |z|≥2, exit |z|<0.5). Adaptive anchor (the MA), so it fades "
+                        "wiggles around the persistent level rather than the ±2% midpoint.",
+            # (1) signal predictive value on the INDEX — NOT a tradable return (you can't
+            #     trade the S$NEER; gross, no cost/carry).
+            "signalBacktest": {**signal_bt,
+                               "basis": "S$NEER index (gross)",
+                               "note": "Predictive value of the signal on the index — not a "
+                                       "tradable P&L (the S$NEER is not a traded instrument)."},
+            # (2) realizable P&L via USD/SGD (the dominant proxy), net of bid/offer + carry.
+            #     Has tracking error to the NEER (USD/SGD is ~20% of the basket).
+            "tradedBacktest": {**traded_bt,
+                               "basis": "USD/SGD proxy (net of cost + carry)",
+                               "costBpPerSide": COST_BP_SIDE, "carryAnnPct": CARRY_ANN,
+                               "note": "Signal traded via USD/SGD, net of ~%.1fbp/side + ~%.1f%%/yr "
+                                       "long-SGD carry. Tracks the NEER imperfectly (USD/SGD is only "
+                                       "~20%% of the basket)." % (COST_BP_SIDE, CARRY_ANN)},
         }
 
 

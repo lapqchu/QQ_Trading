@@ -70,8 +70,8 @@ function SignalChart({ a }) {
     { x: dates, y: bb.lower, name: `Lower −${bb.k ?? 2}σ`, type: "scatter", mode: "lines", line: { color: C.up2, width: 1, dash: "dot" }, fill: "tonexty", fillcolor: "rgba(59,130,246,0.05)", hoverinfo: "skip" },
     { x: dates, y: bb.sma, name: `SMA(${bb.n ?? 20})`, type: "scatter", mode: "lines", line: { color: C.sub, width: 1, dash: "dash" } },
     { x: dates, y: a?.devPct, name: "Band pos %", type: "scatter", mode: "lines", line: { color: C.cyan, width: 1.6 } },
-    { x: buys.map((s) => s.date), y: buys.map((s) => s.dev), name: "BUY", type: "scatter", mode: "markers", marker: { symbol: "triangle-up", size: 10, color: C.up, line: { width: 0.5, color: "#052e16" } }, hovertemplate: "BUY %{x}<br>dev %{y:.3f}<extra></extra>" },
-    { x: sells.map((s) => s.date), y: sells.map((s) => s.dev), name: "SELL", type: "scatter", mode: "markers", marker: { symbol: "triangle-down", size: 10, color: C.down, line: { width: 0.5, color: "#450a0a" } }, hovertemplate: "SELL %{x}<br>dev %{y:.3f}<extra></extra>" },
+    { x: buys.map((s) => s.date), y: buys.map((s) => s.dev), name: "BUY", type: "scatter", mode: "markers", customdata: buys.map((s) => s.conviction || ""), marker: { symbol: "triangle-up", size: 10, color: C.up, opacity: buys.map((s) => s.conviction === "fighting-cap" ? 0.4 : 1), line: { width: 0.5, color: "#052e16" } }, hovertemplate: "BUY %{x}<br>dev %{y:.3f}%<br>%{customdata}<extra></extra>" },
+    { x: sells.map((s) => s.date), y: sells.map((s) => s.dev), name: "SELL", type: "scatter", mode: "markers", customdata: sells.map((s) => s.conviction || ""), marker: { symbol: "triangle-down", size: 10, color: C.down, opacity: sells.map((s) => s.conviction === "fighting-cap" ? 0.4 : 1), line: { width: 0.5, color: "#450a0a" } }, hovertemplate: "SELL %{x}<br>dev %{y:.3f}%<br>%{customdata}<extra></extra>" },
   ];
   const layout = {
     ...PLAYOUT, height: 320,
@@ -98,36 +98,55 @@ function TrendChart({ a }) {
   return <Plot data={traces} layout={layout} config={PCFG} style={{ width: "100%" }} useResizeHandler />;
 }
 
-// ── C. Equity curve ──
-function EquityChart({ a }) {
-  const dates = a?.dates || [];
-  const bt = a?.backtest || {};
+// ── C. Equity curve (per backtest) ──
+function EquityChart({ dates, bt, title, color }) {
   const traces = [{
-    x: dates, y: bt.equity, name: "Equity", type: "scatter", mode: "lines",
-    line: { color: C.up2, width: 1.6 }, fill: "tozeroy", fillcolor: "rgba(52,211,153,0.06)",
+    x: dates || [], y: bt?.equity, name: "Equity", type: "scatter", mode: "lines",
+    line: { color: color || C.up2, width: 1.6 }, fill: "tozeroy", fillcolor: "rgba(52,211,153,0.06)",
     hovertemplate: "%{x}<br>%{y:.4f}<extra></extra>",
   }];
   const layout = {
-    ...PLAYOUT, height: 210, legend: undefined,
-    title: { text: "Equity Curve", font: { size: 11, color: C.text }, x: 0.01, y: 0.98 },
+    ...PLAYOUT, height: 190, legend: undefined,
+    title: { text: title || "Equity Curve", font: { size: 10, color: C.text }, x: 0.01, y: 0.98 },
   };
   return <Plot data={traces} layout={layout} config={PCFG} style={{ width: "100%" }} useResizeHandler />;
 }
 
-// ── C. Rolling Sharpe ──
-function SharpeChart({ a }) {
-  const dates = a?.dates || [];
-  const bt = a?.backtest || {};
+// ── C. Rolling Sharpe (per backtest) ──
+function SharpeChart({ dates, bt, color }) {
   const traces = [{
-    x: dates, y: bt.rollingSharpe, name: "Rolling Sharpe", type: "scatter", mode: "lines",
-    line: { color: C.cyan, width: 1.4 }, hovertemplate: "%{x}<br>%{y:.2f}<extra></extra>",
+    x: dates || [], y: bt?.rollingSharpe, name: "Rolling Sharpe", type: "scatter", mode: "lines",
+    line: { color: color || C.cyan, width: 1.4 }, hovertemplate: "%{x}<br>%{y:.2f}<extra></extra>",
   }];
   const layout = {
-    ...PLAYOUT, height: 210, legend: undefined,
-    title: { text: "Rolling Sharpe (60d)", font: { size: 11, color: C.text }, x: 0.01, y: 0.98 },
+    ...PLAYOUT, height: 190, legend: undefined,
+    title: { text: "Rolling Sharpe (60d)", font: { size: 10, color: C.text }, x: 0.01, y: 0.98 },
     shapes: [{ type: "line", xref: "paper", x0: 0, x1: 1, y0: 0, y1: 0, line: { color: "#475569", width: 1, dash: "dot" } }],
   };
   return <Plot data={traces} layout={layout} config={PCFG} style={{ width: "100%" }} useResizeHandler />;
+}
+
+// ── C. One backtest block (stats + equity + sharpe) ──
+function BacktestBlock({ dates, bt, title, subtitle, color }) {
+  if (!bt) return null;
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <div style={{ fontSize: 10, fontWeight: 700, color: C.text, marginBottom: 2 }}>{title}</div>
+      <div style={{ fontSize: 8.5, color: C.dim, marginBottom: 6, fontStyle: "italic" }}>{subtitle}</div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(88px,1fr))", gap: 6, marginBottom: 8 }}>
+        <Stat label="Total Ret" value={`${num(bt.totalReturnPct, 2)}%`} color={scol(bt.totalReturnPct)} tip="Cumulative return over the window" />
+        <Stat label="Ann Ret" value={`${num(bt.annReturnPct, 2)}%`} color={scol(bt.annReturnPct)} tip="Annualised return" />
+        <Stat label="Sharpe" value={num(bt.sharpe, 2)} color={C.cyan} tip="Annualised Sharpe (√252)" />
+        <Stat label="Max DD" value={`${num(bt.maxDrawdownPct, 2)}%`} color={C.down} tip="Worst peak-to-trough" />
+        <Stat label="Hit Rate" value={`${num(bt.hitRatePct, 1)}%`} tip="Share of profitable days in-position" />
+        <Stat label="Trades/yr" value={num(bt.tradesPerYr, 1)} tip={`Turnover ${num(bt.turnover, 1)} — position flips per year`} />
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+        <EquityChart dates={dates} bt={bt} title={`Equity — ${bt.basis || ""}`} color={color} />
+        <SharpeChart dates={dates} bt={bt} color={color} />
+      </div>
+    </div>
+  );
 }
 
 // ── Main ──
@@ -151,8 +170,6 @@ export default function NeerAnalysis() {
   }, []);
   useEffect(() => { load(); }, [load]);   // fetch once on tab open
 
-  const bt = a?.backtest || {};
-  const gridStyle = { display: "grid", gap: 12 };
   const refreshBtn = (
     <button onClick={load} disabled={loading} style={{
       fontSize: 9, fontWeight: 700, color: loading ? C.dim : C.cyan, background: "transparent",
@@ -190,21 +207,19 @@ export default function NeerAnalysis() {
             </Panel>
           </div>
 
-          {/* C. backtest */}
+          {/* C. backtests — signal indicator (index, gross) + traded proxy (USD/SGD, net) */}
           <div style={{ marginTop: 12 }}>
-            <Panel title="Backtest" note={bt.strategy || null}>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(110px,1fr))", gap: 8, marginBottom: 10 }}>
-                <Stat label="Total Return" value={`${num(bt.totalReturnPct, 2)}%`} color={scol(bt.totalReturnPct)} tip="Cumulative strategy return over the window" />
-                <Stat label="Ann Return" value={`${num(bt.annReturnPct, 2)}%`} color={scol(bt.annReturnPct)} tip="Annualised strategy return" />
-                <Stat label="Sharpe" value={num(bt.sharpe, 2)} color={C.cyan} tip="Annualised Sharpe ratio" />
-                <Stat label="Max Drawdown" value={`${num(bt.maxDrawdownPct, 2)}%`} color={C.down} tip="Worst peak-to-trough decline" />
-                <Stat label="Hit Rate" value={`${num(bt.hitRatePct, 1)}%`} tip="Share of profitable trades" />
-                <Stat label="# Signals" value={num(bt.nSignals, 0)} tip="Number of entry signals generated" />
-              </div>
-              <div style={{ ...gridStyle, gridTemplateColumns: "repeat(auto-fit,minmax(320px,1fr))" }}>
-                <EquityChart a={a} />
-                <SharpeChart a={a} />
-              </div>
+            <Panel title="Backtest" note={a.strategy || null}>
+              <div style={{ fontSize: 9, color: C.sub, marginBottom: 10 }}>{num(a.nSignals, 0)} entry signals over the window.</div>
+              <BacktestBlock
+                dates={a.dates} bt={a.signalBacktest} color={C.up2}
+                title="① Signal predictive value — S$NEER (gross)"
+                subtitle={a.signalBacktest?.note || "Predictive value of the signal on the index — NOT a tradable P&L (the S$NEER is not a traded instrument)."} />
+              <div style={{ height: 1, background: C.border, margin: "6px 0 12px" }} />
+              <BacktestBlock
+                dates={a.dates} bt={a.tradedBacktest} color={C.cyan}
+                title="② Realizable P&L — traded via USD/SGD (net of cost + carry)"
+                subtitle={a.tradedBacktest?.note || "Signal traded via USD/SGD, net of bid/offer + long-SGD carry; tracks the NEER imperfectly."} />
             </Panel>
           </div>
 
