@@ -1,9 +1,9 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
-import NeerApp from "./NeerApp.jsx";
+import DeepDive from "./DeepDive.jsx";
 
 ReactDOM.createRoot(document.getElementById("root")).render(
   <React.StrictMode>
-    <NeerApp />
+    <DeepDive />
   </React.StrictMode>
 );

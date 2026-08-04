@@ -33,6 +33,7 @@ from dotenv import load_dotenv
 from lseg_client import LsegClient
 from market_service import MarketService
 from neer_service import NeerService, MAS_MEETINGS
+from risk_service import RiskService, product_catalog
 from ric_config import CURRENCIES, NDF_CURRENCIES, DELIVERABLE_CURRENCIES, get_spread_pack, get_spread_packs, FUNDING_TENORS
 
 load_dotenv()
@@ -46,11 +47,12 @@ log = logging.getLogger("app")
 lseg: LsegClient | None = None
 market: MarketService | None = None
 neer: NeerService | None = None
+risk: RiskService | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global lseg, market, neer
+    global lseg, market, neer, risk
     lseg = LsegClient(app_key=os.environ.get("LSEG_APP_KEY"))
     try:
         lseg.open()
@@ -60,6 +62,7 @@ async def lifespan(app: FastAPI):
     market = MarketService(lseg)
     market.set_loop(asyncio.get_running_loop())
     neer = NeerService(lseg)   # SGD NEER deep-dive service (shares the LSEG session)
+    risk = RiskService(lseg)   # Risk Units vol/sizing service
     log.info("FX dashboard backend ready")
     yield
     log.info("Shutting down")
@@ -240,6 +243,28 @@ def status() -> Dict[str, Any]:
         "tickCounts": dict(market._tick_counts) if market else {},
         "wsSubscribers": {ch: len(subs) for ch, subs in (market._subscribers if market else {}).items()},
     }
+
+
+# ─────────────────────────── Risk Units ───────────────────────────
+@app.get("/api/risk/products")
+def risk_products(ccy: str = Query(...)) -> Dict[str, Any]:
+    """Product catalogue for a currency (calculator dropdown)."""
+    if ccy not in CURRENCIES:
+        raise HTTPException(404, f"Unknown currency: {ccy}")
+    return {"ccy": ccy, "products": product_catalog(ccy)}
+
+
+@app.get("/api/risk/vol")
+def risk_vol(ccy: str = Query(...), product: str = Query(...),
+             window: int = Query(20)) -> Dict[str, Any]:
+    """Daily vol + historical return distribution for one product (on-demand)."""
+    if not lseg or not lseg.is_open():
+        raise HTTPException(503, "LSEG session not open — check Workspace app & APP_KEY")
+    try:
+        return risk.vol(ccy, product, window)
+    except Exception as e:
+        log.exception("risk_vol failed")
+        raise HTTPException(500, str(e))
 
 
 # ─────────────────────────── NEER deep-dive (SGD) ───────────────────────────
