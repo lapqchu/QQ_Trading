@@ -39,6 +39,15 @@ class LsegClient:
         self._session = None
         self._streams: Dict[str, Any] = {}   # keyed by subscription tag
         self._lock = threading.Lock()
+        # Global rate-spacer for the historical-pricing endpoint (shared by the
+        # pricer + NEER tool). It is rate-limited (429) and bursts easily, so we
+        # space out call-starts and retry with backoff on 429.
+        self._hist_lock = threading.Lock()
+        self._hist_last = 0.0
+        self._hist_min_gap = 0.08   # ≥80ms between history call-starts
+        # Same rate-spacing for the udf snapshot endpoint (also 429-limited).
+        self._snap_last = 0.0
+        self._snap_min_gap = 0.05
 
     # ─────────────────────────── session ───────────────────────────
     def open(self) -> None:
@@ -72,16 +81,36 @@ class LsegClient:
     # ────────────────────────── snapshot ──────────────────────────
     def get_snapshot(self, rics: List[str], fields: List[str]) -> Dict[str, Dict[str, Any]]:
         """
-        One-shot snapshot for a list of RICs.
+        One-shot snapshot for a list of RICs (udf endpoint). Chunked + 429-retried +
+        rate-spaced, since the endpoint is shared (pricer + NEER) and rate-limited.
 
         Returns: { ric: { field: value, ... }, ... }
         """
         import lseg.data as ld
-        df = ld.get_data(universe=rics, fields=fields)
+        import time
+        rics = list(rics)
+        # ONE udf call (chunking would be N rate-limit hits instead of 1); retry the
+        # whole call on 429 with a short backoff, rate-spaced against other snapshots.
+        df = None
+        for attempt in range(2):   # one gentle retry only — retries add load when saturated
+            with self._hist_lock:
+                wait = self._snap_min_gap - (time.time() - self._snap_last)
+                if wait > 0:
+                    time.sleep(wait)
+                self._snap_last = time.time()
+            try:
+                df = ld.get_data(universe=rics, fields=fields)
+                break
+            except Exception as e:
+                m = str(e).lower()
+                if ("429" in m or "too many requests" in m) and attempt < 1:
+                    time.sleep(0.4)
+                    continue
+                log.debug("get_snapshot failed (%d rics): %s", len(rics), str(e)[:80])
+                return {}
         out: Dict[str, Dict[str, Any]] = {}
-        if df is None or df.empty:
+        if df is None or getattr(df, "empty", True):
             return out
-        # df index is RIC ('Instrument' column or index)
         for _, row in df.iterrows():
             ric = row.get("Instrument") or row.name
             out[ric] = {f: row.get(f) for f in fields if f in row.index}
@@ -105,46 +134,69 @@ class LsegClient:
         """
         import lseg.data as ld
         import pandas as pd
+        import time
         pd.set_option("future.no_silent_downcasting", True)
-        kwargs: Dict[str, Any] = {"universe": rics, "fields": list(fields), "interval": interval}
-        if start: kwargs["start"] = start
-        if end: kwargs["end"] = end
-        if count: kwargs["count"] = count
-        try:
-            df = ld.get_history(**kwargs)
-        except (TypeError, KeyError, AttributeError) as e:
-            # SDK bug: multi-RIC intraday queries throw when some RICs have no data.
-            # Fall back to per-RIC queries (slower but reliable).
-            log.info("get_history batch failed (%s); falling back per-RIC", e)
-            result: Dict[str, list] = {}
-            for r in rics:
-                one_kwargs = dict(kwargs); one_kwargs["universe"] = [r]
+        base: Dict[str, Any] = {"fields": list(fields), "interval": interval}
+        if start: base["start"] = start
+        if end: base["end"] = end
+        if count: base["count"] = count
+        rics = list(rics)
+
+        def _is_429(e) -> bool:
+            m = str(e).lower()
+            return "429" in m or "too many requests" in m
+
+        def _records(df, single: Optional[str] = None) -> Dict[str, list]:
+            out: Dict[str, list] = {}
+            if df is None or getattr(df, "empty", True):
+                return out
+            if getattr(df.columns, "nlevels", 1) > 1:
+                for ric in df.columns.get_level_values(0).unique():
+                    sub = df[ric].reset_index(); sub["Date"] = sub.iloc[:, 0].astype(str)
+                    out[ric] = sub.to_dict(orient="records")
+            else:
+                sub = df.reset_index(); sub["Date"] = sub.iloc[:, 0].astype(str)
+                out[single or (rics[0] if len(rics) == 1 else "default")] = sub.to_dict(orient="records")
+            return out
+
+        def _call(universe):
+            """One get_history with a global rate-spacer + 429 backoff. Returns
+            (df, sdk_error) — sdk_error=True signals the multi-RIC SDK bug → per-RIC."""
+            kw = dict(base, universe=universe)
+            for attempt in range(2):   # one gentle retry only
+                with self._hist_lock:
+                    wait = self._hist_min_gap - (time.time() - self._hist_last)
+                    if wait > 0:
+                        time.sleep(wait)
+                    self._hist_last = time.time()
                 try:
-                    subdf = ld.get_history(**one_kwargs)
-                except Exception as e2:
-                    log.debug("per-RIC history %s failed: %s", r, e2)
-                    continue
-                if subdf is None or subdf.empty:
-                    continue
-                sub = subdf.reset_index()
-                sub["Date"] = sub.iloc[:, 0].astype(str)
-                result[r] = sub.to_dict(orient="records")
-            return result
-        if df is None or df.empty:
-            return {}
-        # Convert to JSON-friendly format
+                    return ld.get_history(**kw), False
+                except (TypeError, KeyError, AttributeError):
+                    return None, True
+                except Exception as e:
+                    if _is_429(e) and attempt < 1:
+                        time.sleep(0.6)
+                        continue
+                    if _is_429(e):
+                        log.warning("get_history 429 after retry (%s…)", universe[:2])
+                    else:
+                        log.debug("get_history failed (%s…): %s", universe[:2], e)
+                    return None, False
+            return None, False
+
+        # Chunk large universes so we don't burst the historical-pricing rate limit
+        # (it 429s at ~13 concurrent per-RIC requests); 10 balances burst vs cold-start speed.
+        CHUNK = 10
         result: Dict[str, list] = {}
-        # With multiple RICs, lseg-data returns multi-index columns
-        if isinstance(df.columns, type(df.columns)) and df.columns.nlevels > 1:
-            for ric in rics:
-                if ric in df.columns.get_level_values(0):
-                    sub = df[ric].reset_index()
-                    sub["Date"] = sub.iloc[:, 0].astype(str)
-                    result[ric] = sub.to_dict(orient="records")
-        else:
-            sub = df.reset_index()
-            sub["Date"] = sub.iloc[:, 0].astype(str)
-            result[rics[0] if len(rics) == 1 else "default"] = sub.to_dict(orient="records")
+        chunks = [rics[i:i + CHUNK] for i in range(0, len(rics), CHUNK)] or [rics]
+        for chunk in chunks:
+            df, sdk_err = _call(chunk)
+            if sdk_err:
+                for r in chunk:                       # per-RIC fallback within the chunk
+                    sub_df, _ = _call([r])
+                    result.update(_records(sub_df, single=r))
+            else:
+                result.update(_records(df, single=(chunk[0] if len(chunk) == 1 else None)))
         return result
 
     # ────────────────────── realtime streaming ─────────────────────

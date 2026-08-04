@@ -216,6 +216,13 @@ class NeerService:
         self.weights = _weights_norm()
         self._hist_cache: Optional[Dict[str, Any]] = None
         self._hist_cache_ts: float = 0.0
+        # Short TTL caches for the heavy, slow-moving fetches so frequent snapshot
+        # polls don't hammer the shared LSEG desktop session (which is rate-limited
+        # and also serves the main pricer). carry ≈70 RICs, SORA ≈21 RICs.
+        self._sora_cache: Optional[Dict[str, Any]] = None
+        self._sora_ts: float = 0.0
+        self._carry_cache: Optional[Dict[str, Any]] = None
+        self._carry_ts: float = 0.0
 
     # ─────────────────────────── live quotes ───────────────────────────
     def _snap(self, rics: List[str], fields: List[str]) -> Dict[str, Dict[str, Any]]:
@@ -244,9 +251,11 @@ class NeerService:
     # ─────────────────────────── history ───────────────────────────
     def _history_bilaterals(self, days: int = 760) -> Dict[str, Any]:
         """Daily bilateral 'foreign per SGD' series for the basket, plus dates.
-        Cached ~10 min. Returns {'dates':[iso], 'e':{ccy:[vals]}}."""
+        Daily bars only change once a day, so cache 6h (the live tick comes from the
+        separate live-spot path, not from re-fetching this history every poll).
+        Returns {'dates':[iso], 'e':{ccy:[vals]}}."""
         import time as _t
-        if self._hist_cache and (_t.time() - self._hist_cache_ts) < 600:
+        if self._hist_cache and (_t.time() - self._hist_cache_ts) < 21600:
             return self._hist_cache
         start = (date.today() - timedelta(days=days)).isoformat()
         end = date.today().isoformat()
@@ -370,6 +379,9 @@ class NeerService:
         """The market SORA OIS curve (SGDSRA<T>OIS=, matches Bloomberg) plus the O/N
         SORA fixing (SORA=MAST) and the O/N SORA OIS (broker-contributed). No
         self-computed compounded rate and no SOR/SORA basis (SOR is discontinued)."""
+        import time as _t
+        if self._sora_cache is not None and (_t.time() - self._sora_ts) < 25:
+            return self._sora_cache
         rics = [SORA_ON_RIC] + SORA_ON_OIS_RICS + list(SORA_OIS_RICS.values())
         snap = self._snap(rics, ["CF_LAST", "CF_BID", "CF_ASK", "VALUE"])
         on_fix = _mid(snap.get(SORA_ON_RIC))
@@ -383,8 +395,10 @@ class NeerService:
             if v is not None:
                 curve.append({"months": m, "label": SORA_OIS_LABEL[m], "rate": v, "ric": ric})
         curve.sort(key=lambda x: x["months"])
-        return {"onSoraFixing": on_fix, "onFixingRic": SORA_ON_RIC,
-                "onSoraOis": on_ois, "onOisRic": on_ois_ric, "oisCurve": curve}
+        self._sora_cache = {"onSoraFixing": on_fix, "onFixingRic": SORA_ON_RIC,
+                            "onSoraOis": on_ois, "onOisRic": on_ois_ric, "oisCurve": curve}
+        self._sora_ts = _t.time()
+        return self._sora_cache
 
     # ─────────────────────────── carry (forward NEER − spot NEER) ───────────────
     def carry(self, neer_pos_slope: float, spot_neer_display: Optional[float] = None) -> Dict[str, Any]:
@@ -395,6 +409,11 @@ class NeerService:
         so spot and forward are internally consistent. carry>0 = the market prices SGD
         appreciation over the horizon (positive roll to be long); we also show it net
         of the policy slope."""
+        import time as _t
+        # ~70-RIC fetch; forward points move slowly → cache 45s to spare the shared
+        # LSEG session. spot_neer_display staleness of ≤45s is negligible for carryPts.
+        if self._carry_cache is not None and (_t.time() - self._carry_ts) < 45:
+            return self._carry_cache
         tenor_code = {1: "1M", 2: "2M", 3: "3M", 6: "6M", 12: "1Y"}
         tenors = [1, 2, 3, 6, 12]
         # assemble RICs: spot legs + SGD fwd points + per-leg fwd (deliv pts / NDF outrights)
@@ -484,6 +503,9 @@ class NeerService:
                 # (negative ⇒ the forward prices more appreciation than policy delivers → costs carry)
                 "netAnnPct": round(neer_pos_slope - ann, 3),
             })
+        if out.get("tenors"):
+            self._carry_cache = out
+            self._carry_ts = _t.time()
         return out
 
     # ─────────────────────────── trading metrics ───────────────────────────
@@ -728,7 +750,7 @@ class NeerService:
             if rv:
                 metrics["carryToVol"] = round(c3["netAnnPct"] / rv, 2)
         # per-leg contributions to today's NEER move (Δln e_i * w_i)
-        contribs = self._leg_contributions()
+        contribs = self._leg_contributions(e)   # reuse live bilaterals (no re-fetch)
         off = self._official_neer_cached()
         official = None
         if off.get("dates"):
@@ -754,10 +776,12 @@ class NeerService:
             "meetingActions": MAS_MEETING_ACTIONS,
         }
 
-    def _leg_contributions(self) -> Dict[str, Optional[float]]:
-        """Each leg's contribution to today's NEER log-move (bp), vs previous close."""
+    def _leg_contributions(self, e: Optional[Dict[str, float]] = None) -> Dict[str, Optional[float]]:
+        """Each leg's contribution to today's NEER log-move (bp), vs previous close.
+        Reuse the caller's live bilaterals (`e`) to avoid a duplicate LSEG fetch."""
         h = self._history_bilaterals()
-        e, legs, sgd_usd = self._live_bilaterals()
+        if e is None:
+            e, _legs, _sgd = self._live_bilaterals()
         out: Dict[str, Optional[float]] = {}
         if not h["dates"]:
             return out

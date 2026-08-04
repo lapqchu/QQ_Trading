@@ -173,7 +173,7 @@ function IntradayPanel() {
       } catch { if (alive) setStale(true); }
     }
     poll();
-    const id = setInterval(poll, 15000);   // live feel — refresh every 15s
+    const id = setInterval(poll, 30000);   // 30s — minute-history is heavy on the shared LSEG session
     return () => { alive = false; clearInterval(id); };
   }, [win]);
 
@@ -227,7 +227,7 @@ function IntradayPanel() {
         <span style={{ fontFamily: C.mono, fontSize: 12, fontWeight: 700, color: C.cyan }}>{num(last, 3)}</span>
         {btns}
       </div>}
-      note={hasData ? `${d.interval || ""} bars · ${d.count ?? times.length} pts · ceiling ${num(d.upper, 2)} / mid ${num(d.midpoint, 2)} / floor ${num(d.lower, 2)} · polls 15s` : null}>
+      note={hasData ? `${d.interval || ""} bars · ${d.count ?? times.length} pts · ceiling ${num(d.upper, 2)} / mid ${num(d.midpoint, 2)} / floor ${num(d.lower, 2)} · polls 30s` : null}>
       {body}
     </Panel>
   );
@@ -448,11 +448,13 @@ export default function NeerApp() {
       }
     }
     poll();
-    const id = setInterval(poll, 8000);
+    const id = setInterval(poll, 20000);   // 20s — NEER moves slowly; carry/SORA server-cached
     return () => { alive = false; clearInterval(id); };
   }, []);
 
-  // History: fetch once, refresh every 60s.
+  // History (10y daily band): STATIC — fetch once, refresh only hourly. The live
+  // position updates via the 20s snapshot poll (the last point effectively ticks
+  // through the gauge/readout); no need to re-pull the whole series every tick.
   useEffect(() => {
     let alive = true;
     async function load() {
@@ -464,7 +466,7 @@ export default function NeerApp() {
       } catch { /* keep last good history */ }
     }
     load();
-    const id = setInterval(load, 60000);
+    const id = setInterval(load, 3600000);   // hourly (daily bars barely change)
     return () => { alive = false; clearInterval(id); };
   }, []);
 
@@ -619,7 +621,7 @@ export default function NeerApp() {
         </div>
 
         <div style={{ marginTop: 16, textAlign: "center", fontSize: 8.5, color: C.dim }}>
-          SGD NEER deep-dive · snapshot polled every 8s · history 60s · intraday 15s · replicated basket (Barclays weights)
+          SGD NEER deep-dive · live 20s · history cached (hourly) · intraday 30s · replicated basket (Barclays weights)
         </div>
 
         </>)}
