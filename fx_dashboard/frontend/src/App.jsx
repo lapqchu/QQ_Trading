@@ -642,6 +642,19 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
     }
     return tenorDaysCurve;
   })();
+  // Naive (weekend-only, holiday-BLIND) spot→VD count for TODAY's tenor. Used only
+  // as a DRIFT reference: per-bar historical day counts are anchored to the true
+  // IPA count (tenorDaysVal/tenorDays) PLUS this bar's naive drift-vs-today. That
+  // cancels the constant holiday-blind offset (the ~13bp historical IY level bias
+  // came entirely from history using ~31d where IPA's holiday-adjusted count is
+  // ~33d) and makes the last bar reproduce the live IY exactly, while still
+  // capturing the real seasonal drift (a 1M window is 28-31 calendar days).
+  const todayNaiveVal=(()=>{
+    if(monthHint==null||!Number.isInteger(monthHint))return null;
+    const s=computeSpotDate(new Date());
+    const d=daysBtwn(s,addMon(s,monthHint));
+    return d>0?d:null;
+  })();
   // Current SOFR for this tenor from live snapshot (approximation — SOFR history not fetched).
   const currentSofr=(()=>{
     if(!ad||!ad.rows)return null;
@@ -661,13 +674,13 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
       vals=hist.map((h,i)=>{
         let ppdDays=tenorDays;
         const iso=rawHist?.[i]?.iso??(h.date instanceof Date?h.date.toISOString().slice(0,10):null);
-        if(monthHint!=null&&Number.isInteger(monthHint)&&nrM==null&&frM==null&&iso){
+        if(monthHint!=null&&Number.isInteger(monthHint)&&nrM==null&&frM==null&&iso&&todayNaiveVal){
           const barDate=new Date(iso+"T00:00:00");
           if(!isNaN(barDate)){
             const barSpot=computeSpotDate(barDate);
-            const barVD=addMon(barSpot,monthHint);
-            const perBarDays=daysBtwn(barSpot,barVD);
-            if(perBarDays>0)ppdDays=perBarDays;
+            const perBarNaive=daysBtwn(barSpot,addMon(barSpot,monthHint));
+            // Drift-anchor to today's true (IPA) count; see IY branch below.
+            if(perBarNaive>0){const d=tenorDays+(perBarNaive-todayNaiveVal);if(d>0)ppdDays=d;}
           }
         }
         return h.value*365/Math.max(ppdDays,1)/PF;
@@ -728,13 +741,14 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
         // date helpers. Only for genuine month tenors (integer monthHint) that
         // are not spreads/funding; otherwise fall back to tenorDaysVal.
         let iyDays=tenorDaysVal;
-        if(monthHint!=null&&Number.isInteger(monthHint)&&nrM==null&&frM==null&&iso){
+        if(monthHint!=null&&Number.isInteger(monthHint)&&nrM==null&&frM==null&&iso&&todayNaiveVal){
           const barDate=new Date(iso+"T00:00:00");
           if(!isNaN(barDate)){
-            const barSpot=computeSpotDate(barDate);    // ≈ spot = T+2 business days
-            const barVD=addMon(barSpot,monthHint);      // value date = spot + monthHint months
-            const perBarDays=daysBtwn(barSpot,barVD);   // calendar-day spot→VD count
-            if(perBarDays>0)iyDays=perBarDays;
+            const barSpot=computeSpotDate(barDate);                     // ≈ spot = T+2 business days
+            const perBarNaive=daysBtwn(barSpot,addMon(barSpot,monthHint)); // naive spot→VD count
+            // Drift-anchor to the live IPA-true count: the constant holiday-blind
+            // offset cancels (kills the ~13bp level bias); last bar ≈ live exactly.
+            if(perBarNaive>0){const d=tenorDaysVal+(perBarNaive-todayNaiveVal);if(d>0)iyDays=d;}
           }
         }
         return implYld(fwd,spot,sofrForDate,iyDays);
@@ -923,9 +937,13 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
   const lastBarForming=_cmpIdx!==_lastIdx;
   const liveVsLast=(()=>{
     if(viewMode!=="swap"||liveMid==null||lastBar==null||!isFinite(lastBar))return null;
-    const diff=Math.abs(lastBar-liveMid);
-    const tol=Math.max(1,Math.abs(liveMid)*0.05); // 5% or 1 pip, whichever is bigger
-    return{ok:diff<=tol,last:lastBar,live:liveMid,diff,forming:lastBarForming};
+    const diff=lastBar-liveMid;
+    // The last CHART bar is a prior-day SETTLE; the live value is the current tick, so a
+    // gap the size of a normal overnight/intraday move is EXPECTED (not a bug). Only flag
+    // an implausibly large gap — the kind a units/scale mismatch (pips↔outright) would
+    // produce — as a real "check this" warning.
+    const severe=Math.abs(diff)>Math.max(20,Math.abs(liveMid)*0.5);
+    return{ok:!severe,severe,last:lastBar,live:liveMid,diff};
   })();
   const priceTraces=[
     {x:dates,y:vals,type:"scatter",mode:"lines",name:tenor,line:{color:"#10B981",width:1.8}},
@@ -970,7 +988,7 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
     <div style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,.85)",zIndex:100,display:"flex",justifyContent:"center",alignItems:"center",padding:8}} onClick={onClose}>
       <div style={{background:"#0F172A",border:"1px solid #334155",borderRadius:8,width:"96%",maxWidth:1300,maxHeight:"96vh",overflow:"auto",padding:12}} onClick={e=>e.stopPropagation()}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6,flexWrap:"wrap",gap:4}}>
-          <h2 style={{fontSize:13,fontWeight:800,color:"#F8FAFC",margin:0}}>{tenor} — Historical {isSwapPts?"(Swap Points)":""}{histSource==='interpolated'&&<span style={{color:"#60A5FA",fontWeight:400,fontSize:9,marginLeft:8}}>Interpolated from anchor data</span>}{liveVsLast&&<span style={{marginLeft:8,fontSize:9,fontWeight:600,padding:"1px 6px",borderRadius:3,background:liveVsLast.ok?"#14532D":"#78350F",color:liveVsLast.ok?"#4ADE80":"#FBBF24"}} title={`last bar=${liveVsLast.last.toFixed(2)} · live=${liveVsLast.live.toFixed(2)} · Δ=${liveVsLast.diff.toFixed(2)}`}>{liveVsLast.ok?`\u2713 live matches last bar`:`\u26A0 last: ${liveVsLast.last.toFixed(1)} · live: ${liveVsLast.live.toFixed(1)}`}</span>}</h2>
+          <h2 style={{fontSize:13,fontWeight:800,color:"#F8FAFC",margin:0}}>{tenor} — Historical {isSwapPts?"(Swap Points)":""}{histSource==='interpolated'&&<span style={{color:"#60A5FA",fontWeight:400,fontSize:9,marginLeft:8}}>Interpolated from anchor data</span>}{liveVsLast&&<span style={{marginLeft:8,fontSize:9,fontWeight:600,padding:"1px 6px",borderRadius:3,background:liveVsLast.ok?"#14532D":"#78350F",color:liveVsLast.ok?"#4ADE80":"#FBBF24"}} title={`last bar=${liveVsLast.last.toFixed(2)} · live=${liveVsLast.live.toFixed(2)} · Δ=${liveVsLast.diff.toFixed(2)}`}>{liveVsLast.ok?`\u2713 live vs prior close (normal daily move)`:`\u26A0 last: ${liveVsLast.last.toFixed(1)} · live: ${liveVsLast.live.toFixed(1)}`}</span>}</h2>
           <div style={{display:"flex",gap:4,alignItems:"center",flexWrap:"wrap"}}>
             <div style={{display:"flex",gap:2}}>{["1D","5D","1M","3M","6M","1Y","3Y","5Y","10Y","Max"].map(p=>(<button key={p} onClick={()=>setPeriod(p)} style={{fontSize:7.5,padding:"1px 5px",borderRadius:3,border:"none",cursor:"pointer",background:period===p?"#3B82F6":"#1E293B",color:period===p?"#FFF":"#94A3B8"}}>{p}</button>))}</div>
             <div style={{display:"flex",gap:2,borderLeft:"1px solid #334155",paddingLeft:4}}>{[["swap","Swap Pts"],["iy","Impl Yld"],["ppd","PPD"],["carryDecomp","Carry Decomp"]].map(([k,l])=>(<button key={k} onClick={()=>setViewMode(k)} style={{fontSize:7.5,padding:"1px 5px",borderRadius:3,border:"none",cursor:"pointer",background:viewMode===k?"#8B5CF6":"#1E293B",color:viewMode===k?"#FFF":"#94A3B8"}}>{l}</button>))}</div>
