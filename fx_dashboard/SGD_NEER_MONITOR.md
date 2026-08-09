@@ -20,7 +20,7 @@ just a different page.
 ```
 cd fx_dashboard/backend
 python -m venv .venv && source .venv/bin/activate     # first time (Windows: .venv\Scripts\activate)
-pip install -r requirements.txt                        # first time (adds scipy for the weight-fit)
+pip install -r requirements.txt                        # first time (scipy for weight-fit; holidays for on-par carry day counts)
 uvicorn app:app --host 127.0.0.1 --port 8000
 ```
 Wait for `FX dashboard backend ready`. (No `--reload`.)
@@ -37,7 +37,30 @@ Then open in the browser:
 
 That's it — the NEER page polls the backend every ~8s and ticks live with the FX legs.
 
-The page has two tabs: **MONITOR** and **ANALYSIS**.
+## Deep-dive tabs (top of the neer.html page)
+The `neer.html` page is a **deep-dive shell** with three top-level tabs — the first per-currency
+tools of a growing family, all sharing the pricer's backend + LSEG session:
+
+- **SGD NEER** — the monitor described here (MONITOR + ANALYSIS sub-tabs).
+- **RISK UNITS** — vol-based position sizing: pick a product, state a USD risk budget
+  (daily vol / VaR95 / VaR99), get the notional (or DV01) to put on. `/api/risk/*`.
+- **CARRY BASKET** — long high-yield / short low-yield, **vol-adjusted sizing**, across all
+  traded EM currencies (the pricer universe) **+ G10** (EUR/GBP/JPY/CHF/AUD/NZD/CAD/NOK/SEK,
+  which are NOT in the pricer). Always shows a **yield rank** over the combined universe on the
+  1M forward-implied yield vs USD (NDF-implied for restricted names). Pick longs (top-N or
+  specific) with USD notionals + shorts (bottom-N or specific); the short leg is sized so its
+  daily-$-vol balances the longs (vol-neutral default; $-neutral optional), inverse-vol within
+  each leg. Reports the book's daily-$-vol from the **full covariance** (shows the diversification
+  vs the naive per-leg sum), net carry, carry-to-vol, and VaR. `/api/carry/*`.
+  - **On par with the pricer**: same spot/points/NDF feeds, same DF yield engine, and the same
+    holiday-adjusted 1M day count (uses the `holidays` package; verified to **0.0 bp** vs the
+    pricer's `iyDf` across SGD/INR/TRY/KRW/THB/MXN/PHP). Rank refreshes 60s; sizing re-runs on
+    selection change (history is cached ~2h, so it stays light on the shared LSEG session).
+  - **Read the caveat**: carry is structurally short-vol / negatively skewed — realized vol
+    underprices tail risk (a low-vol high-carrier like a managed peg can be a crowded crash
+    trade). The tool shows per-leg downside 95/99 alongside carry-to-vol for this reason.
+
+## SGD NEER: the page has two tabs — **MONITOR** and **ANALYSIS**.
 
 ### MONITOR
 - **NEER + band position** — our live geometric replica of the MAS S$NEER, re-based to the

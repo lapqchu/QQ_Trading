@@ -28,12 +28,14 @@ from typing import Dict, Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from lseg_client import LsegClient
 from market_service import MarketService
 from neer_service import NeerService, MAS_MEETINGS
 from risk_service import RiskService, product_catalog
+from carry_basket_service import CarryBasketService
 from ric_config import CURRENCIES, NDF_CURRENCIES, DELIVERABLE_CURRENCIES, get_spread_pack, get_spread_packs, FUNDING_TENORS
 
 load_dotenv()
@@ -48,11 +50,12 @@ lseg: LsegClient | None = None
 market: MarketService | None = None
 neer: NeerService | None = None
 risk: RiskService | None = None
+carry: CarryBasketService | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global lseg, market, neer, risk
+    global lseg, market, neer, risk, carry
     lseg = LsegClient(app_key=os.environ.get("LSEG_APP_KEY"))
     try:
         lseg.open()
@@ -63,6 +66,7 @@ async def lifespan(app: FastAPI):
     market.set_loop(asyncio.get_running_loop())
     neer = NeerService(lseg)   # SGD NEER deep-dive service (shares the LSEG session)
     risk = RiskService(lseg)   # Risk Units vol/sizing service
+    carry = CarryBasketService(lseg)   # Carry Basket rank/sizing deep-dive service
     log.info("FX dashboard backend ready")
     yield
     log.info("Shutting down")
@@ -264,6 +268,60 @@ def risk_vol(ccy: str = Query(...), product: str = Query(...),
         return risk.vol(ccy, product, window)
     except Exception as e:
         log.exception("risk_vol failed")
+        raise HTTPException(500, str(e))
+
+
+# ─────────────────────────── Carry Basket ───────────────────────────
+class _LongLeg(BaseModel):
+    code: str
+    notionalUsd: float = 0.0
+
+
+class _BasketReq(BaseModel):
+    longs: list[_LongLeg] = []
+    shorts: list[str] = []
+    sizingMode: str = "vol_neutral"     # vol_neutral | dollar_neutral
+    weighting: str = "inverse_vol"      # inverse_vol | equal_notional
+    window: int = 20
+
+
+@app.get("/api/carry/rank")
+def carry_rank(force: bool = Query(False)) -> Dict[str, Any]:
+    """1M forward-implied yield rank across all EM (pricer) + G10 currencies."""
+    if not lseg or not lseg.is_open():
+        raise HTTPException(503, "LSEG session not open — check Workspace app & APP_KEY")
+    try:
+        return carry.rank(force=force)
+    except Exception as e:
+        log.exception("carry_rank failed")
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/carry/vols")
+def carry_vols(codes: str = Query(...), window: int = Query(20)) -> Dict[str, Any]:
+    """Per-currency daily/annual realized vol + downside percentiles."""
+    if not lseg or not lseg.is_open():
+        raise HTTPException(503, "LSEG session not open — check Workspace app & APP_KEY")
+    try:
+        code_list = [c.strip().upper() for c in codes.split(",") if c.strip()]
+        return {"window": window, "vols": carry.vols(code_list, window)}
+    except Exception as e:
+        log.exception("carry_vols failed")
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/carry/basket")
+def carry_basket(req: _BasketReq) -> Dict[str, Any]:
+    """Size the short leg vol-adjusted to balance user-specified longs; return the
+    full book (per-name notionals, book vol from covariance, net carry, carry-to-vol)."""
+    if not lseg or not lseg.is_open():
+        raise HTTPException(503, "LSEG session not open — check Workspace app & APP_KEY")
+    try:
+        longs = [{"code": l.code.upper(), "notionalUsd": l.notionalUsd} for l in req.longs]
+        shorts = [c.upper() for c in req.shorts]
+        return carry.basket(longs, shorts, req.sizingMode, req.weighting, req.window)
+    except Exception as e:
+        log.exception("carry_basket failed")
         raise HTTPException(500, str(e))
 
 
