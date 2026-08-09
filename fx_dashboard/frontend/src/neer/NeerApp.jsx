@@ -44,10 +44,20 @@ const PLAYOUT = {
   yaxis: { gridcolor: C.border, zerolinecolor: "#475569", tickfont: { size: 8 }, automargin: true },
   hovermode: "x unified",
   legend: { font: { size: 8 }, bgcolor: "transparent", orientation: "h", x: 0, y: 1.14 },
-  // Preserve user pan/zoom across the periodic data refreshes (constant → Plotly
-  // keeps the current view when only the data updates).
-  uirevision: "keep",
 };
+// Build a chart layout with its OWN fresh xaxis/yaxis objects and a PER-CHART
+// uirevision. Two reasons: (1) Plotly mutates layout.xaxis (writes the zoom range
+// into it) — sharing the PLAYOUT.xaxis reference across charts leaks a zoom from one
+// chart into all the others; (2) a distinct uirevision preserves each chart's own
+// pan/zoom across data refreshes without ever linking charts together.
+function chartLayout(uirev, over = {}) {
+  const { xaxis = {}, yaxis = {}, ...rest } = over;
+  return {
+    ...PLAYOUT, uirevision: uirev, ...rest,
+    xaxis: { ...PLAYOUT.xaxis, ...xaxis },
+    yaxis: { ...PLAYOUT.yaxis, ...yaxis },
+  };
+}
 const PCFG = { responsive: true, displayModeBar: false, displaylogo: false };
 const PCFG_BAR = {
   responsive: true, displaylogo: false,
@@ -148,11 +158,11 @@ function HistoryChart({ hist, meetingActions }) {
     font: { size: 7, color: ACTION_COLOR[m.action] || C.dim },
     bgcolor: "rgba(11,18,32,0.55)",
   }));
-  const layout = {
-    ...PLAYOUT, height: 320, shapes, annotations,
+  const layout = chartLayout("neer-band-history", {
+    height: 320, shapes, annotations,
     title: { text: "SGD NEER vs Policy Band — MAS meeting actions", font: { size: 11, color: C.text }, x: 0.01, y: 0.995 },
     margin: { l: 48, r: 16, t: 58, b: 26 },
-  };
+  });
   return <Plot data={traces} layout={layout} config={PCFG_BAR} style={{ width: "100%" }} useResizeHandler />;
 }
 
@@ -212,13 +222,15 @@ function IntradayPanel() {
       x: times, y: d.neer, type: "scatter", mode: "lines", name: "S$NEER",
       line: { color: C.cyan, width: 1.4 }, hovertemplate: "%{x}<br>%{y:.4f}<extra></extra>",
     }];
-    const layout = {
-      ...PLAYOUT, height: 240, shapes, legend: undefined,
+    // uirevision keyed to the window → same window preserves the user's zoom, but
+    // switching 1D/3D/5D/20D resets to the new data range.
+    const layout = chartLayout(`neer-intraday-${d.window || win}`, {
+      height: 240, shapes, legend: undefined,
       title: { text: `Intraday S$NEER (${String(d.window || win).toUpperCase()})`, font: { size: 11, color: C.text }, x: 0.01, y: 0.98 },
       margin: { l: 48, r: 16, t: 30, b: 30 },
-      xaxis: { ...PLAYOUT.xaxis, type: "date" },
-      yaxis: { ...PLAYOUT.yaxis, autorange: true },
-    };
+      xaxis: { type: "date" },
+      yaxis: { autorange: true },
+    });
     body = <Plot data={traces} layout={layout} config={PCFG} style={{ width: "100%" }} useResizeHandler />;
   }
   return (
@@ -314,14 +326,13 @@ function SoraCurveChart({ curve }) {
     line: { color: C.cyan, width: 1.5 }, marker: { size: 4, color: C.blue },
     hovertemplate: "%{x}: %{y:.3f}%<extra></extra>",
   }];
-  const layout = {
-    ...PLAYOUT, height: 130, margin: { l: 40, r: 10, t: 10, b: 22 },
-    legend: undefined,
+  const layout = chartLayout("neer-sora-curve", {
+    height: 130, margin: { l: 40, r: 10, t: 10, b: 22 }, legend: undefined,
     // force a categorical tenor axis — otherwise Plotly tries to date-parse the
     // labels ("O/N","1M",…), fails, and renders an empty chart on a ~2000 date axis.
-    xaxis: { ...PLAYOUT.xaxis, type: "category" },
-    yaxis: { ...PLAYOUT.yaxis, ticksuffix: "%" },
-  };
+    xaxis: { type: "category" },
+    yaxis: { ticksuffix: "%" },
+  });
   return <Plot data={traces} layout={layout} config={PCFG} style={{ width: "100%" }} useResizeHandler />;
 }
 

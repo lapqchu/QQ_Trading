@@ -27,8 +27,17 @@ const PLAYOUT = {
   yaxis: { gridcolor: C.border, zerolinecolor: "#475569", tickfont: { size: 8 }, automargin: true },
   hovermode: "x unified",
   legend: { font: { size: 8 }, bgcolor: "transparent", orientation: "h", x: 0, y: 1.16 },
-  uirevision: "keep",   // preserve pan/zoom across refreshes
 };
+// Fresh per-chart xaxis/yaxis (Plotly mutates them on zoom; sharing the PLAYOUT
+// reference leaks zoom between charts) + a distinct uirevision per chart.
+function chartLayout(uirev, over = {}) {
+  const { xaxis = {}, yaxis = {}, ...rest } = over;
+  return {
+    ...PLAYOUT, uirevision: uirev, ...rest,
+    xaxis: { ...PLAYOUT.xaxis, ...xaxis },
+    yaxis: { ...PLAYOUT.yaxis, ...yaxis },
+  };
+}
 const PCFG = {
   responsive: true, displaylogo: false,
   modeBarButtonsToRemove: ["lasso2d", "select2d", "toImage", "autoScale2d"],
@@ -73,11 +82,11 @@ function SignalChart({ a }) {
     { x: buys.map((s) => s.date), y: buys.map((s) => s.dev), name: "BUY", type: "scatter", mode: "markers", customdata: buys.map((s) => s.conviction || ""), marker: { symbol: "triangle-up", size: 10, color: C.up, opacity: buys.map((s) => s.conviction === "fighting-cap" ? 0.4 : 1), line: { width: 0.5, color: "#052e16" } }, hovertemplate: "BUY %{x}<br>dev %{y:.3f}%<br>%{customdata}<extra></extra>" },
     { x: sells.map((s) => s.date), y: sells.map((s) => s.dev), name: "SELL", type: "scatter", mode: "markers", customdata: sells.map((s) => s.conviction || ""), marker: { symbol: "triangle-down", size: 10, color: C.down, opacity: sells.map((s) => s.conviction === "fighting-cap" ? 0.4 : 1), line: { width: 0.5, color: "#450a0a" } }, hovertemplate: "SELL %{x}<br>dev %{y:.3f}%<br>%{customdata}<extra></extra>" },
   ];
-  const layout = {
-    ...PLAYOUT, height: 320,
+  const layout = chartLayout("an-signal", {
+    height: 320,
     title: { text: "Band Position — Mean Reversion (Bollinger + signals)", font: { size: 11, color: C.text }, x: 0.01, y: 0.99 },
-    yaxis: { ...PLAYOUT.yaxis, ticksuffix: "%" },
-  };
+    yaxis: { ticksuffix: "%" },
+  });
   return <Plot data={traces} layout={layout} config={PCFG} style={{ width: "100%" }} useResizeHandler />;
 }
 
@@ -90,11 +99,11 @@ function TrendChart({ a }) {
     { x: dates, y: tr.sma20, name: "SMA20", type: "scatter", mode: "lines", line: { color: C.cyan, width: 1.5 } },
     { x: dates, y: tr.sma50, name: "SMA50", type: "scatter", mode: "lines", line: { color: C.amber, width: 1.5 } },
   ];
-  const layout = {
-    ...PLAYOUT, height: 240,
+  const layout = chartLayout("an-trend", {
+    height: 240,
     title: { text: "Trend — SMA20 vs SMA50", font: { size: 11, color: C.text }, x: 0.01, y: 0.98 },
-    yaxis: { ...PLAYOUT.yaxis, ticksuffix: "%" },
-  };
+    yaxis: { ticksuffix: "%" },
+  });
   return <Plot data={traces} layout={layout} config={PCFG} style={{ width: "100%" }} useResizeHandler />;
 }
 
@@ -105,10 +114,10 @@ function EquityChart({ dates, bt, title, color }) {
     line: { color: color || C.up2, width: 1.6 }, fill: "tozeroy", fillcolor: "rgba(52,211,153,0.06)",
     hovertemplate: "%{x}<br>%{y:.4f}<extra></extra>",
   }];
-  const layout = {
-    ...PLAYOUT, height: 190, legend: undefined,
+  const layout = chartLayout(`an-equity-${bt?.basis || title || ""}`, {
+    height: 190, legend: undefined,
     title: { text: title || "Equity Curve", font: { size: 10, color: C.text }, x: 0.01, y: 0.98 },
-  };
+  });
   return <Plot data={traces} layout={layout} config={PCFG} style={{ width: "100%" }} useResizeHandler />;
 }
 
@@ -118,11 +127,11 @@ function SharpeChart({ dates, bt, color }) {
     x: dates || [], y: bt?.rollingSharpe, name: "Rolling Sharpe", type: "scatter", mode: "lines",
     line: { color: color || C.cyan, width: 1.4 }, hovertemplate: "%{x}<br>%{y:.2f}<extra></extra>",
   }];
-  const layout = {
-    ...PLAYOUT, height: 190, legend: undefined,
+  const layout = chartLayout(`an-sharpe-${bt?.basis || ""}`, {
+    height: 190, legend: undefined,
     title: { text: "Rolling Sharpe (60d)", font: { size: 10, color: C.text }, x: 0.01, y: 0.98 },
     shapes: [{ type: "line", xref: "paper", x0: 0, x1: 1, y0: 0, y1: 0, line: { color: "#475569", width: 1, dash: "dot" } }],
-  };
+  });
   return <Plot data={traces} layout={layout} config={PCFG} style={{ width: "100%" }} useResizeHandler />;
 }
 
