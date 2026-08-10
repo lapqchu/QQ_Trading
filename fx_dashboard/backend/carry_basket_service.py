@@ -82,6 +82,17 @@ DEFAULT_WINDOW = 20
 ANNUALIZE = math.sqrt(252.0)
 SNAP_FIELDS = ["CF_BID", "CF_ASK", "CF_LAST", "VALUE", "PRIMACT_1"]
 
+# ── User-directed sourcing for thin restricted NDFs where broker quotes genuinely
+# disagree (no single "true" yield — e.g. EGP FMD-outright 22.7% vs GMGM-point 20.5%).
+# Each source resolves to a forward OUTRIGHT (foreign-per-USD); the ccy's outright is
+# the mean of the resolved sources. Overrides the default composite/broker chain.
+#   "outright": RIC value IS the outright ({code}1MNDFOR={broker}).
+#   "point"   : RIC value is a swap point; outright = spot + point/pip_factor (ccy value_mode).
+CUSTOM_SOURCES: Dict[str, List[Tuple[str, str]]] = {
+    "EGP": [("EGP1MNDF=GMGM", "point"), ("EGP1MNDFOR=FMD", "outright")],   # average GMGM & FMD
+    "NGN": [("NGN1MNDFOR=MBGL", "outright")],                               # Martin Brokers (MBGL)
+}
+
 
 def _num(*vals) -> Optional[float]:
     for v in vals:
@@ -235,6 +246,8 @@ class CarryBasketService:
                 rics.append(ric)
             for orr in u.get("outright_rics") or []:
                 rics.append(orr)
+            for cric, _typ in CUSTOM_SOURCES.get(u["code"], []):
+                rics.append(cric)
         # de-dup preserving order
         rics = list(dict.fromkeys(rics))
 
@@ -272,11 +285,26 @@ class CarryBasketService:
             # Everyone else: composite point → broker points.
             fwd_fx = None
             src = None
-            for orr in (u.get("outright_rics") or []):
-                ov = mid(orr)
-                if ov is not None and ov > 0:
-                    fwd_fx, src = ov, "outright"
-                    break
+            # User-directed override first (EGP = avg GMGM+FMD; NGN = Martin/MBGL).
+            custom = CUSTOM_SOURCES.get(u["code"])
+            if custom:
+                outs = []
+                for cric, typ in custom:
+                    v = mid(cric)
+                    if v is None:
+                        continue
+                    o = (v if v > 0 else None) if typ == "outright" else self._outright(s_raw, v, u)
+                    if o and o > 0:
+                        outs.append(o)
+                if outs:
+                    fwd_fx = sum(outs) / len(outs)
+                    src = ("avg%d" % len(outs)) if len(outs) > 1 else "broker"
+            if fwd_fx is None:
+                for orr in (u.get("outright_rics") or []):
+                    ov = mid(orr)
+                    if ov is not None and ov > 0:
+                        fwd_fx, src = ov, "outright"
+                        break
             if fwd_fx is None:
                 for i, (ric, vm) in enumerate(u.get("pts_sources") or []):
                     p = mid(ric)
