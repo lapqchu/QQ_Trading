@@ -80,7 +80,10 @@ _CCY_CAL: Dict[str, str] = {
     "GBP": "GB", "AUD": "AU", "NZD": "NZ", "JPY": "JP", "CHF": "CH", "CAD": "CA",
     "NOK": "NO", "SEK": "SE",
 }
-_SPOT_LAG: Dict[str, int] = {"CAD": 1}     # USDCAD is T+1; others default T+2
+# T+1 settlement vs USD (spot lands one business day out, not two). Verified against
+# the pricer's IPA startDate: CAD/TRY/RUB/PHP settle T+1 — treating them as T+2 rolls
+# the value date over a weekend (+2 days), mispricing the yield (~180bp on TRY's 33%).
+_SPOT_LAG: Dict[str, int] = {"CAD": 1, "TRY": 1, "RUB": 1, "PHP": 1}
 _DAYS_1M_FALLBACK = 31                      # weekend-only ~1M count if holidays pkg absent
 
 # ── G10 universe (NOT in the pricer). code -> config ──
@@ -202,12 +205,17 @@ class CarryBasketService:
         """Combined EM (pricer) + G10 universe with the fields the rank needs."""
         out: List[Dict[str, Any]] = []
         for code, cfg in CURRENCIES.items():
+            # NGN/EGP: composite swap-point RIC is null — the pricer derives the forward
+            # from broker OUTRIGHT RICs ({code}1MNDFOR={broker}). Carry the outright RICs
+            # so the rank can read the outright directly instead of faking spot (→ SOFR).
+            outright_rics = ([cfg.outright_ric(1, broker=b) for b in cfg.outright_source_brokers]
+                             if cfg.derive_from_outrights else [])
             out.append({
                 "code": code, "pair": cfg.pair, "group": "EM",
                 "spot_ric": cfg.spot_ric, "pts_ric": cfg.swap_points_ric(1),
                 "pip_factor": cfg.pip_factor or 1.0,
                 "value_mode": cfg.value_mode, "inverted": bool(cfg.inverted),
-                "ndf": cfg.kind == "NDF",
+                "ndf": cfg.kind == "NDF", "outright_rics": outright_rics,
             })
         for code, g in G10.items():
             out.append({
@@ -263,17 +271,19 @@ class CarryBasketService:
     @staticmethod
     def _outright(spot: float, pts: float, u: Dict[str, Any]) -> Optional[float]:
         """Forward outright in FOREIGN-per-USD from spot + 1M points, honoring the
-        currency's value_mode / pip_factor / inverted convention."""
-        if spot is None or spot == 0:
+        currency's value_mode / pip_factor / inverted convention. Returns None if the
+        points are missing — WITHOUT points the forward would equal spot and the yield
+        would collapse to the USD rate (SOFR), silently faking a ~3.6% yield."""
+        if spot is None or spot == 0 or pts is None:
             return None
         pf = u["pip_factor"] or 1.0
         if u["inverted"]:
             # RIC quotes USD-per-foreign; points add in that convention, then reciprocate.
-            fwd_usd_per = spot + (pts / pf if pts is not None else 0.0)
+            fwd_usd_per = spot + pts / pf
             if fwd_usd_per <= 0:
                 return None
             return 1.0 / fwd_usd_per
-        add = (pts / pf) if (u["value_mode"] == "pips" and pts is not None) else (pts or 0.0)
+        add = (pts / pf) if u["value_mode"] == "pips" else pts
         fwd = spot + add
         return fwd if fwd > 0 else None
 
@@ -296,6 +306,8 @@ class CarryBasketService:
         for u in uni:
             rics.append(u["spot_ric"])
             rics.append(u["pts_ric"])
+            for orr in u.get("outright_rics") or []:
+                rics.append(orr)
         # de-dup preserving order
         rics = list(dict.fromkeys(rics))
 
@@ -324,15 +336,26 @@ class CarryBasketService:
         rows: List[Dict[str, Any]] = []
         for u in uni:
             s_raw = mid(u["spot_ric"])
-            p_raw = mid(u["pts_ric"])
             spot_fx = self._spot_fx(s_raw, u)
-            fwd_fx = self._outright(s_raw, p_raw, u)
             d1m = self._days_1m(u["code"])
+            # Forward outright (FOREIGN-per-USD): for derive-from-outright names (NGN/EGP,
+            # null composite points) read the broker OUTRIGHT directly; else spot + points.
+            fwd_fx = None
+            src = "points"
+            for orr in (u.get("outright_rics") or []):
+                ov = mid(orr)
+                if ov is not None and ov > 0:
+                    fwd_fx, src = ov, "outright"
+                    break
+            p_raw = None
+            if fwd_fx is None:
+                p_raw = mid(u["pts_ric"])
+                fwd_fx = self._outright(s_raw, p_raw, u)
             iy = implied_yield(fwd_fx, spot_fx, usd_curve(d1m), d1m) if (spot_fx and fwd_fx) else None
             rows.append({
                 "code": u["code"], "pair": u["pair"], "group": u["group"], "ndf": u["ndf"],
                 "spot": round(spot_fx, 6) if spot_fx else None,
-                "days1m": d1m,
+                "days1m": d1m, "src": src,
                 "impliedYield": round(iy, 4) if iy is not None else None,
                 "carry": round(iy - sofr, 4) if iy is not None else None,
                 "hasData": iy is not None,

@@ -416,7 +416,7 @@ export default function CarryBasket() {
         </div>
 
         <div style={{ fontSize: 8.5, color: C.dim, marginTop: 14, lineHeight: 1.6 }}>
-          Rank on 1M forward-implied yield vs USD (CIP); NDF names use the offshore NDF-implied yield. Day count is holiday-adjusted (US + local calendar) — on par with the pricer. Vol = realized daily vol of the currency's appreciation return over the lookback window; book vol from the full covariance of the basket's returns (signed exposures). Sizing default: vol-neutral short leg, inverse-vol within-leg (JPMorgan / Bloomberg-GSAM convention). rank 60s · sizing on selection change (history cached).
+          Rank on 1M forward-implied yield vs USD (CIP); NDF names use the offshore NDF-implied yield (NGN/EGP derived from broker outrights where the composite point is null). Day count is holiday-adjusted (US + local calendar, T+1 for CAD/TRY/RUB/PHP) — matches the pricer to &lt;1bp for 40/42; a couple of names (e.g. INR) can differ ≤1 day / ~6bp where the holiday-calendar source diverges from the pricer's. Vol = realized daily vol of the currency's appreciation return over the lookback window; book vol from the full covariance of the basket's returns (signed exposures). Sizing default: vol-neutral short leg, inverse-vol within-leg (JPMorgan / Bloomberg-GSAM convention). rank 60s · sizing on selection change (history cached).
         </div>
       </div>
     </div>
