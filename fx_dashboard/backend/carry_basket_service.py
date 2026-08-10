@@ -125,9 +125,16 @@ class CarryBasketService:
             # so the rank can read the outright directly instead of faking spot (→ SOFR).
             outright_rics = ([cfg.outright_ric(1, broker=b) for b in cfg.outright_source_brokers]
                              if cfg.derive_from_outrights else [])
+            # Ordered 1M-point sources: composite first, then brokers (each with its OWN
+            # value_mode — e.g. MXN composite is 'outright' pesos but brokers quote 'pips').
+            # The rank tries these in order so a null/absent composite self-heals via a
+            # broker instead of blanking or collapsing to the USD rate. No fallback to 0.
+            pts_sources = [(cfg.swap_points_ric(1), cfg.value_mode_for("composite"))]
+            for b in cfg.brokers[:3]:
+                pts_sources.append((cfg.broker_ric(1, b), cfg.value_mode_for(b)))
             out.append({
                 "code": code, "pair": cfg.pair, "group": "EM",
-                "spot_ric": cfg.spot_ric, "pts_ric": cfg.swap_points_ric(1),
+                "spot_ric": cfg.spot_ric, "pts_sources": pts_sources,
                 "pip_factor": cfg.pip_factor or 1.0,
                 "value_mode": cfg.value_mode, "inverted": bool(cfg.inverted),
                 "ndf": cfg.kind == "NDF", "outright_rics": outright_rics,
@@ -135,9 +142,9 @@ class CarryBasketService:
         for code, g in G10.items():
             out.append({
                 "code": code, "pair": g["pair"], "group": "G10",
-                "spot_ric": g["spot_ric"], "pts_ric": g["pts_ric"],
+                "spot_ric": g["spot_ric"], "pts_sources": [(g["pts_ric"], "pips")],
                 "pip_factor": g["pip_factor"], "value_mode": "pips",
-                "inverted": g["inverted"], "ndf": False,
+                "inverted": g["inverted"], "ndf": False, "outright_rics": [],
             })
         return out
 
@@ -184,11 +191,14 @@ class CarryBasketService:
         return out
 
     @staticmethod
-    def _outright(spot: float, pts: float, u: Dict[str, Any]) -> Optional[float]:
+    def _outright(spot: float, pts: float, u: Dict[str, Any],
+                  value_mode: Optional[str] = None) -> Optional[float]:
         """Forward outright in FOREIGN-per-USD from spot + 1M points, honoring the
-        currency's value_mode / pip_factor / inverted convention. Returns None if the
-        points are missing — WITHOUT points the forward would equal spot and the yield
-        would collapse to the USD rate (SOFR), silently faking a ~3.6% yield."""
+        source's value_mode / the ccy's pip_factor / inverted convention. Returns None
+        if the points are missing — WITHOUT points the forward would equal spot and the
+        yield would collapse to the USD rate (SOFR), silently faking a ~3.6% yield.
+        `value_mode` overrides the composite mode (a broker source may quote differently,
+        e.g. MXN composite is 'outright' pesos but its brokers quote 'pips')."""
         if spot is None or spot == 0 or pts is None:
             return None
         pf = u["pip_factor"] or 1.0
@@ -198,7 +208,8 @@ class CarryBasketService:
             if fwd_usd_per <= 0:
                 return None
             return 1.0 / fwd_usd_per
-        add = (pts / pf) if u["value_mode"] == "pips" else pts
+        vm = value_mode or u["value_mode"]
+        add = (pts / pf) if vm == "pips" else pts
         fwd = spot + add
         return fwd if fwd > 0 else None
 
@@ -220,7 +231,8 @@ class CarryBasketService:
         rics: List[str] = []
         for u in uni:
             rics.append(u["spot_ric"])
-            rics.append(u["pts_ric"])
+            for ric, _vm in u.get("pts_sources") or []:
+                rics.append(ric)
             for orr in u.get("outright_rics") or []:
                 rics.append(orr)
         # de-dup preserving order
@@ -253,19 +265,28 @@ class CarryBasketService:
             s_raw = mid(u["spot_ric"])
             spot_fx = self._spot_fx(s_raw, u)
             d1m = self._days_1m(u["code"])
-            # Forward outright (FOREIGN-per-USD): for derive-from-outright names (NGN/EGP,
-            # null composite points) read the broker OUTRIGHT directly; else spot + points.
+            # Forward outright (FOREIGN-per-USD), sourced in priority order — NEVER a
+            # fallback to 0/spot. Derive-from-outright names (NGN/EGP) are flagged BECAUSE
+            # their point RICs (composite AND broker) are unreliable, so their broker
+            # OUTRIGHT RIC ({code}1MNDFOR={broker}) is the canonical source and comes FIRST.
+            # Everyone else: composite point → broker points.
             fwd_fx = None
-            src = "points"
+            src = None
             for orr in (u.get("outright_rics") or []):
                 ov = mid(orr)
                 if ov is not None and ov > 0:
                     fwd_fx, src = ov, "outright"
                     break
-            p_raw = None
             if fwd_fx is None:
-                p_raw = mid(u["pts_ric"])
-                fwd_fx = self._outright(s_raw, p_raw, u)
+                for i, (ric, vm) in enumerate(u.get("pts_sources") or []):
+                    p = mid(ric)
+                    if p is None:
+                        continue
+                    f = self._outright(s_raw, p, u, vm)
+                    if f:
+                        fwd_fx = f
+                        src = "composite" if i == 0 else "broker"
+                        break
             iy = implied_yield(fwd_fx, spot_fx, usd_curve(d1m), d1m) if (spot_fx and fwd_fx) else None
             rows.append({
                 "code": u["code"], "pair": u["pair"], "group": u["group"], "ndf": u["ndf"],

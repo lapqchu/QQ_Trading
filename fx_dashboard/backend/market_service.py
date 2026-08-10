@@ -891,9 +891,15 @@ class MarketService:
             # reciprocate both and the diff stays conventional — leave valueMode.
             if kind in ("spot", "outright") or ric == spot_ric:
                 for b in (bars or []):
-                    b["BID"] = self._recip(_num(b.get("ASK")))
-                    b["ASK"] = self._recip(_num(b.get("BID")))
-                    b["TRDPRC_1"] = self._recip(_num(b.get("TRDPRC_1")))
+                    # Read BOTH raw sides FIRST — assigning b["BID"] before reading
+                    # b["BID"] for the ASK line would reciprocate an already-inverted
+                    # value (ask' = 1/(1/ask) = ask), leaving ASK un-inverted (the
+                    # BWP half-inversion bug: BID=1/0.0786=12.7 but ASK stayed 0.0786).
+                    rb, ra = _num(b.get("BID")), _num(b.get("ASK"))
+                    rl = _num(b.get("TRDPRC_1"))
+                    b["BID"] = self._recip(ra)   # bid' = 1/ask
+                    b["ASK"] = self._recip(rb)   # ask' = 1/bid
+                    b["TRDPRC_1"] = self._recip(rl)
                 continue
             # Swap / funding POINT series → per-USD points using per-date spot.
             for b in (bars or []):
