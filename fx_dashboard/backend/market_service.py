@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from lseg_client import LsegClient
 from turns import generate_turns, turn_types_for
 from discount_curve import DiscountCurve, implied_yield
+from daycount import day_count_map
 from ric_config import (
     CURRENCIES, SOFR_RICS, FUNDING_TENORS, BROKER_META,
     CurrencyConfig,
@@ -1467,6 +1468,20 @@ class MarketService:
         if getattr(cfg, "inverted", False):
             self._invert_history(cfg, hist, ric_meta)
 
+        # Per-bar holiday-adjusted spot→value-date day count, per anchor tenor. The
+        # frontend's historical implied-yield uses these instead of weekend-only date
+        # math (which mis-levels the IY by up to ~25bp on bars whose spot→VD window
+        # straddles a holiday). Keyed {monthStr: {iso: days}}; computed over the union
+        # of bar dates seen in this history. Pure calendar arithmetic — no LSEG calls.
+        day_counts: Dict[str, Dict[str, int]] = {}
+        if interval == "daily":
+            iso_dates = sorted({(b.get("Date") or "")[:10]
+                                for series in hist.values() for b in (series or [])
+                                if b.get("Date")})
+            if iso_dates:
+                for m in cfg.anchor_tenors_m:
+                    day_counts[str(m)] = day_count_map(ccy, m, iso_dates)
+
         return {
             "ccy": ccy, "pair": cfg.pair, "kind": cfg.kind,
             "period": period, "interval": interval,
@@ -1477,6 +1492,7 @@ class MarketService:
             "ricMeta": ric_meta,
             "sofrRics": sofr_rics,
             "history": hist,
+            "dayCounts": day_counts,
         }
 
     def get_history_custom_dates(self, ccy: str,

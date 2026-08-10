@@ -674,12 +674,15 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
       vals=hist.map((h,i)=>{
         let ppdDays=tenorDays;
         const iso=rawHist?.[i]?.iso??(h.date instanceof Date?h.date.toISOString().slice(0,10):null);
-        if(monthHint!=null&&Number.isInteger(monthHint)&&nrM==null&&frM==null&&iso&&todayNaiveVal){
+        // Prefer backend per-bar holiday-adjusted spot→VD day count (see IY branch).
+        const backendDays=(monthHint!=null&&iso)?rawHistData?.dayCounts?.[String(monthHint)]?.[iso]:null;
+        if(backendDays>0){
+          ppdDays=backendDays;
+        }else if(monthHint!=null&&Number.isInteger(monthHint)&&nrM==null&&frM==null&&iso&&todayNaiveVal){
           const barDate=new Date(iso+"T00:00:00");
           if(!isNaN(barDate)){
             const barSpot=computeSpotDate(barDate);
             const perBarNaive=daysBtwn(barSpot,addMon(barSpot,monthHint));
-            // Drift-anchor to today's true (IPA) count; see IY branch below.
             if(perBarNaive>0){const d=tenorDays+(perBarNaive-todayNaiveVal);if(d>0)ppdDays=d;}
           }
         }
@@ -741,13 +744,19 @@ function HistModal({tenor,val,isSwapPts,onClose,dpOverride,ccy,monthHint,nrM,frM
         // date helpers. Only for genuine month tenors (integer monthHint) that
         // are not spreads/funding; otherwise fall back to tenorDaysVal.
         let iyDays=tenorDaysVal;
-        if(monthHint!=null&&Number.isInteger(monthHint)&&nrM==null&&frM==null&&iso&&todayNaiveVal){
+        // AUTHORITATIVE: backend per-bar holiday-adjusted spot→value-date day count for
+        // this tenor (same US+local calendar as the pricer's live IPA count). This fixes
+        // the historical-IY level: weekend-only date math mis-counts any bar whose
+        // spot→VD window straddles a holiday (up to ~25bp; recent bars were off ~10-16bp).
+        const backendDays=(monthHint!=null&&iso)?rawHistData?.dayCounts?.[String(monthHint)]?.[iso]:null;
+        if(backendDays>0){
+          iyDays=backendDays;
+        }else if(monthHint!=null&&Number.isInteger(monthHint)&&nrM==null&&frM==null&&iso&&todayNaiveVal){
+          // Fallback (backend map absent): drift-anchor the naive count to today's true count.
           const barDate=new Date(iso+"T00:00:00");
           if(!isNaN(barDate)){
-            const barSpot=computeSpotDate(barDate);                     // ≈ spot = T+2 business days
-            const perBarNaive=daysBtwn(barSpot,addMon(barSpot,monthHint)); // naive spot→VD count
-            // Drift-anchor to the live IPA-true count: the constant holiday-blind
-            // offset cancels (kills the ~13bp level bias); last bar ≈ live exactly.
+            const barSpot=computeSpotDate(barDate);
+            const perBarNaive=daysBtwn(barSpot,addMon(barSpot,monthHint));
             if(perBarNaive>0){const d=tenorDaysVal+(perBarNaive-todayNaiveVal);if(d>0)iyDays=d;}
           }
         }

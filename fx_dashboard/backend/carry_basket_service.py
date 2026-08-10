@@ -46,8 +46,6 @@ batched snapshot (all spot + all 1M-point RICs) cached ~90s; vol + covariance co
 from spot history fetched ONCE and cached ~2h. Nothing re-fetches history per poll.
 """
 from __future__ import annotations
-import calendar as _cal
-import datetime as _dt
 import logging
 import math
 import statistics as st
@@ -57,34 +55,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ric_config import CURRENCIES, SOFR_RICS
 from discount_curve import DiscountCurve, implied_yield
-
-try:
-    import holidays as _holidays          # optional; enables per-ccy holiday-aware day counts
-except Exception:                          # pragma: no cover
-    _holidays = None
+from daycount import day_count as _day_count   # shared holiday-adjusted day count (on par w/ pricer)
 
 log = logging.getLogger("carry")
-
-# ── Per-currency settlement calendar (LOCAL leg; USD is always added) ──
-# Used to compute the 1M spot→value-date day count on par with the pricer's IPA
-# calendar (a flat count mis-levels near-zero-yield names — e.g. SGD reads 0.95%
-# at 30d vs the pricer's 1.19% at the holiday-adjusted 33d). ISO codes for the
-# `holidays` package; EUR uses the ECB/TARGET financial calendar.
-_CCY_CAL: Dict[str, str] = {
-    "TWD": "TW", "KRW": "KR", "INR": "IN", "IDR": "ID", "PHP": "PH", "CNY": "CN",
-    "MYR": "MY", "NGN": "NG", "EGP": "EG", "CLP": "CL", "COP": "CO", "CNH": "CN",
-    "SGD": "SG", "HKD": "HK", "THB": "TH", "MXN": "MX", "ZAR": "ZA", "TRY": "TR",
-    "CZK": "CZ", "ILS": "IL", "RON": "RO", "PLN": "PL", "HUF": "HU", "KZT": "KZ",
-    "RUB": "RU", "UGX": "UG", "MUR": "MU", "BWP": "BW", "SAR": "SA", "AED": "AE",
-    "MAD": "MA", "TND": "TN", "QAR": "QA",
-    "GBP": "GB", "AUD": "AU", "NZD": "NZ", "JPY": "JP", "CHF": "CH", "CAD": "CA",
-    "NOK": "NO", "SEK": "SE",
-}
-# T+1 settlement vs USD (spot lands one business day out, not two). Verified against
-# the pricer's IPA startDate: CAD/TRY/RUB/PHP settle T+1 — treating them as T+2 rolls
-# the value date over a weekend (+2 days), mispricing the yield (~180bp on TRY's 33%).
-_SPOT_LAG: Dict[str, int] = {"CAD": 1, "TRY": 1, "RUB": 1, "PHP": 1}
-_DAYS_1M_FALLBACK = 31                      # weekend-only ~1M count if holidays pkg absent
 
 # ── G10 universe (NOT in the pricer). code -> config ──
 #   spot_ric / pts_ric : LSEG RICs (spot + 1M forward swap points)
@@ -129,74 +102,16 @@ class CarryBasketService:
         self._rank_cache: Optional[Tuple[float, Dict[str, Any]]] = None
         self._hist_cache: Dict[str, Tuple[float, List[Tuple[str, float]]]] = {}
         self._sofr_cache: Optional[Tuple[float, float]] = None
-        self._cal_cache: Dict[str, Any] = {}                 # code -> holiday set (or None)
-        self._us_cal: Any = None
         self._days_cache: Dict[str, Tuple[str, int]] = {}    # code -> (asOfIso, days)
 
-    # ───────────────────── 1M day count (holiday-aware) ─────────────────────
-    def _local_cal(self, code: str):
-        """Holiday calendar for the currency's LOCAL leg (cached). None if unavailable."""
-        if code in self._cal_cache:
-            return self._cal_cache[code]
-        cal = None
-        if _holidays is not None:
-            yrs = [date.today().year, date.today().year + 1]
-            try:
-                if code == "EUR":
-                    cal = _holidays.financial_holidays("ECB", years=yrs)
-                else:
-                    iso = _CCY_CAL.get(code)
-                    if iso:
-                        cal = _holidays.country_holidays(iso, years=yrs)
-            except Exception:
-                cal = None
-        self._cal_cache[code] = cal
-        return cal
-
     def _days_1m(self, code: str) -> int:
-        """1M spot→value-date calendar day count for `code`, holiday-adjusted with the
-        USD + local calendars (T+2 spot, +1M modified-following). Cached per as-of day.
-        Falls back to ~31d if the holidays package is unavailable."""
-        today = date.today()
-        iso = today.isoformat()
+        """Today's 1M spot→value-date day count (holiday-adjusted), via the shared
+        daycount module. Cached per as-of day."""
+        iso = date.today().isoformat()
         c = self._days_cache.get(code)
         if c and c[0] == iso:
             return c[1]
-        days = _DAYS_1M_FALLBACK
-        if _holidays is not None:
-            try:
-                if self._us_cal is None:
-                    self._us_cal = _holidays.country_holidays(
-                        "US", years=[today.year, today.year + 1])
-                loc = self._local_cal(code)
-
-                def good(d: _dt.date) -> bool:
-                    if d.weekday() >= 5 or d in self._us_cal:
-                        return False
-                    if loc is not None and d in loc:
-                        return False
-                    return True
-
-                def add_biz(d: _dt.date, n: int) -> _dt.date:
-                    while n > 0:
-                        d += timedelta(days=1)
-                        if good(d):
-                            n -= 1
-                    return d
-
-                def mod_foll(d: _dt.date) -> _dt.date:
-                    while not good(d):
-                        d += timedelta(days=1)
-                    return d
-
-                spot = add_biz(today, _SPOT_LAG.get(code, 2))
-                y, m = (spot.year, spot.month + 1) if spot.month < 12 else (spot.year + 1, 1)
-                vd = mod_foll(_dt.date(y, m, min(spot.day, _cal.monthrange(y, m)[1])))
-                d = (vd - spot).days
-                if 20 < d < 45:
-                    days = d
-            except Exception:
-                log.exception("carry: day-count failed for %s", code)
+        days = _day_count(code, 1, date.today())
         self._days_cache[code] = (iso, days)
         return days
 
