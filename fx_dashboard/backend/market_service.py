@@ -516,7 +516,7 @@ class MarketService:
     # ───── discount-factor implied yields ─────
     def _apply_df_yields(self, cfg: CurrencyConfig, snap: Dict[str, Any]) -> None:
         """
-        Per-tenor implied yield via the discount-factor curve (firm-standard
+        Per-tenor implied yield via the discount-factor curve (market-standard
         methodology): build a USD DF curve from the SOFR block, form each ccy
         forward outright, and compute the ccy zero from DF_ccy = DF_usd*S/F.
 

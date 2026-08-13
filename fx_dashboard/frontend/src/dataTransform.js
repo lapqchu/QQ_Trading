@@ -544,7 +544,7 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
     const sofT = sofTRaw != null && isFinite(sofTRaw) ? sofTRaw : (month === 0 ? 0 : null);
     const sofT1 = sofT1Raw != null && isFinite(sofT1Raw) ? sofT1Raw : (month === 0 ? 0 : null);
 
-    // Backend discount-factor IY (firm-standard OIS methodology, composite-based):
+    // Backend discount-factor IY (market-standard OIS methodology, composite-based):
     // a selection-independent reference shown alongside the selection-aware CIP
     // iyM. At anchor tenors iyM(composite)==iyDf exactly (co-located SOFR node);
     // the DF value additionally interpolates the USD leg at off-node day counts.
@@ -775,7 +775,7 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
     .map(im => getRow(im.days / 30.44, im.days, im.label, im.valDate));
 
   // DF curves for DF-consistent forward-forward IY (IMM rolls / custom dates).
-  // Firm-standard OIS methodology: interpolate the ccy discount factor log-linearly
+  // Market-standard OIS methodology: interpolate the ccy discount factor log-linearly
   // (arbitrage-free) rather than the zero rate. Built from REAL anchor tenors only
   // (skip gap-interpolated rows so curve seams don't distort it): USD from SOFR,
   // ccy from forward outrights via DF_ccy(d) = DF_usd(d)·S/F(d). At anchor day
@@ -1052,7 +1052,7 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
     const fIy = fwdFwdIy(nr.iyM, nVal, fr.iyM, fVal);
     const fIyA = fwdFwdIy(nr.iyB, nVal, fr.iyA, fVal);
     const fIy1 = fwdFwdIy(nr.iyM1, nVal1, fr.iyM1, fVal1);
-    // DF-consistent fwd-fwd reference (arb-free ccy-DF interpolation, firm-standard).
+    // DF-consistent fwd-fwd reference (arb-free ccy-DF interpolation, market-standard).
     const fIyDf = fwdFwdIyDf(_ccyDfCurve, nVal, fVal);
     const haveSof = dsVal > 0 && fr.sofT != null && nr.sofT != null;
     const haveSof1 = dsVal > 0 && fr.sofT1 != null && nr.sofT1 != null;
@@ -1260,7 +1260,7 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
     const ds = fr.dT - nr.dT;
     const fIy = fwdFwdIy(nr.iyM, nr.dT, fr.iyM, fr.dT);
     const fIy1 = fwdFwdIy(nr.iyM1, nr.dT1, fr.iyM1, fr.dT1);
-    // DF-consistent fwd-fwd reference (arb-free ccy-DF interpolation, firm-standard).
+    // DF-consistent fwd-fwd reference (arb-free ccy-DF interpolation, market-standard).
     const fIyDf = fwdFwdIyDf(_ccyDfCurve, nr.daysVal ?? nr.dT, fr.daysVal ?? fr.dT);
     const haveSofImm = ds > 0 && fr.sofT != null && nr.sofT != null;
     const fSof = haveSofImm ? ((1 + fr.sofT / 100 * fr.dT / 360) / (1 + nr.sofT / 100 * nr.dT / 360) - 1) * 360 / ds * 100 : null;

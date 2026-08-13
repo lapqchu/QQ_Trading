@@ -1,4 +1,4 @@
-# SGD NEER Monitor — how to run (company PC)
+# SGD NEER Monitor — how to run
 
 A deep-dive dashboard for the Singapore dollar: reconstructs the MAS S$NEER live from
 the basket legs, overlays the estimated policy band, the SORA rates complex, carry, and
