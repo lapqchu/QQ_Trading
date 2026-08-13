@@ -223,6 +223,14 @@ class NeerService:
         self._sora_ts: float = 0.0
         self._carry_cache: Optional[Dict[str, Any]] = None
         self._carry_ts: float = 0.0
+        # Intraday minute/hourly bars barely change tick-to-tick (only the last bar
+        # updates), yet the frontend polls every ~30s — re-fetching full minute history
+        # for ~13 legs each time was a top request-count sink (≈5k calls/day left open).
+        # Cache per window; the live tip still comes from build_sgd's live snapshot.
+        self._intra_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        # Live-bilateral snapshot cache — coalesces rapid build_sgd polls (20s) so we
+        # don't fire a fresh basket snapshot on every one.
+        self._live_cache: Optional[Tuple[float, Any]] = None
 
     # ─────────────────────────── live quotes ───────────────────────────
     def _snap(self, rics: List[str], fields: List[str]) -> Dict[str, Dict[str, Any]]:
@@ -233,7 +241,11 @@ class NeerService:
             return {}
 
     def _live_bilaterals(self) -> Tuple[Dict[str, float], Dict[str, Dict[str, float]], Optional[float]]:
-        """Return (e_i map, per-leg raw quote map, USDSGD spot)."""
+        """Return (e_i map, per-leg raw quote map, USDSGD spot).
+        Cached ~15s so rapid build_sgd polls coalesce into one basket snapshot."""
+        import time as _t
+        if self._live_cache and (_t.time() - self._live_cache[0]) < 15:
+            return self._live_cache[1]
         rics = [ric for _, ric, _, _ in BASKET]
         fields = ["CF_BID", "CF_ASK", "CF_LAST", "PRIMACT_1"]
         snap = self._snap(list(dict.fromkeys(rics)), fields)
@@ -246,7 +258,9 @@ class NeerService:
             if ei is not None:
                 e[ccy] = ei
             legs[ccy] = {"ric": ric, "quote": q, "inverted": inv, "weight": self.weights[ccy], "e": ei}
-        return e, legs, sgd_usd
+        out = (e, legs, sgd_usd)
+        self._live_cache = (_t.time(), out)
+        return out
 
     # ─────────────────────────── history ───────────────────────────
     def _history_bilaterals(self, days: int = 760) -> Dict[str, Any]:
@@ -799,6 +813,10 @@ class NeerService:
     def intraday_neer(self, window: str = "1d") -> Dict[str, Any]:
         """Intraday NEER series (tick-by-tick-ish) for the live chart, re-based to the
         official level. window ∈ {1d,3d,5d,20d}; 1d uses minute bars, longer hourly."""
+        import time as _t
+        c = self._intra_cache.get(window)
+        if c and (_t.time() - c[0]) < 90:   # 90s cache — minute/hourly bars barely change
+            return c[1]
         cfg = {"1d": ("minute", 1), "3d": ("hourly", 4), "5d": ("hourly", 7), "20d": ("hourly", 30)}
         interval, days = cfg.get(window, ("minute", 1))
         start = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
@@ -850,11 +868,14 @@ class NeerService:
         if srs.get("dates"):
             mid = (srs["midpoint"][srs["anchorIdx"]]
                    * midpoint_factor(_d(BAND_ANCHOR_DATE), date.today()))
-        return {"window": window, "interval": interval, "times": times, "neer": neer,
-                "midpoint": round(mid, 4) if mid else None,
-                "upper": round(mid * (1 + BAND_WIDTH), 4) if mid else None,
-                "lower": round(mid * (1 - BAND_WIDTH), 4) if mid else None,
-                "count": len(neer)}
+        res = {"window": window, "interval": interval, "times": times, "neer": neer,
+               "midpoint": round(mid, 4) if mid else None,
+               "upper": round(mid * (1 + BAND_WIDTH), 4) if mid else None,
+               "lower": round(mid * (1 - BAND_WIDTH), 4) if mid else None,
+               "count": len(neer)}
+        if neer:                       # only cache a non-empty result
+            self._intra_cache[window] = (_t.time(), res)
+        return res
 
     # ─────────────────────────── analysis / strategies ─────────────────────────
     def analysis(self) -> Dict[str, Any]:

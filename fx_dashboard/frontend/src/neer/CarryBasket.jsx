@@ -118,8 +118,13 @@ export default function CarryBasket() {
       } catch (e) { if (alive) setRankErr(e?.message || "network error"); }
     };
     load(true);
-    const id = setInterval(() => load(false), 60000);
-    return () => { alive = false; clearInterval(id); };
+    // Poll only when the tab is visible — a backgrounded dashboard must not keep
+    // hitting the rate-limited LSEG session (the daily 10k-request cap). Yields move
+    // slowly, so 120s is plenty; refresh immediately when the tab regains focus.
+    const id = setInterval(() => { if (!document.hidden) load(false); }, 120000);
+    const onVis = () => { if (!document.hidden) load(false); };
+    document.addEventListener("visibilitychange", onVis);
+    return () => { alive = false; clearInterval(id); document.removeEventListener("visibilitychange", onVis); };
   }, []);
 
   const ranked = rank?.rank || [];

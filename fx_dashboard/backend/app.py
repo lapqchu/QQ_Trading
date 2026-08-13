@@ -241,11 +241,16 @@ def ipa_forward_batch(
 
 @app.get("/api/status")
 def status() -> Dict[str, Any]:
+    cooldown = lseg.cooldown_remaining() if lseg else 0.0
     return {
         "sessionOpen": lseg.is_open() if lseg else False,
         "activeCcy": market._active_ccy if market else None,
         "tickCounts": dict(market._tick_counts) if market else {},
         "wsSubscribers": {ch: len(subs) for ch, subs in (market._subscribers if market else {}).items()},
+        # Circuit breaker: >0 means LSEG returned sustained 429s (rate/daily-quota) and
+        # the backend is pausing calls. The frontend should stop polling until it clears.
+        "lsegCooldownSec": round(cooldown, 1),
+        "lsegThrottled": cooldown > 0,
     }
 
 

@@ -175,6 +175,7 @@ function IntradayPanel() {
   useEffect(() => {
     let alive = true;
     async function poll() {
+      if (document.hidden) return;   // don't poll a backgrounded tab (LSEG daily quota)
       try {
         const r = await fetch(`/api/neer/sgd/intraday?window=${win}`);
         if (!r.ok) throw new Error();
@@ -183,8 +184,10 @@ function IntradayPanel() {
       } catch { if (alive) setStale(true); }
     }
     poll();
-    const id = setInterval(poll, 30000);   // 30s — minute-history is heavy on the shared LSEG session
-    return () => { alive = false; clearInterval(id); };
+    const id = setInterval(poll, 60000);   // 60s — minute-history is heavy + server-cached 90s
+    const onVis = () => { if (!document.hidden) poll(); };   // refresh when tab regains focus
+    document.addEventListener("visibilitychange", onVis);
+    return () => { alive = false; clearInterval(id); document.removeEventListener("visibilitychange", onVis); };
   }, [win]);
 
   const times = d?.times || [];
@@ -449,6 +452,7 @@ export default function NeerApp() {
   useEffect(() => {
     let alive = true;
     async function poll() {
+      if (document.hidden) return;   // don't poll a backgrounded tab (LSEG daily quota)
       try {
         const r = await fetch("/api/neer/sgd");
         if (!r.ok) throw new Error(`snapshot HTTP ${r.status}`);
@@ -459,8 +463,10 @@ export default function NeerApp() {
       }
     }
     poll();
-    const id = setInterval(poll, 20000);   // 20s — NEER moves slowly; carry/SORA server-cached
-    return () => { alive = false; clearInterval(id); };
+    const id = setInterval(poll, 45000);   // 45s — NEER moves slowly; carry/SORA server-cached
+    const onVis = () => { if (!document.hidden) poll(); };   // refresh when tab regains focus
+    document.addEventListener("visibilitychange", onVis);
+    return () => { alive = false; clearInterval(id); document.removeEventListener("visibilitychange", onVis); };
   }, []);
 
   // History (10y daily band): STATIC — fetch once, refresh only hourly. The live
@@ -469,6 +475,7 @@ export default function NeerApp() {
   useEffect(() => {
     let alive = true;
     async function load() {
+      if (document.hidden) return;   // don't poll a backgrounded tab (LSEG daily quota)
       try {
         const r = await fetch("/api/neer/sgd/history");
         if (!r.ok) throw new Error();

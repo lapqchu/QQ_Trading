@@ -48,6 +48,42 @@ class LsegClient:
         # Same rate-spacing for the udf snapshot endpoint (also 429-limited).
         self._snap_last = 0.0
         self._snap_min_gap = 0.05
+        # ── Circuit breaker ──────────────────────────────────────────────
+        # The desktop session has a DAILY request cap (~10k). When it (or the
+        # burst limit) is hit, every call 429s and blind retries just pile on
+        # ("get_history 429 after retry", PoolTimeout). On a SUSTAINED 429 (one
+        # that survived the per-call retry) we trip a cooldown: all LSEG calls
+        # short-circuit to empty until it expires, so we stop hammering an
+        # exhausted quota. Backoff escalates on repeats (45s → 90 → 180 → 300).
+        self._cooldown_until = 0.0
+        self._cooldown_base = 45.0
+        self._cooldown_max = 300.0
+        self._last_429_ts = 0.0
+        self._consec_429 = 0
+
+    # ─────────────────────────── circuit breaker ───────────────────────────
+    def in_cooldown(self) -> bool:
+        import time
+        return time.time() < self._cooldown_until
+
+    def cooldown_remaining(self) -> float:
+        import time
+        return max(0.0, self._cooldown_until - time.time())
+
+    def _trip_cooldown(self) -> None:
+        """Called on a SUSTAINED 429 (survived retry). Escalate the pause on repeats."""
+        import time
+        now = time.time()
+        self._consec_429 = self._consec_429 + 1 if (now - self._last_429_ts < 180) else 1
+        self._last_429_ts = now
+        backoff = min(self._cooldown_max, self._cooldown_base * (2 ** min(self._consec_429 - 1, 3)))
+        self._cooldown_until = now + backoff
+        log.warning("LSEG circuit breaker tripped — pausing calls %.0fs (consec 429=%d)",
+                    backoff, self._consec_429)
+
+    def _note_success(self) -> None:
+        """A clean call clears the throttle streak."""
+        self._consec_429 = 0
 
     # ─────────────────────────── session ───────────────────────────
     def open(self) -> None:
@@ -89,6 +125,8 @@ class LsegClient:
         import lseg.data as ld
         import time
         rics = list(rics)
+        if self.in_cooldown():           # circuit breaker open — don't hammer a dead quota
+            return {}
         # ONE udf call (chunking would be N rate-limit hits instead of 1); retry the
         # whole call on 429 with a short backoff, rate-spaced against other snapshots.
         df = None
@@ -100,12 +138,16 @@ class LsegClient:
                 self._snap_last = time.time()
             try:
                 df = ld.get_data(universe=rics, fields=fields)
+                self._note_success()
                 break
             except Exception as e:
                 m = str(e).lower()
-                if ("429" in m or "too many requests" in m) and attempt < 1:
+                is429 = "429" in m or "too many requests" in m
+                if is429 and attempt < 1:
                     time.sleep(0.4)
                     continue
+                if is429:
+                    self._trip_cooldown()   # sustained 429 → pause all calls
                 log.debug("get_snapshot failed (%d rics): %s", len(rics), str(e)[:80])
                 return {}
         out: Dict[str, Dict[str, Any]] = {}
@@ -141,6 +183,8 @@ class LsegClient:
         if end: base["end"] = end
         if count: base["count"] = count
         rics = list(rics)
+        if self.in_cooldown():           # circuit breaker open — don't hammer a dead quota
+            return {}
 
         def _is_429(e) -> bool:
             m = str(e).lower()
@@ -170,7 +214,9 @@ class LsegClient:
                         time.sleep(wait)
                     self._hist_last = time.time()
                 try:
-                    return ld.get_history(**kw), False
+                    df = ld.get_history(**kw)
+                    self._note_success()
+                    return df, False
                 except (TypeError, KeyError, AttributeError):
                     return None, True
                 except Exception as e:
@@ -178,6 +224,7 @@ class LsegClient:
                         time.sleep(0.6)
                         continue
                     if _is_429(e):
+                        self._trip_cooldown()   # sustained 429 → pause all calls
                         log.warning("get_history 429 after retry (%s…)", universe[:2])
                     else:
                         log.debug("get_history failed (%s…): %s", universe[:2], e)
@@ -190,6 +237,8 @@ class LsegClient:
         result: Dict[str, list] = {}
         chunks = [rics[i:i + CHUNK] for i in range(0, len(rics), CHUNK)] or [rics]
         for chunk in chunks:
+            if self.in_cooldown():   # a prior chunk tripped the breaker — stop, don't burn more
+                break
             df, sdk_err = _call(chunk)
             if sdk_err:
                 for r in chunk:                       # per-RIC fallback within the chunk
