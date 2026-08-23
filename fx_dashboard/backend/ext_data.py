@@ -196,6 +196,58 @@ def datagov_search(resource_id: str, limit: int = 500, sort: str = "_id desc",
             "error": raw.get("error")}
 
 
+# ───────────────────────── FAO Food Price Index ─────────────────────────
+# Monthly CSV (2014-16=100). The sfvrsn query param rotates — fetch without it
+# first, fall back to the last known param, then to stale cache.
+_FAO_URLS = [
+    "https://www.fao.org/media/docs/worldfoodsituationlibraries/default-document-library/food_price_indices_data.csv",
+    "https://www.fao.org/media/docs/worldfoodsituationlibraries/default-document-library/food_price_indices_data.csv?sfvrsn=523ebd2a_82&download=true",
+]
+
+
+def fao_food_index(ttl: float = 3 * 86400) -> Dict[str, Any]:
+    """FAO Food Price Index (headline) → {"points": {"YYYY-MM": v}, "stale": bool}."""
+    key = "fao_food"
+    cached = _read_cache(key)
+    now = time.time()
+    if cached and (now - cached.get("fetchedAt", 0)) < ttl:
+        cached["stale"] = False
+        return cached
+    text, err = None, None
+    for url in _FAO_URLS:
+        try:
+            r = _session.get(url, timeout=30)
+            r.raise_for_status()
+            if "," in r.text[:200]:
+                text = r.text
+                break
+        except Exception as e:
+            err = str(e)[:150]
+    if text is None:
+        if cached:
+            cached["stale"] = True
+            cached["error"] = err
+            return cached
+        return {"points": {}, "stale": True, "error": err}
+    points: Dict[str, float] = {}
+    for line in text.splitlines():
+        parts = [p.strip().strip('"') for p in line.split(",")]
+        if len(parts) < 2 or not parts[0][:4].isdigit():
+            continue
+        # Date formats seen: "1990-01", "1990-01-01", "Jan-1990"
+        d = parts[0]
+        mk = d[:7] if d[4:5] == "-" else None
+        try:
+            v = float(parts[1])
+        except ValueError:
+            continue
+        if mk:
+            points[mk] = v
+    payload = {"points": points, "fetchedAt": now, "stale": False}
+    _write_cache(key, payload)
+    return payload
+
+
 # ───────────────────────── MAS API portal (keyed, optional) ─────────────────────────
 # The official replacement for the dead datastore API. Needs a KeyId header from a
 # (free, guest) subscription at eservices.mas.gov.sg/apimg-portal. We use it only as

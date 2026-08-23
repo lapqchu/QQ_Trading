@@ -21,6 +21,8 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
+import numpy as np
+
 import ext_data
 
 log = logging.getLogger("sg_fund")
@@ -94,6 +96,8 @@ CORE_GROUPS = {"1": "MAS Core index", "1.2": "MAS Core y/y", "2": "Services",
 
 # data.gov.sg COE bidding results (same-day per exercise)
 COE_DATASET = "d_69b3380ad7e51aff3a7dcc84eba52b8a"
+# data.gov.sg HDB median rents by town & flat type (quarterly)
+HDB_RENT_DATASET = "d_23000a00c52996c55106084ed0339566"
 
 # ───────────────────────── Policy tables (verified 2026-08-23) ─────────────────────────
 MPS_DECISIONS = [  # (date, action) — slope/width/centre wording condensed
@@ -197,6 +201,8 @@ class SgFundamentalsService:
         self.lseg = lseg
         self._cache: Optional[Dict[str, Any]] = None
         self._cache_ts: float = 0.0
+        self._nc_cache: Optional[Dict[str, Any]] = None
+        self._nc_ts: float = 0.0
         self._lock = threading.Lock()
 
     # ── LSEG pulls ──
@@ -347,6 +353,109 @@ class SgFundamentalsService:
                 "headlineYoY": round(headline_yoy, 2),
                 "coreContrib": round(core_contrib, 3),
                 "nonCoreContrib": round(noncore_contrib, 3)}
+
+    # ── NOWCAST: high-frequency Tier-A feeds (see plan §2) ──
+    def nowcast(self, refresh: bool = False) -> Dict[str, Any]:
+        """Daily/weekly trackers that lead the monthly CPI print: the electricity
+        tariff-setting window (Brent proxy), COE bidding, FAO food, HDB rents,
+        jet fuel. Cached 6h; pump prices are a known gap (no verified source)."""
+        with self._lock:
+            if not refresh and self._nc_cache and (time.time() - self._nc_ts) < _TTL:
+                return self._nc_cache
+            t0 = time.time()
+            today = dt.date.today()
+            # Brent daily (1y) — drives the tariff window + imported energy read
+            def _daily(ric: str, days: int, fields=("TRDPRC_1", "SETTLE", "BID")):
+                try:
+                    h = self.lseg.get_history([ric], fields=list(fields), interval="daily",
+                                              start=(today - dt.timedelta(days=days)).isoformat(),
+                                              end=today.isoformat())
+                except Exception as e:
+                    log.warning("nowcast history %s failed: %s", ric, e)
+                    return {"dates": [], "values": []}
+                recs = h.get(ric) or h.get("default") or []
+                ds, vs = [], []
+                for r in recs:
+                    v = next((r[f] for f in fields if isinstance(r.get(f), (int, float))), None)
+                    if v is not None:
+                        ds.append(str(r.get("Date", ""))[:10])
+                        vs.append(float(v))
+                return {"dates": ds, "values": vs}
+
+            brent = _daily("LCOc1", 400)
+            jet = _daily("JETSGSWMc1", 200)   # Jet Fuel FOB Spore swap (may be unentitled)
+
+            # Tariff-setting window: quarter Q's tariff = avg gas (oil-indexed)
+            # over the FIRST 2.5 MONTHS of quarter Q-1. Track the window forming
+            # for the NEXT quarter vs the one that set the CURRENT tariff.
+            def _window_avg(s, a: dt.date, b: dt.date):
+                vs = [v for d, v in zip(s["dates"], s["values"]) if a.isoformat() <= d <= b.isoformat()]
+                return (round(float(np.mean(vs)), 2), len(vs)) if vs else (None, 0)
+
+            q = (today.month - 1) // 3 + 1
+            cur_q_start = dt.date(today.year, 3 * q - 2, 1)
+            prev_q_start = (cur_q_start - dt.timedelta(days=1)).replace(day=1)
+            prev_q_start = dt.date(prev_q_start.year, 3 * ((prev_q_start.month - 1) // 3) + 1, 1)
+            def _win(qs: dt.date):
+                return qs, (qs + dt.timedelta(days=75))
+            nw_a, nw_b = _win(cur_q_start)          # sets NEXT quarter's tariff
+            cw_a, cw_b = _win(prev_q_start)         # set the CURRENT tariff
+            next_avg, n_next = _window_avg(brent, nw_a, min(nw_b, today))
+            cur_avg, _ = _window_avg(brent, cw_a, cw_b)
+            tariff = {
+                "currentTariffCents": 31.91, "energyComponentCents": 25.50,
+                "asOf": "Q3-2026 (SP Group)",
+                "windowForNext": {"from": nw_a.isoformat(), "to": nw_b.isoformat(),
+                                  "brentAvgSoFar": next_avg, "daysIn": n_next},
+                "windowForCurrent": {"from": cw_a.isoformat(), "to": cw_b.isoformat(),
+                                     "brentAvg": cur_avg},
+                "estNextStepPct": (round((next_avg / cur_avg - 1.0) * 100.0 * (25.50 / 31.91), 1)
+                                   if next_avg and cur_avg else None),
+                "note": "Tariff energy component = avg gas over the first 2.5 months of the prior quarter; Brent is a PROXY for the oil-indexed gas price. Estimate = window Δ% × energy share (80%).",
+            }
+
+            fao_raw = ext_data.fao_food_index()
+            fao_sr = _pts_to_series({k + "-01": v for k, v in (fao_raw.get("points") or {}).items()})
+            fao = {"index": fao_sr, "yoy": _yoy(fao_sr["dates"], fao_sr["values"]),
+                   "stale": fao_raw.get("stale"), "error": fao_raw.get("error")}
+
+            # HDB median rents (quarterly, by town/flat type) → avg of town medians, 4-room
+            # sort DESC — the dataset is large and the cap would otherwise return
+            # only the oldest rows (first attempt returned 2005–2011)
+            hdb_raw = ext_data.datagov_search(HDB_RENT_DATASET, limit=5000, sort="_id desc")
+            by_q: Dict[str, List[float]] = {}
+            for r in hdb_raw.get("records", []):
+                ft = str(r.get("flat_type", "")).upper().replace("-", " ")
+                if "4" not in ft:
+                    continue
+                try:
+                    v = float(r.get("median_rent"))
+                except (TypeError, ValueError):
+                    continue
+                by_q.setdefault(str(r.get("quarter")), []).append(v)
+            hdb_pts = {}
+            for qk, vs in by_q.items():   # "2026-Q2" → quarter-end iso
+                try:
+                    y, qn = int(qk[:4]), int(qk[-1])
+                    hdb_pts[f"{y}-{qn*3:02d}-28"] = round(float(np.mean(vs)), 0)
+                except (ValueError, IndexError):
+                    continue
+            hdb_sr = _pts_to_series(hdb_pts)
+            hdb = {"avgMedian4rm": hdb_sr, "yoy": _yoy(hdb_sr["dates"], hdb_sr["values"]),
+                   "stale": hdb_raw.get("stale"), "error": hdb_raw.get("error")}
+
+            payload = {
+                "asOf": dt.datetime.now().isoformat(timespec="seconds"),
+                "brent": brent, "jetFuel": jet if jet["values"] else None,
+                "tariff": tariff, "fao": fao, "hdbRent": hdb,
+                "coe": self._coe(),
+                "gaps": ["Pump prices (weekly) — no verified source yet",
+                         "Tier B scraped price basket — deferred (user decision)"],
+                "buildSecs": round(time.time() - t0, 2),
+            }
+            self._nc_cache = payload
+            self._nc_ts = time.time()
+            return payload
 
     # ── main payload ──
     def monitor(self, refresh: bool = False) -> Dict[str, Any]:

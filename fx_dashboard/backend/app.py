@@ -364,6 +364,17 @@ def fund_sg_model(refresh: bool = False) -> Dict[str, Any]:
         raise HTTPException(500, str(e))
 
 
+@app.get("/api/fund/sg/nowcast")
+def fund_sg_nowcast(refresh: bool = False) -> Dict[str, Any]:
+    """High-frequency Tier-A trackers that lead the CPI print: tariff-setting
+    window (Brent proxy), COE bidding, FAO food, HDB rents, jet fuel. Cached 6h."""
+    try:
+        return fund.nowcast(refresh=refresh)
+    except Exception as e:
+        log.exception("fund_sg_nowcast failed")
+        raise HTTPException(500, str(e))
+
+
 @app.get("/api/rules")
 def em_rules(refresh: bool = False) -> Dict[str, Any]:
     """EM Rules screener payload: per-country rule states (R1–R5, R8, R11) +

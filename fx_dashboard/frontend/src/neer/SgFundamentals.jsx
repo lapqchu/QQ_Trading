@@ -496,6 +496,87 @@ function PolicyView({ monitor }) {
   );
 }
 
+// ═══════════════════════ NOWCAST sub-tab ═══════════════════════
+// Tier-A high-frequency feeds that lead the monthly CPI print (plan §2).
+function NowcastView() {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const load = useCallback(async (refresh = false) => {
+    setBusy(true); setErr(null);
+    try {
+      const r = await fetch(`/api/fund/sg/nowcast${refresh ? "?refresh=1" : ""}`);
+      if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+      setData(await r.json());
+    } catch (e) { setErr(String(e).slice(0, 300)); }
+    setBusy(false);
+  }, []);
+  useEffect(() => { load(false); }, [load]);
+
+  if (err) return <div style={{ padding: 30, color: C.down, fontFamily: C.mono, fontSize: 12 }}>Nowcast failed: {err}</div>;
+  if (!data) return <div style={{ padding: 30, color: C.dim, fontSize: 12 }}>Loading high-frequency trackers…</div>;
+
+  const t = data.tariff || {};
+  const coeH = data.coe?.history || {};
+  const coeLatest = data.coe?.latest || {};
+  const coeTraces = [["Category A", C.cyan], ["Category B", C.blue], ["Category E", C.violet]]
+    .filter(([k]) => coeH[k])
+    .map(([k, col]) => ({ x: coeH[k].exercises, y: coeH[k].premiums, name: k.replace("Category", "Cat"),
+      type: "scatter", mode: "lines+markers", line: { color: col, width: 1.4 }, marker: { size: 3 } }));
+  const winShapes = [
+    { type: "rect", xref: "x", yref: "paper", x0: t.windowForCurrent?.from, x1: t.windowForCurrent?.to, y0: 0, y1: 1, fillcolor: "rgba(148,163,184,0.10)", line: { width: 0 } },
+    { type: "rect", xref: "x", yref: "paper", x0: t.windowForNext?.from, x1: t.windowForNext?.to, y0: 0, y1: 1, fillcolor: "rgba(34,211,238,0.10)", line: { width: 0 } },
+  ];
+
+  return (
+    <div style={{ padding: 14, maxWidth: 1500, margin: "0 auto" }}>
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 12 }}>
+        <Stat label="TARIFF NOW" value={`${t.currentTariffCents}¢`} sub={`${t.asOf} · energy ${t.energyComponentCents}¢`} color={C.amber} />
+        <Stat label="NEXT-Q TARIFF EST" value={t.estNextStepPct != null ? `${FP(t.estNextStepPct, 1)}%` : "—"} sub={`window ${t.windowForNext?.daysIn}d in · Brent ${F(t.windowForNext?.brentAvgSoFar, 1)} vs ${F(t.windowForCurrent?.brentAvg, 1)}`} color={C.cyan} />
+        <Stat label="BRENT" value={data.brent?.values?.length ? F(data.brent.values[data.brent.values.length - 1], 2) : "—"} sub="LCOc1 · drives tariff + imported energy" />
+        <Stat label="FAO FOOD Y/Y" value={data.fao?.yoy?.values?.length ? `${FP(data.fao.yoy.values[data.fao.yoy.values.length - 1], 1)}%` : "—"} sub={`index ${data.fao?.index?.values?.length ? F(data.fao.index.values[data.fao.index.values.length - 1], 1) : "—"} · leads food CPI 3–6m`} />
+        <Stat label="HDB 4RM RENT Y/Y" value={data.hdbRent?.yoy?.values?.length ? `${FP(data.hdbRent.yoy.values[data.hdbRent.yoy.values.length - 1], 1)}%` : "—"} sub="avg of town medians · leads accommodation 4–8q" />
+        <Stat label="COE CAT A" value={coeLatest["Category A"] ? `${Math.round(coeLatest["Category A"].premium / 1000)}k` : "—"} sub={`latest exercise ${coeLatest["Category A"]?.exercise || ""}`} />
+        <div style={{ flex: 1 }} />
+        <div style={{ display: "flex", flexDirection: "column", justifyContent: "center", gap: 4, alignItems: "flex-end" }}>
+          <button onClick={() => load(true)} disabled={busy}
+            style={{ background: C.panel2, color: C.cyan, border: `1px solid ${C.border}`, borderRadius: 6, padding: "6px 14px", fontSize: 10, fontWeight: 800, letterSpacing: ".08em", cursor: "pointer" }}>
+            {busy ? "REFRESHING…" : "REFRESH"}
+          </button>
+          <div style={{ fontSize: 8.5, color: C.dim, fontFamily: C.mono }}>built {String(data.asOf).slice(5, 16)} · {data.buildSecs}s</div>
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1.3fr 1fr", gap: 10, marginBottom: 10 }}>
+        <Panel title="BRENT & THE TARIFF-SETTING WINDOWS" note="grey = window that SET the current tariff · cyan = window forming the NEXT one">
+          <Lines id="sgn-brent" height={230} ytitle="$/bbl" yzero={false} shapes={winShapes}
+            series={[line(data.brent, "Brent (LCOc1)", C.amber)]} />
+          <div style={{ fontSize: 9.5, color: C.sub, marginTop: 4 }}>{t.note}</div>
+        </Panel>
+        <Panel title="COE PREMIUMS" note="per bidding exercise · data.gov.sg, same-day">
+          <Lines id="sgn-coe" height={250} ytitle="S$" yzero={false} series={coeTraces} />
+        </Panel>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginBottom: 10 }}>
+        <Panel title="FAO FOOD PRICE INDEX" note="y/y % · leads non-cooked food CPI 3–6m (MR Apr-17 Box B)">
+          <Lines id="sgn-fao" height={190} series={[line(data.fao?.yoy, "FAO food y/y", C.cyan)]} />
+        </Panel>
+        <Panel title="HDB RENTS" note="avg of town median 4-room rents, quarterly → accommodation CPI with 4–8q lag">
+          <Lines id="sgn-hdb" height={190} ytitle="S$/mo" yzero={false} series={[line(data.hdbRent?.avgMedian4rm, "Avg median 4rm", C.cyan)]} />
+        </Panel>
+        <Panel title="JET FUEL (SGP FOB SWAP)" note="drives airfares / travel services">
+          {data.jetFuel
+            ? <Lines id="sgn-jet" height={190} ytitle="$/bbl" yzero={false} series={[line(data.jetFuel, "Jet fuel M1 swap", C.violet)]} />
+            : <div style={{ padding: 24, color: C.dim, fontSize: 11 }}>JETSGSWMc1 history not entitled on this Workspace — showing nothing rather than a proxy.</div>}
+        </Panel>
+      </div>
+      <div style={{ fontSize: 8.5, color: C.dim, fontFamily: C.mono, paddingBottom: 20 }}>
+        Known gaps: {(data.gaps || []).join(" · ")} · All feeds cached 6h, no polling.
+      </div>
+    </div>
+  );
+}
+
 // ═══════════════════════ parent: sub-tab shell ═══════════════════════
 export default function SgFundamentals() {
   const [tab, setTab] = useState("monitor");
@@ -514,7 +595,7 @@ export default function SgFundamentals() {
   }, []);
   useEffect(() => { load(false); }, [load]);
 
-  const SUBTABS = [["monitor", "MONITOR"], ["model", "MODEL"], ["policy", "POLICY"]];
+  const SUBTABS = [["monitor", "MONITOR"], ["model", "MODEL"], ["nowcast", "NOWCAST"], ["policy", "POLICY"]];
   return (
     <div>
       <div style={{ display: "flex", gap: 2, padding: "6px 14px 0", borderBottom: `1px solid ${C.border}`, background: C.bg }}>
@@ -532,6 +613,7 @@ export default function SgFundamentals() {
       </div>
       {tab === "monitor" ? <MonitorView data={data} err={err} busy={busy} load={load} />
         : tab === "model" ? <ModelView consensus={data?.consensus?.rows} />
+        : tab === "nowcast" ? <NowcastView />
         : <PolicyView monitor={data} />}
     </div>
   );
