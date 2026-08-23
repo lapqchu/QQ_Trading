@@ -36,6 +36,7 @@ from market_service import MarketService
 from neer_service import NeerService, MAS_MEETINGS
 from risk_service import RiskService, product_catalog
 from carry_basket_service import CarryBasketService
+from sg_fundamentals_service import SgFundamentalsService
 from ric_config import CURRENCIES, NDF_CURRENCIES, DELIVERABLE_CURRENCIES, get_spread_pack, get_spread_packs, FUNDING_TENORS
 
 load_dotenv()
@@ -51,11 +52,12 @@ market: MarketService | None = None
 neer: NeerService | None = None
 risk: RiskService | None = None
 carry: CarryBasketService | None = None
+fund: SgFundamentalsService | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global lseg, market, neer, risk, carry
+    global lseg, market, neer, risk, carry, fund
     lseg = LsegClient(app_key=os.environ.get("LSEG_APP_KEY"))
     try:
         lseg.open()
@@ -67,6 +69,7 @@ async def lifespan(app: FastAPI):
     neer = NeerService(lseg)   # SGD NEER deep-dive service (shares the LSEG session)
     risk = RiskService(lseg)   # Risk Units vol/sizing service
     carry = CarryBasketService(lseg)   # Carry Basket rank/sizing deep-dive service
+    fund = SgFundamentalsService(lseg)  # SG Fundamentals country monitor (deep-dive tab 4)
     log.info("FX dashboard backend ready")
     yield
     log.info("Shutting down")
@@ -327,6 +330,19 @@ def carry_basket(req: _BasketReq) -> Dict[str, Any]:
         return carry.basket(longs, shorts, req.sizingMode, req.weighting, req.window)
     except Exception as e:
         log.exception("carry_basket failed")
+        raise HTTPException(500, str(e))
+
+
+# ─────────────────────── SG Fundamentals (deep-dive tab 4) ───────────────────────
+@app.get("/api/fund/sg")
+def fund_sg(refresh: bool = False) -> Dict[str, Any]:
+    """Singapore fundamentals monitor payload: inflation (+contributions), consensus,
+    drivers, activity, labour, monetary, policy, release calendar. Cached 6h —
+    the frontend fetches once on mount + manual refresh; do NOT poll this."""
+    try:
+        return fund.monitor(refresh=refresh)
+    except Exception as e:
+        log.exception("fund_sg failed")
         raise HTTPException(500, str(e))
 
 

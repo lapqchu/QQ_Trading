@@ -1,0 +1,306 @@
+// SG Fundamentals — Singapore country-fundamentals monitor (deep-dive tab 4).
+//
+// Replicates the indicator set MAS itself tracks (Macroeconomic Review / MPS /
+// BIS 142): inflation + y/y contributions by CPI component, consensus vs prior
+// for upcoming prints, imported- and domestic-cost drivers, activity, labour,
+// monetary, the MPS decision history and the release calendar.
+//
+// Data: ONE fetch of /api/fund/sg on mount (backend caches 6h) + a manual
+// refresh button. This tab never polls — everything here is monthly/quarterly
+// official statistics.
+import React, { useEffect, useState, useCallback } from "react";
+import Plot from "react-plotly.js";
+import { F, FP } from "../calc.js";
+
+// ── Dark theme (mirrors NeerApp / the pricer) ──
+const C = {
+  bg: "#0B1220", panel: "#0F172A", panel2: "#131C2E", border: "#1E293B",
+  text: "#E2E8F0", sub: "#94A3B8", dim: "#64748B",
+  up: "#4ADE80", down: "#F87171",
+  blue: "#3B82F6", cyan: "#22D3EE", amber: "#FBBF24", violet: "#A78BFA",
+  mono: "'JetBrains Mono','Fira Code',monospace",
+};
+
+const PLAYOUT = {
+  paper_bgcolor: C.panel, plot_bgcolor: C.panel2,
+  font: { color: C.sub, size: 9, family: "Inter,system-ui" },
+  margin: { l: 46, r: 16, t: 26, b: 26 },
+  xaxis: { gridcolor: C.border, zerolinecolor: "#475569", tickfont: { size: 8 }, automargin: true },
+  yaxis: { gridcolor: C.border, zerolinecolor: "#475569", tickfont: { size: 8 }, automargin: true },
+  hovermode: "x unified",
+  legend: { font: { size: 8 }, bgcolor: "transparent", orientation: "h", x: 0, y: 1.16 },
+};
+function chartLayout(uirev, over = {}) {
+  const { xaxis = {}, yaxis = {}, ...rest } = over;
+  return { ...PLAYOUT, uirevision: uirev, ...rest,
+    xaxis: { ...PLAYOUT.xaxis, ...xaxis }, yaxis: { ...PLAYOUT.yaxis, ...yaxis } };
+}
+const PCFG = { responsive: true, displayModeBar: false, displaylogo: false };
+
+function Panel({ title, note, right, children, style }) {
+  return (
+    <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 8, padding: 10, ...style }}>
+      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 6 }}>
+        <div>
+          <span style={{ fontSize: 10.5, fontWeight: 800, letterSpacing: ".12em", color: C.sub }}>{title}</span>
+          {note && <span style={{ fontSize: 9, color: C.dim, marginLeft: 8 }}>{note}</span>}
+        </div>
+        {right}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+const line = (s, name, color, extra = {}) => ({
+  x: s?.dates || [], y: s?.values || [], name, type: "scatter", mode: "lines",
+  line: { color, width: 1.6 }, ...extra,
+});
+const lastVal = (s) => (s?.values?.length ? s.values[s.values.length - 1] : null);
+const lastDate = (s) => (s?.dates?.length ? s.dates[s.dates.length - 1] : null);
+
+function Lines({ id, series, height = 190, ytitle = "%", yzero = true, shapes = [], yover = {} }) {
+  return (
+    <Plot
+      data={series}
+      layout={chartLayout(id, {
+        height, shapes,
+        yaxis: { title: { text: ytitle, font: { size: 8 } }, zeroline: yzero, ...yover },
+      })}
+      config={PCFG} style={{ width: "100%" }} useResizeHandler
+    />
+  );
+}
+
+// ── header stat chip ──
+function Stat({ label, value, sub, color }) {
+  return (
+    <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 8, padding: "8px 12px", minWidth: 108 }}>
+      <div style={{ fontSize: 9, letterSpacing: ".1em", color: C.dim, fontWeight: 700 }}>{label}</div>
+      <div style={{ fontFamily: C.mono, fontSize: 17, fontWeight: 600, color: color || C.text, marginTop: 2 }}>{value}</div>
+      {sub && <div style={{ fontSize: 9, color: C.sub, marginTop: 1 }}>{sub}</div>}
+    </div>
+  );
+}
+
+export default function SgFundamentals() {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async (refresh = false) => {
+    setBusy(true); setErr(null);
+    try {
+      const r = await fetch(`/api/fund/sg${refresh ? "?refresh=1" : ""}`);
+      if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+      setData(await r.json());
+    } catch (e) { setErr(String(e).slice(0, 300)); }
+    setBusy(false);
+  }, []);
+  useEffect(() => { load(false); }, [load]);
+
+  if (err) return <div style={{ padding: 30, color: C.down, fontFamily: C.mono, fontSize: 12 }}>SG Fundamentals failed: {err}</div>;
+  if (!data) return <div style={{ padding: 30, color: C.dim, fontSize: 12 }}>Loading Singapore fundamentals… (first build pulls ~8 years of official series, ~10s)</div>;
+
+  const inf = data.inflation, con = data.consensus, drv = data.drivers,
+        act = data.activity, lab = data.labour, mon = data.monetary, pol = data.policy;
+  const range = inf.masRange2026;
+  const contrib = inf.contributions || { rows: [] };
+  const cpiRow = (con.rows || []).find((r) => r.key === "cpiYoY") || {};
+  const coreRow = (con.rows || []).find((r) => r.key === "coreYoY") || {};
+
+  // MAS 2026 forecast band across calendar-2026 on the inflation chart
+  const bandShape = {
+    type: "rect", xref: "x", yref: "y", x0: "2026-01-01", x1: "2026-12-31",
+    y0: range.low, y1: range.high, fillcolor: "rgba(34,211,238,0.08)",
+    line: { color: "rgba(34,211,238,0.35)", width: 1, dash: "dot" },
+  };
+
+  // contributions bar (latest month), sorted, core vs excluded colouring
+  const crows = [...(contrib.rows || [])].filter((r) => r.contribution != null)
+    .sort((a, b) => a.contribution - b.contribution);
+  const contribTrace = {
+    type: "bar", orientation: "h",
+    y: crows.map((r) => r.label), x: crows.map((r) => r.contribution),
+    marker: { color: crows.map((r) => (r.core ? C.cyan : C.amber)) },
+    text: crows.map((r) => `${FP(r.yoy, 1)}% y/y · w ${(r.w / 100).toFixed(1)}%`),
+    textposition: "none", hovertemplate: "%{y}: %{x:.2f}pp — %{text}<extra></extra>",
+  };
+
+  // COE per-exercise history (Cat A/B/E)
+  const coeH = drv.coe?.history || {};
+  const coeTraces = [["Category A", C.cyan], ["Category B", C.blue], ["Category E", C.violet]]
+    .filter(([k]) => coeH[k])
+    .map(([k, col]) => ({
+      x: coeH[k].exercises, y: coeH[k].premiums, name: k.replace("Category", "Cat"),
+      type: "scatter", mode: "lines+markers", line: { color: col, width: 1.4 },
+      marker: { size: 3 },
+    }));
+  const coeLatest = drv.coe?.latest || {};
+
+  const staleSrc = Object.entries(data.sources || {}).filter(([, v]) => v?.stale).map(([k]) => k);
+  const today = new Date().toISOString().slice(0, 10);
+  const upcoming = (data.calendar || []).filter((c) => c.date >= today).slice(0, 6);
+
+  return (
+    <div style={{ padding: 14, maxWidth: 1500, margin: "0 auto" }}>
+      {/* ── header strip ── */}
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "stretch", marginBottom: 12 }}>
+        <Stat label="HEADLINE CPI Y/Y" value={`${F(inf.latest.headline, 2)}%`} sub={`as of ${inf.latest.month || "—"}`} color={C.cyan} />
+        <Stat label="MAS CORE Y/Y" value={`${F(inf.latest.core, 1)}%`} sub="ex accommodation & private transport" color={C.cyan} />
+        <Stat label="NEXT PRINT" value={cpiRow.releaseDate || "—"} sub={`cons ${F(cpiRow.mean, 2)}% hl / ${F(coreRow.mean, 1)}% core`} color={C.amber} />
+        <Stat label="MAS 2026 RANGE" value={`${range.low}–${range.high}%`} sub={`core & headline · as of ${range.asOf}`} />
+        <Stat label="OUTPUT GAP 2026" value={FP(act.outputGap2026, 1) + "%"} sub="of potential · MR Jul-26" />
+        <Stat label="MTI GDP 2026" value={`${act.mtiGdpRange2026.low}–${act.mtiGdpRange2026.high}%`} sub={`upgraded ${act.mtiGdpRange2026.asOf}`} />
+        <div style={{ flex: 1 }} />
+        <div style={{ display: "flex", flexDirection: "column", justifyContent: "center", gap: 4, alignItems: "flex-end" }}>
+          <button onClick={() => load(true)} disabled={busy}
+            style={{ background: C.panel2, color: C.cyan, border: `1px solid ${C.border}`, borderRadius: 6, padding: "6px 14px", fontSize: 10, fontWeight: 800, letterSpacing: ".08em", cursor: "pointer" }}>
+            {busy ? "REFRESHING…" : "REFRESH"}
+          </button>
+          <div style={{ fontSize: 8.5, color: staleSrc.length ? C.amber : C.dim, fontFamily: C.mono }}>
+            built {String(data.asOf).slice(5, 16)} · {data.buildSecs}s{staleSrc.length ? ` · stale: ${staleSrc.join(",")}` : ""}
+          </div>
+        </div>
+      </div>
+
+      {/* ── row 1: inflation ── */}
+      <div style={{ display: "grid", gridTemplateColumns: "1.25fr 1fr 1fr", gap: 10, marginBottom: 10 }}>
+        <Panel title="INFLATION" note="y/y % · shaded = MAS 2026 forecast range">
+          <Lines id="sgf-infl" height={230} shapes={[bandShape]} series={[
+            line(inf.headlineYoY, "Headline", C.cyan),
+            line(inf.coreYoY, "MAS Core", C.amber),
+          ]} />
+        </Panel>
+        <Panel title="CONTRIBUTIONS TO HEADLINE Y/Y" note={`${contrib.asOf || ""} · cyan=in core, amber=excluded`}>
+          <Plot data={[contribTrace]}
+            layout={chartLayout("sgf-contrib", {
+              height: 230, margin: { l: 128, r: 12, t: 8, b: 24 },
+              xaxis: { title: { text: "pp", font: { size: 8 } }, zeroline: true },
+              yaxis: { tickfont: { size: 8 } },
+            })}
+            config={PCFG} style={{ width: "100%" }} useResizeHandler />
+          <div style={{ fontSize: 9, color: C.sub, fontFamily: C.mono, marginTop: 2 }}>
+            Σ core {FP(contrib.coreContrib, 2)}pp · Σ excluded {FP(contrib.nonCoreContrib, 2)}pp → headline {F(contrib.headlineYoY, 2)}%
+          </div>
+        </Panel>
+        <Panel title="CORE GROUPS" note="official MAS groupings, y/y %">
+          <Lines id="sgf-coregrp" height={230} series={[
+            line(inf.coreGroupsYoY?.coreYoYOfficial, "MAS Core (official)", C.cyan),
+            line(inf.coreGroupsYoY?.["Services"], "Services", C.blue),
+            line(inf.coreGroupsYoY?.["Retail & other goods"], "Retail & other goods", C.violet),
+            line(inf.coreGroupsYoY?.["Electricity & gas"], "Electricity & gas", C.amber),
+          ]} />
+        </Panel>
+      </div>
+
+      {/* ── row 2: drivers ── */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 10, marginBottom: 10 }}>
+        <Panel title="IMPORTED COSTS" note="y/y % (import & export price indices)">
+          <Lines id="sgf-imp" height={180} series={[
+            line(drv.importPricesYoY, "Import prices", C.cyan),
+            line(drv.exportPricesYoY, "Export prices", C.blue),
+          ]} />
+        </Panel>
+        <Panel title="S$NEER Y/Y" note="official weekly series, monthly avg — appreciation dampens imported inflation">
+          <Lines id="sgf-neer" height={180} series={[line(drv.neerYoY, "S$NEER y/y", C.cyan)]} />
+        </Panel>
+        <Panel title="COE PREMIUMS" note="per bidding exercise (data.gov.sg, same-day)"
+          right={<span style={{ fontFamily: C.mono, fontSize: 9, color: C.sub }}>
+            A {coeLatest["Category A"] ? Math.round(coeLatest["Category A"].premium / 1000) + "k" : "—"} ·
+            B {coeLatest["Category B"] ? Math.round(coeLatest["Category B"].premium / 1000) + "k" : "—"}
+          </span>}>
+          <Lines id="sgf-coe" height={180} ytitle="S$" yzero={false} series={coeTraces} />
+        </Panel>
+        <Panel title="RENTS & TARIFF" note="URA private rental index y/y (accommodation feeds CPI with ~4–8q lag)">
+          <Lines id="sgf-rent" height={150} series={[line(drv.uraRent?.yoy, "URA rental y/y", C.cyan)]} />
+          <div style={{ fontSize: 9.5, color: C.amber, marginTop: 4, lineHeight: 1.4 }}>⚡ {drv.tariff?.note}</div>
+        </Panel>
+      </div>
+
+      {/* ── row 3: activity ── */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginBottom: 10 }}>
+        <Panel title="GDP & PMI" note="real GDP y/y (quarterly) · SIPMM PMI (50 = neutral, rhs)">
+          <Plot
+            data={[
+              { ...line(act.gdpYoY, "GDP y/y", C.cyan), type: "bar", marker: { color: C.cyan }, line: undefined },
+              { ...line(act.pmi, "PMI (rhs)", C.amber), yaxis: "y2" },
+            ]}
+            layout={chartLayout("sgf-gdp", {
+              height: 190, margin: { l: 46, r: 40, t: 26, b: 26 },
+              yaxis: { title: { text: "%", font: { size: 8 } }, zeroline: true },
+              yaxis2: { overlaying: "y", side: "right", gridcolor: "transparent",
+                        zeroline: false, tickfont: { size: 8, color: C.amber }, automargin: true },
+              shapes: [{ type: "line", xref: "paper", x0: 0, x1: 1, y0: 50, y1: 50, yref: "y2",
+                         line: { color: C.dim, width: 1, dash: "dot" } }],
+            })}
+            config={PCFG} style={{ width: "100%" }} useResizeHandler
+          />
+        </Panel>
+        <Panel title="TRADE & PRODUCTION" note="y/y %">
+          <Lines id="sgf-trade" height={190} series={[
+            line(act.nodxYoY, "NODX", C.cyan),
+            line(act.ipYoY, "Industrial production", C.blue),
+          ]} />
+        </Panel>
+        <Panel title="DOMESTIC DEMAND & LABOUR" note="retail volume y/y · unemployment (SA) · ULC y/y">
+          <Lines id="sgf-dom" height={190} series={[
+            line(act.retailYoY, "Retail volume y/y", C.cyan),
+            line(lab.unemp, "Unemployment (SA)", C.amber),
+            line(lab.ulcYoY, "ULC y/y (q)", C.violet),
+          ]} />
+        </Panel>
+      </div>
+
+      {/* ── row 4: monetary + policy + calendar ── */}
+      <div style={{ display: "grid", gridTemplateColumns: "1.2fr 1fr 1fr", gap: 10, marginBottom: 10 }}>
+        <Panel title="MONEY & CREDIT" note="y/y %">
+          <Lines id="sgf-money" height={200} series={[
+            line(mon.m2YoY, "M2", C.cyan),
+            line(mon.loansBizYoY, "Loans: businesses", C.blue),
+            line(mon.loansConsYoY, "Loans: consumers", C.violet),
+            line(mon.loansHousYoY, "Housing loans", C.amber),
+          ]} />
+        </Panel>
+        <Panel title="MPS DECISIONS" note={`next: ${pol.nextMeeting}`}>
+          <div style={{ maxHeight: 200, overflowY: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 10.5 }}>
+              <tbody>
+                {[...pol.decisions].reverse().map((d) => (
+                  <tr key={d.date} style={{ borderBottom: `1px solid ${C.border}` }}>
+                    <td style={{ fontFamily: C.mono, color: C.dim, padding: "3px 6px", whiteSpace: "nowrap" }}>{d.date}</td>
+                    <td style={{ color: d.action.includes("↑") ? C.up : d.action.includes("↓") || d.action.includes("0%") ? C.down : C.sub, padding: "3px 6px" }}>{d.action}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div style={{ fontSize: 9, color: C.sub, marginTop: 6, fontFamily: C.mono }}>
+            SPF Jun-26 medians: CPI {pol.spf.cpi2026}% · core {pol.spf.core2026}% · GDP {pol.spf.gdp2026}% · USD/SGD {pol.spf.usdsgdEnd2026} · SORA {pol.spf.soraAvg2026}%
+          </div>
+        </Panel>
+        <Panel title="RELEASE CALENDAR" note="upcoming (MAS/DOS advance calendar)">
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 10.5 }}>
+            <tbody>
+              {upcoming.map((c) => (
+                <tr key={c.date + c.event} style={{ borderBottom: `1px solid ${C.border}` }}>
+                  <td style={{ fontFamily: C.mono, color: c.date <= today ? C.amber : C.dim, padding: "4px 6px", whiteSpace: "nowrap" }}>{c.date}</td>
+                  <td style={{ color: C.sub, padding: "4px 6px" }}>{c.event}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div style={{ fontSize: 9, color: C.dim, marginTop: 6 }}>
+            Consensus rows (Reuters polls): {(con.rows || []).map((r) => `${r.label} ${r.mean != null ? F(r.mean, 1) : "—"}`).join(" · ")}
+          </div>
+        </Panel>
+      </div>
+
+      <div style={{ fontSize: 8.5, color: C.dim, fontFamily: C.mono, paddingBottom: 20 }}>
+        Sources: LSEG econ indicators (aSG…) + Reuters polls · SingStat M213751/M213891/M015631/M212311 · data.gov.sg COE ·
+        weights = DOS 2024 rebasing paper · MAS Core = headline − accommodation − private transport (64.4% of basket) ·
+        cached 6h, no polling · {lab.note}
+      </div>
+    </div>
+  );
+}

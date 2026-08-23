@@ -7,6 +7,7 @@ import React, { useState } from "react";
 import NeerApp from "./NeerApp.jsx";
 import RiskUnits from "./RiskUnits.jsx";
 import CarryBasket from "./CarryBasket.jsx";
+import SgFundamentals from "./SgFundamentals.jsx";
 
 // ── Dark theme (mirrors NeerApp / the pricer) ──
 const C = {
@@ -17,7 +18,7 @@ const C = {
   mono: "'JetBrains Mono','Fira Code',monospace",
 };
 
-const TABS = [["neer", "SGD NEER"], ["risk", "RISK UNITS"], ["carry", "CARRY BASKET"]];
+const TABS = [["neer", "SGD NEER"], ["risk", "RISK UNITS"], ["carry", "CARRY BASKET"], ["fund", "SG FUNDAMENTALS"]];
 
 export default function DeepDive() {
   const [tab, setTab] = useState("neer");
@@ -53,7 +54,8 @@ export default function DeepDive() {
       </div>
 
       {/* ── Active tool ── */}
-      {tab === "neer" ? <NeerApp /> : tab === "risk" ? <RiskUnits /> : <CarryBasket />}
+      {tab === "neer" ? <NeerApp /> : tab === "risk" ? <RiskUnits /> :
+       tab === "carry" ? <CarryBasket /> : <SgFundamentals />}
     </div>
   );
 }

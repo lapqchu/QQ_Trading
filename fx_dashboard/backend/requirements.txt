@@ -7,3 +7,4 @@ scipy>=1.10.0
 holidays>=0.40          # per-currency settlement calendars for on-par 1M day counts (Carry Basket)
 python-dotenv>=1.0.0
 websockets>=12.0
+requests>=2.31.0        # SG Fundamentals external feeds (SingStat / data.gov.sg / MAS chart JSON)
