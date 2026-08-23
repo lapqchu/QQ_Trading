@@ -351,6 +351,15 @@ function ModelView({ consensus }) {
         <Stat label="M1 CORE" value={`${F(nc.coreYoY, 2)}%`} sub="MAS core y/y, bottom-up" color={C.cyan} />
         <Stat label="CONSENSUS" value={`${F(cpiRow.mean, 2)} / ${F(coreRow.mean, 1)}%`} sub={`headline / core · rel ${cpiRow.releaseDate || "—"}`} color={C.amber} />
         <Stat label="NAIVE (CARRY)" value={`${F(lastPub.headlineYoY, 2)} / ${F(lastPub.coreYoY, 1)}%`} sub={`= ${lastPub.month} y/y carried fwd`} />
+        {(() => {  // surprise call vs consensus: only a "call" beyond ~½ RMSE
+          const edgeH = nc.headlineYoY != null && cpiRow.mean != null ? nc.headlineYoY - cpiRow.mean : null;
+          const edgeC = nc.coreYoY != null && coreRow.mean != null ? nc.coreYoY - coreRow.mean : null;
+          const thr = (bt.rmse?.m1Headline ?? 0.25) / 2;
+          const isCall = edgeH != null && Math.abs(edgeH) > thr;
+          return <Stat label="SURPRISE CALL vs CONS" value={`${FP(edgeH, 2)} / ${FP(edgeC, 2)}`}
+            sub={isCall ? `|edge| > ${thr.toFixed(2)} → ${edgeH > 0 ? "UPSIDE" : "DOWNSIDE"} call` : `inside ±${thr.toFixed(2)} noise band — no call`}
+            color={isCall ? C.amber : C.dim} />;
+        })()}
         <Stat label="BACKTEST RMSE 36M" value={`${F(bt.rmse?.m1Headline, 2)} vs ${F(bt.rmse?.naiveHeadline, 2)}`} sub="M1 vs naive · headline pp" color={bt.rmse && bt.rmse.m1Headline < bt.rmse.naiveHeadline ? C.up : C.down} />
         <Stat label="CORE RMSE" value={`${F(bt.rmse?.m1Core, 2)} vs ${F(bt.rmse?.naiveCore, 2)}`} sub="M1 vs naive · core pp" color={bt.rmse && bt.rmse.m1Core < bt.rmse.naiveCore ? C.up : C.down} />
         <div style={{ flex: 1 }} />
@@ -422,6 +431,42 @@ function ModelView({ consensus }) {
           </div>
         </Panel>
       </div>
+
+      <Panel title="SURPRISE SCORECARD — MODEL vs CONSENSUS vs ACTUAL" note="recorded forward each release (vendor stores no consensus history)" style={{ marginBottom: 10 }}>
+        {(data.surpriseLog?.rows || []).length === 0
+          ? <div style={{ padding: 14, color: C.dim, fontSize: 11 }}>
+              No scored prints yet — logging started with the Jul-2026 release (24 Aug 2026). Each month this table gains a row:
+              consensus (frozen pre-release), the model's call, the actual, and whether the model called the surprise direction.
+            </div>
+          : <>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 10.5 }}>
+                <thead><tr style={{ color: C.dim, textAlign: "right" }}>
+                  <th style={{ textAlign: "left", padding: "3px 6px" }}>MONTH</th><th style={{ textAlign: "left" }}>SERIES</th>
+                  <th style={{ padding: "3px 6px" }}>CONS</th><th style={{ padding: "3px 6px" }}>MODEL</th>
+                  <th style={{ padding: "3px 6px" }}>ACTUAL</th><th style={{ padding: "3px 6px" }}>SURPRISE</th>
+                  <th style={{ padding: "3px 6px" }}>MODEL−CONS</th><th style={{ padding: "3px 6px" }}>HIT</th>
+                </tr></thead>
+                <tbody>
+                  {data.surpriseLog.rows.map((r) => (
+                    <tr key={r.month + r.series} style={{ borderTop: `1px solid ${C.border}`, textAlign: "right", fontFamily: C.mono }}>
+                      <td style={{ textAlign: "left", padding: "3px 6px" }}>{r.month}</td>
+                      <td style={{ textAlign: "left", color: C.sub }}>{r.series === "cpiYoY" ? "headline" : "core"}</td>
+                      <td style={{ padding: "3px 6px" }}>{F(r.consensus, 2)}</td>
+                      <td style={{ padding: "3px 6px" }}>{F(r.model, 2)}</td>
+                      <td style={{ padding: "3px 6px", color: C.text }}>{F(r.actual, 2)}</td>
+                      <td style={{ padding: "3px 6px", color: r.surprise > 0 ? C.up : r.surprise < 0 ? C.down : C.sub }}>{FP(r.surprise, 2)}</td>
+                      <td style={{ padding: "3px 6px" }}>{FP(r.modelMinusCons, 2)}</td>
+                      <td style={{ padding: "3px 6px" }}>{r.hit == null ? "—" : r.hit ? "✓" : "✗"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <div style={{ fontSize: 9.5, color: C.sub, fontFamily: C.mono, marginTop: 5 }}>
+                surprise-direction hit rate: {data.surpriseLog.hitRate != null ? `${Math.round(data.surpriseLog.hitRate * 100)}%` : "—"} over {data.surpriseLog.n} scored rows
+              </div>
+            </>}
+        <div style={{ fontSize: 9, color: C.dim, marginTop: 5 }}>{data.surpriseLog?.note}</div>
+      </Panel>
 
       <div style={{ fontSize: 8.5, color: C.dim, fontFamily: C.mono, paddingBottom: 20 }}>
         M1 = Laspeyres aggregation, DOS 2024 weights (headline = Σ wᵢIᵢ/10000; core = Σ_core wᵢIᵢ/Σ_core wᵢ; reconstruction check {data.reconstruction ? `${data.reconstruction.diffPct}% vs official` : "—"}) ·

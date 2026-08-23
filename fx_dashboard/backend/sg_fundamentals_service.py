@@ -16,7 +16,9 @@ TTL (6h) — the frontend fetches once on mount + manual refresh; NO polling.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
+import os
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -196,6 +198,39 @@ def _pts_to_series(points: Dict[str, float]) -> Dict[str, List]:
     return {"dates": ks, "values": [points[k] for k in ks]}
 
 
+# ── consensus / nowcast vintage log ──
+# LSEG poll RICs do NOT store forecast history (error 96104: only actuals come
+# back via get_history) — so the surprise series (actual − consensus) cannot be
+# reconstructed backwards. We RECORD it forwards instead: every monitor build
+# persists the pre-release consensus, every model build persists the nowcast;
+# the MODEL tab scores surprises as prints accumulate.
+_VINTAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             ".fund_cache", "vintages.json")
+
+
+def load_vintages() -> Dict[str, Any]:
+    try:
+        with open(_VINTAGE_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_vintage(key: str, entry: Dict[str, Any]) -> None:
+    """Upsert one vintage entry (idempotent per key; lastSeen updated)."""
+    try:
+        v = load_vintages()
+        cur = v.get(key, {})
+        entry = {**cur, **entry, "lastSeen": dt.datetime.now().isoformat(timespec="seconds")}
+        entry.setdefault("firstSeen", entry["lastSeen"])
+        v[key] = entry
+        os.makedirs(os.path.dirname(_VINTAGE_PATH), exist_ok=True)
+        with open(_VINTAGE_PATH, "w") as f:
+            json.dump(v, f, indent=1)
+    except Exception as e:
+        log.warning("vintage save failed for %s: %s", key, e)
+
+
 class SgFundamentalsService:
     def __init__(self, lseg):
         self.lseg = lseg
@@ -262,14 +297,26 @@ class SgFundamentalsService:
             return str(v)
 
         rows = []
+        today = dt.date.today().isoformat()
         for key, p in POLL_RICS.items():
             s = snap.get(p["ric"], {}) or {}
-            rows.append({
+            row = {
                 "key": key, "label": p["label"], "ric": p["ric"],
                 "actual": _clean(s.get("ECON_ACT")), "prior": _clean(s.get("ECON_PRIOR")),
                 "mean": _clean(s.get("FCAST_MEAN")), "high": _clean(s.get("FCAST_HIGH")),
                 "low": _clean(s.get("FCAST_LOW")), "releaseDate": _clean(s.get("VALUE_DT1")),
-            })
+            }
+            rows.append(row)
+            # log the PRE-release consensus vintage (poll history isn't stored
+            # by the vendor — see note at load_vintages)
+            rd = row["releaseDate"]
+            if (key in ("cpiYoY", "coreYoY") and row["mean"] is not None
+                    and isinstance(rd, str) and rd >= today):
+                save_vintage(f"consensus:{key}:{rd}", {
+                    "kind": "consensus", "series": key, "releaseDate": rd,
+                    "mean": row["mean"], "high": row["high"], "low": row["low"],
+                    "prior": row["prior"],
+                })
         return {"rows": rows}
 
     # ── external pulls ──

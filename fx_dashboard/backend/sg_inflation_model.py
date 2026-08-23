@@ -35,7 +35,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 import ext_data
-from sg_fundamentals_service import CPI_COMPONENTS, _CPI_ALL_SERIES, COE_DATASET
+from sg_fundamentals_service import (CPI_COMPONENTS, _CPI_ALL_SERIES, COE_DATASET,
+                                     load_vintages, save_vintage)
 
 log = logging.getLogger("sg_model")
 
@@ -489,6 +490,50 @@ class SgInflationModel:
                            "diffPct": round((idx / data["all"].get(last_pub) - 1) * 100, 3)}
             phillips = self._phillips(data)
             backtest = self._backtest(data)
+
+            # ── surprise scorecard (built forward from logged vintages) ──
+            # Log this build's call for the upcoming print…
+            if nowcast.get("ok"):
+                save_vintage(f"nowcast:{target}", {
+                    "kind": "nowcast", "target": target,
+                    "headline": nowcast.get("headlineYoY"), "core": nowcast.get("coreYoY")})
+            # …and score every logged consensus whose print is now out.
+            vint = load_vintages()
+            sur_rows = []
+            for key, v in vint.items():
+                if v.get("kind") != "consensus":
+                    continue
+                rd = v.get("releaseDate") or ""
+                if len(rd) < 10:
+                    continue
+                tgt = _shift_month(rd[:7], -1)          # Jul CPI prints ~23 Aug
+                actual = (data["all"].yoy(tgt) if v["series"] == "cpiYoY"
+                          else data["coreOff"].yoy(tgt))
+                if actual is None or rd > dt.date.today().isoformat():
+                    continue                              # not printed yet
+                nc_v = vint.get(f"nowcast:{tgt}") or {}
+                model_call = nc_v.get("headline" if v["series"] == "cpiYoY" else "core")
+                surprise = round(actual - v["mean"], 2)
+                edge = (round(model_call - v["mean"], 2)
+                        if model_call is not None else None)
+                sur_rows.append({
+                    "month": tgt, "series": v["series"], "consensus": v["mean"],
+                    "model": model_call, "actual": round(actual, 2),
+                    "surprise": surprise, "modelMinusCons": edge,
+                    "hit": (bool(np.sign(surprise) == np.sign(edge))
+                            if edge not in (None, 0.0) and surprise != 0.0 else None),
+                })
+            sur_rows.sort(key=lambda r: (r["month"], r["series"]))
+            hits = [r["hit"] for r in sur_rows if r["hit"] is not None]
+            surprise_log = {
+                "rows": sur_rows,
+                "n": len(sur_rows), "hitRate": (round(sum(hits) / len(hits), 2)
+                                                if hits else None),
+                "note": ("Vendor stores no consensus history (ECI 96104) — this "
+                         "scorecard is RECORDED FORWARD from 2026-08-24. A model-vs-"
+                         "consensus gap is only a call when it exceeds ~half the "
+                         "backtest RMSE."),
+            }
             payload = {
                 "asOf": dt.datetime.now().isoformat(timespec="seconds"),
                 "lastPublished": {"month": last_pub,
@@ -499,6 +544,7 @@ class SgInflationModel:
                 "reconstruction": recon_h,
                 "phillips": phillips,
                 "backtest": backtest,
+                "surpriseLog": surprise_log,
                 "policy": {
                     "reactionPrior": {
                         "coreGap": round((nowcast.get("coreYoY") or 0) - 2.0, 2),
