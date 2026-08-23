@@ -38,6 +38,7 @@ from risk_service import RiskService, product_catalog
 from carry_basket_service import CarryBasketService
 from sg_fundamentals_service import SgFundamentalsService
 from sg_inflation_model import SgInflationModel
+from em_rules_service import EmRulesService
 from ric_config import CURRENCIES, NDF_CURRENCIES, DELIVERABLE_CURRENCIES, get_spread_pack, get_spread_packs, FUNDING_TENORS
 
 load_dotenv()
@@ -55,11 +56,12 @@ risk: RiskService | None = None
 carry: CarryBasketService | None = None
 fund: SgFundamentalsService | None = None
 fund_model: SgInflationModel | None = None
+rules: EmRulesService | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global lseg, market, neer, risk, carry, fund, fund_model
+    global lseg, market, neer, risk, carry, fund, fund_model, rules
     lseg = LsegClient(app_key=os.environ.get("LSEG_APP_KEY"))
     try:
         lseg.open()
@@ -73,6 +75,7 @@ async def lifespan(app: FastAPI):
     carry = CarryBasketService(lseg)   # Carry Basket rank/sizing deep-dive service
     fund = SgFundamentalsService(lseg)  # SG Fundamentals country monitor (deep-dive tab 4)
     fund_model = SgInflationModel(lseg)  # SG inflation nowcast + Phillips curve (MODEL sub-tab)
+    rules = EmRulesService(lseg)         # EM Rules screener (Willer/Chandran/Lam), tab 5
     log.info("FX dashboard backend ready")
     yield
     log.info("Shutting down")
@@ -358,6 +361,18 @@ def fund_sg_model(refresh: bool = False) -> Dict[str, Any]:
         return fund_model.model(refresh=refresh)
     except Exception as e:
         log.exception("fund_sg_model failed")
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/rules")
+def em_rules(refresh: bool = False) -> Dict[str, Any]:
+    """EM Rules screener payload: per-country rule states (R1–R5, R8, R11) +
+    global overlays (R6/R9/R10). Cached 12h — one build per day is the intent;
+    do NOT poll. R7 carry/vol is served by /api/carry/rank."""
+    try:
+        return rules.build(refresh=refresh)
+    except Exception as e:
+        log.exception("em_rules failed")
         raise HTTPException(500, str(e))
 
 
