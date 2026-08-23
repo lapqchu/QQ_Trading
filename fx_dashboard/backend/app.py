@@ -37,6 +37,7 @@ from neer_service import NeerService, MAS_MEETINGS
 from risk_service import RiskService, product_catalog
 from carry_basket_service import CarryBasketService
 from sg_fundamentals_service import SgFundamentalsService
+from sg_inflation_model import SgInflationModel
 from ric_config import CURRENCIES, NDF_CURRENCIES, DELIVERABLE_CURRENCIES, get_spread_pack, get_spread_packs, FUNDING_TENORS
 
 load_dotenv()
@@ -53,11 +54,12 @@ neer: NeerService | None = None
 risk: RiskService | None = None
 carry: CarryBasketService | None = None
 fund: SgFundamentalsService | None = None
+fund_model: SgInflationModel | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global lseg, market, neer, risk, carry, fund
+    global lseg, market, neer, risk, carry, fund, fund_model
     lseg = LsegClient(app_key=os.environ.get("LSEG_APP_KEY"))
     try:
         lseg.open()
@@ -70,6 +72,7 @@ async def lifespan(app: FastAPI):
     risk = RiskService(lseg)   # Risk Units vol/sizing service
     carry = CarryBasketService(lseg)   # Carry Basket rank/sizing deep-dive service
     fund = SgFundamentalsService(lseg)  # SG Fundamentals country monitor (deep-dive tab 4)
+    fund_model = SgInflationModel(lseg)  # SG inflation nowcast + Phillips curve (MODEL sub-tab)
     log.info("FX dashboard backend ready")
     yield
     log.info("Shutting down")
@@ -343,6 +346,18 @@ def fund_sg(refresh: bool = False) -> Dict[str, Any]:
         return fund.monitor(refresh=refresh)
     except Exception as e:
         log.exception("fund_sg failed")
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/fund/sg/model")
+def fund_sg_model(refresh: bool = False) -> Dict[str, Any]:
+    """SG inflation MODEL payload: next-print bottom-up nowcast (per-component,
+    with driver methods), Phillips-curve fit/decomposition/projection, 36-month
+    expanding backtest vs naive, and the policy reaction prior. Cached 6h."""
+    try:
+        return fund_model.model(refresh=refresh)
+    except Exception as e:
+        log.exception("fund_sg_model failed")
         raise HTTPException(500, str(e))
 
 

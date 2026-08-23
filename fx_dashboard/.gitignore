@@ -3,3 +3,4 @@ backend/.fund_cache/
 frontend/dist/
 backend/venv/
 backend/.venv*/
+backend/.env

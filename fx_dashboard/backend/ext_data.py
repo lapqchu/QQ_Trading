@@ -196,6 +196,53 @@ def datagov_search(resource_id: str, limit: int = 500, sort: str = "_id desc",
             "error": raw.get("error")}
 
 
+# ───────────────────────── MAS API portal (keyed, optional) ─────────────────────────
+# The official replacement for the dead datastore API. Needs a KeyId header from a
+# (free, guest) subscription at eservices.mas.gov.sg/apimg-portal. We use it only as
+# an official fallback/validator feed — everything works without it.
+#   product 10484 daily SORA:  /server/monthly_statistical_bulletin_non610mssql/
+#       domestic_interest_rates_daily/views/domestic_interest_rates_daily
+#   product 10485 daily FX:    /server/monthly_statistical_bulletin_non610ora/
+#       exchange_rates_end_of_period_daily/views/exchange_rates_end_of_period_daily
+# Denodo query params: $filter / $select / $orderby / $start_index (+ column params).
+
+_MAS_GW = "https://eservices.mas.gov.sg/apimg-gw"
+
+
+def mas_api_available() -> bool:
+    return bool(os.environ.get("MAS_API_KEY"))
+
+
+def mas_api(path: str, params: Optional[Dict[str, str]] = None,
+            ttl: float = 12 * 3600) -> Dict[str, Any]:
+    """GET a MAS API-portal view (path relative to the gateway root). Returns the
+    same envelope as get_json; {"data": None, "error": "no MAS_API_KEY"} when the
+    key is absent."""
+    key_id = os.environ.get("MAS_API_KEY")
+    if not key_id:
+        return {"data": None, "stale": True, "fetchedAt": None, "error": "no MAS_API_KEY"}
+    url = f"{_MAS_GW}/{path.lstrip('/')}"
+    cache_key = "masapi_" + path.strip("/").replace("/", "_")[-80:]
+    cached = _read_cache(cache_key)
+    now = time.time()
+    if cached and (now - cached.get("fetchedAt", 0)) < ttl:
+        cached["stale"] = False
+        return cached
+    try:
+        r = _session.get(url, params=params, headers={"KeyId": key_id}, timeout=25)
+        r.raise_for_status()
+        payload = {"data": r.json(), "fetchedAt": now, "stale": False, "url": r.url}
+        _write_cache(cache_key, payload)
+        return payload
+    except Exception as e:
+        log.warning("MAS API fetch failed %s: %s", path, str(e)[:200])
+        if cached:
+            cached["stale"] = True
+            cached["error"] = str(e)[:200]
+            return cached
+        return {"data": None, "fetchedAt": None, "stale": True, "error": str(e)[:200]}
+
+
 # ───────────────────────── MAS chart JSON (no auth) ─────────────────────────
 # GET https://www.mas.gov.sg/api/v1/MAS/chart/rev/{view}
 # Undocumented but stable-shaped: {"name": ..., "elements": [ {...}, ... ]} newest first.

@@ -83,22 +83,7 @@ function Stat({ label, value, sub, color }) {
   );
 }
 
-export default function SgFundamentals() {
-  const [data, setData] = useState(null);
-  const [err, setErr] = useState(null);
-  const [busy, setBusy] = useState(false);
-
-  const load = useCallback(async (refresh = false) => {
-    setBusy(true); setErr(null);
-    try {
-      const r = await fetch(`/api/fund/sg${refresh ? "?refresh=1" : ""}`);
-      if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
-      setData(await r.json());
-    } catch (e) { setErr(String(e).slice(0, 300)); }
-    setBusy(false);
-  }, []);
-  useEffect(() => { load(false); }, [load]);
-
+function MonitorView({ data, err, busy, load }) {
   if (err) return <div style={{ padding: 30, color: C.down, fontFamily: C.mono, fontSize: 12 }}>SG Fundamentals failed: {err}</div>;
   if (!data) return <div style={{ padding: 30, color: C.dim, fontSize: 12 }}>Loading Singapore fundamentals… (first build pulls ~8 years of official series, ~10s)</div>;
 
@@ -301,6 +286,253 @@ export default function SgFundamentals() {
         weights = DOS 2024 rebasing paper · MAS Core = headline − accommodation − private transport (64.4% of basket) ·
         cached 6h, no polling · {lab.note}
       </div>
+    </div>
+  );
+}
+
+// ═══════════════════════ MODEL sub-tab ═══════════════════════
+// Bottom-up component nowcast (M1) + Phillips curve (M2) + backtest.
+function ModelView({ consensus }) {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const load = useCallback(async (refresh = false) => {
+    setBusy(true); setErr(null);
+    try {
+      const r = await fetch(`/api/fund/sg/model${refresh ? "?refresh=1" : ""}`);
+      if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+      setData(await r.json());
+    } catch (e) { setErr(String(e).slice(0, 300)); }
+    setBusy(false);
+  }, []);
+  useEffect(() => { load(false); }, [load]);
+
+  if (err) return <div style={{ padding: 30, color: C.down, fontFamily: C.mono, fontSize: 12 }}>Model failed: {err}</div>;
+  if (!data) return <div style={{ padding: 30, color: C.dim, fontSize: 12 }}>Building inflation model… (first build fits the component models + backtest, ~10s)</div>;
+
+  const nc = data.nowcast || {};
+  const bt = data.backtest || {};
+  const ph = data.phillips || {};
+  const lastPub = data.lastPublished || {};
+  const cpiRow = (consensus || []).find((r) => r.key === "cpiYoY") || {};
+  const coreRow = (consensus || []).find((r) => r.key === "coreYoY") || {};
+
+  const detail = (nc.detail || []).filter((d) => d.mm != null);
+  const sorted = [...detail].sort((a, b) => (b.contribution ?? -9) - (a.contribution ?? -9));
+
+  // backtest chart traces
+  const btRows = bt.rows || [];
+  const btTrace = (key, name, color, dash) => ({
+    x: btRows.map((r) => r.month), y: btRows.map((r) => r[key]),
+    name, type: "scatter", mode: "lines", line: { color, width: 1.5, dash },
+  });
+
+  // phillips fitted + projection
+  const fit = ph.fitted || [];
+  const proj = ph.projection || [];
+  const phTraces = [
+    { x: fit.map((r) => r.month), y: fit.map((r) => r.actual), name: "MAS Core actual", type: "scatter", mode: "lines", line: { color: C.cyan, width: 1.6 } },
+    { x: fit.map((r) => r.month), y: fit.map((r) => r.fitted), name: "Fitted", type: "scatter", mode: "lines", line: { color: C.violet, width: 1.2, dash: "dot" } },
+    { x: proj.map((r) => r.month), y: proj.map((r) => r.coreYoY), name: "Projection (6m)", type: "scatter", mode: "lines+markers", line: { color: C.amber, width: 1.6, dash: "dash" }, marker: { size: 4 } },
+  ];
+  const dec = ph.decomposition || {};
+  const decTrace = {
+    type: "bar",
+    x: Object.values(dec), y: Object.keys(dec), orientation: "h",
+    marker: { color: [C.cyan, C.blue, C.amber, C.violet, C.dim] },
+    hovertemplate: "%{y}: %{x:.2f}pp<extra></extra>",
+  };
+
+  return (
+    <div style={{ padding: 14, maxWidth: 1500, margin: "0 auto" }}>
+      {/* nowcast header */}
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 12 }}>
+        <Stat label={`M1 NOWCAST · ${nc.target || "—"}`} value={`${F(nc.headlineYoY, 2)}%`} sub="headline y/y, bottom-up" color={C.cyan} />
+        <Stat label="M1 CORE" value={`${F(nc.coreYoY, 2)}%`} sub="MAS core y/y, bottom-up" color={C.cyan} />
+        <Stat label="CONSENSUS" value={`${F(cpiRow.mean, 2)} / ${F(coreRow.mean, 1)}%`} sub={`headline / core · rel ${cpiRow.releaseDate || "—"}`} color={C.amber} />
+        <Stat label="NAIVE (CARRY)" value={`${F(lastPub.headlineYoY, 2)} / ${F(lastPub.coreYoY, 1)}%`} sub={`= ${lastPub.month} y/y carried fwd`} />
+        <Stat label="BACKTEST RMSE 36M" value={`${F(bt.rmse?.m1Headline, 2)} vs ${F(bt.rmse?.naiveHeadline, 2)}`} sub="M1 vs naive · headline pp" color={bt.rmse && bt.rmse.m1Headline < bt.rmse.naiveHeadline ? C.up : C.down} />
+        <Stat label="CORE RMSE" value={`${F(bt.rmse?.m1Core, 2)} vs ${F(bt.rmse?.naiveCore, 2)}`} sub="M1 vs naive · core pp" color={bt.rmse && bt.rmse.m1Core < bt.rmse.naiveCore ? C.up : C.down} />
+        <div style={{ flex: 1 }} />
+        <div style={{ display: "flex", flexDirection: "column", justifyContent: "center", gap: 4, alignItems: "flex-end" }}>
+          <button onClick={() => load(true)} disabled={busy}
+            style={{ background: C.panel2, color: C.cyan, border: `1px solid ${C.border}`, borderRadius: 6, padding: "6px 14px", fontSize: 10, fontWeight: 800, letterSpacing: ".08em", cursor: "pointer" }}>
+            {busy ? "REBUILDING…" : "REBUILD"}
+          </button>
+          <div style={{ fontSize: 8.5, color: C.dim, fontFamily: C.mono }}>
+            built {String(data.asOf).slice(5, 16)} · {data.buildSecs}s · recon {data.reconstruction ? `${data.reconstruction.diffPct}%` : "—"}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr", gap: 10, marginBottom: 10 }}>
+        {/* component table */}
+        <Panel title="COMPONENT NOWCAST" note={`${nc.target} · m/m forecast per component → y/y & contribution (pp of headline)`}>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 10.5 }}>
+              <thead>
+                <tr style={{ color: C.dim, textAlign: "right" }}>
+                  <th style={{ textAlign: "left", padding: "3px 6px" }}>COMPONENT</th>
+                  <th style={{ padding: "3px 6px" }}>W%</th>
+                  <th style={{ padding: "3px 6px" }}>M/M</th>
+                  <th style={{ padding: "3px 6px" }}>Y/Y</th>
+                  <th style={{ padding: "3px 6px" }}>CONTRIB</th>
+                  <th style={{ textAlign: "left", padding: "3px 6px" }}>METHOD</th>
+                </tr>
+              </thead>
+              <tbody>
+                {sorted.map((d) => (
+                  <tr key={d.key} style={{ borderTop: `1px solid ${C.border}`, textAlign: "right" }}>
+                    <td style={{ textAlign: "left", padding: "3px 6px", color: d.core ? C.text : C.amber }}>{d.label}{!d.core && " ✕"}</td>
+                    <td style={{ fontFamily: C.mono, padding: "3px 6px", color: C.dim }}>{(d.w / 100).toFixed(1)}</td>
+                    <td style={{ fontFamily: C.mono, padding: "3px 6px" }}>{FP(d.mm, 2)}</td>
+                    <td style={{ fontFamily: C.mono, padding: "3px 6px" }}>{FP(d.yoy, 1)}</td>
+                    <td style={{ fontFamily: C.mono, padding: "3px 6px", color: (d.contribution ?? 0) >= 0 ? C.up : C.down }}>{FP(d.contribution, 2)}</td>
+                    <td style={{ textAlign: "left", padding: "3px 6px", color: C.sub, fontSize: 9.5 }}>{d.method}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div style={{ fontSize: 9, color: C.dim, marginTop: 5 }}>✕ = excluded from MAS core. Methods: seasonal = median m/m of that calendar month (6y, ex-2020); driver models refit on data before each target (no lookahead).</div>
+        </Panel>
+        {/* backtest chart */}
+        <Panel title="BACKTEST — HEADLINE Y/Y" note="expanding-window one-step-ahead, last 36 prints">
+          <Lines id="sgm-bt" height={250} series={[
+            btTrace("actualHeadline", "Actual", C.cyan),
+            btTrace("m1Headline", "M1 nowcast", C.amber),
+            btTrace("naiveHeadline", "Naive carry", C.dim, "dot"),
+          ]} />
+        </Panel>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr", gap: 10, marginBottom: 10 }}>
+        <Panel title="M2 — CORE PHILLIPS CURVE" note={`${ph.form || ""} · r² ${ph.r2 ?? "—"} · n ${ph.n ?? "—"} (fit 2012→)`}>
+          <Lines id="sgm-ph" height={240} series={phTraces} />
+        </Panel>
+        <Panel title="DECOMPOSITION & PROJECTION" note={`latest month's core y/y by term (coef × value, pp) · ${ph.lastMonth || ""}`}>
+          <Plot data={[decTrace]}
+            layout={chartLayout("sgm-dec", { height: 150, margin: { l: 90, r: 12, t: 8, b: 22 }, xaxis: { zeroline: true } })}
+            config={PCFG} style={{ width: "100%" }} useResizeHandler />
+          <div style={{ fontFamily: C.mono, fontSize: 10, color: C.sub, marginTop: 6, lineHeight: 1.6 }}>
+            {(ph.projection || []).map((p) => `${p.month.slice(5)}: ${p.coreYoY}%`).join(" · ")}
+          </div>
+          <div style={{ fontSize: 9, color: C.dim, marginTop: 4 }}>
+            Projection holds import-price & NEER y/y at last obs; IP gap decays 0.9/m. GST dummies: Jan-23, Jan-24.
+          </div>
+        </Panel>
+      </div>
+
+      <div style={{ fontSize: 8.5, color: C.dim, fontFamily: C.mono, paddingBottom: 20 }}>
+        M1 = Laspeyres aggregation, DOS 2024 weights (headline = Σ wᵢIᵢ/10000; core = Σ_core wᵢIᵢ/Σ_core wᵢ; reconstruction check {data.reconstruction ? `${data.reconstruction.diffPct}% vs official` : "—"}) ·
+        drivers: SP tariff step × estimated pass-through, COE bidding premiums (data.gov.sg), URA rent lags 3–6q ·
+        M2 per BIS Papers 142 (MAS EPG) · cached 6h
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════ POLICY sub-tab ═══════════════════════
+function PolicyView({ monitor }) {
+  const [model, setModel] = useState(null);
+  useEffect(() => {
+    fetch("/api/fund/sg/model").then((r) => r.json()).then(setModel).catch(() => {});
+  }, []);
+  if (!monitor) return <div style={{ padding: 30, color: C.dim, fontSize: 12 }}>Loading…</div>;
+  const pol = monitor.policy || {};
+  const vint = (monitor.inflation || {}).forecastVintages2026 || [];
+  const rp = model?.policy?.reactionPrior;
+  const spfN = model?.policy?.spfNextMeeting;
+  const proj = model?.phillips?.projection || [];
+
+  return (
+    <div style={{ padding: 14, maxWidth: 1200, margin: "0 auto" }}>
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 12 }}>
+        <Stat label="NEXT MPS" value="≤ 14 Oct 2026" sub="quarterly · MR same day" color={C.amber} />
+        <Stat label="REACTION PRIOR" value={rp ? rp.read.toUpperCase() : "—"} sub={rp ? `core gap ${FP(rp.coreGap, 2)}pp · output gap +${rp.outputGap}%` : "from model"} color={C.cyan} />
+        <Stat label="SPF: OCT SLOPE ↑" value={spfN ? `${spfN.slopeUpPct}%` : "—"} sub="of respondents (Jun-26 survey)" />
+        <Stat label="M2 CORE @ OCT MPS" value={proj.length >= 3 ? `${proj[2].coreYoY}%` : "—"} sub="Phillips projection for Sep y/y" />
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
+        <Panel title="POLICY REACTION FRAMEWORK" note="MR Oct-2018 Box A · MR Oct-2021 SF A">
+          <div style={{ fontSize: 11.5, color: C.sub, lineHeight: 1.7 }}>
+            <p style={{ margin: "4px 0" }}>MAS's estimated rule: <span style={{ color: C.text }}>band slope ← core-inflation gap (vs ~2% medium-term) + output gap</span>. Estimated sensitivities: +1pp expected inflation → +1.7% NEER appreciation; +1pp output gap → +0.9%.</p>
+            <p style={{ margin: "4px 0" }}>Current inputs: core nowcast <span style={{ fontFamily: C.mono, color: C.cyan }}>{model?.nowcast?.coreYoY ?? "—"}%</span> (gap {rp ? FP(rp.coreGap, 2) : "—"}pp), output gap <span style={{ fontFamily: C.mono, color: C.cyan }}>+0.7%</span> (MR Jul-26), Phillips path rising into year-end → <span style={{ color: C.amber, fontWeight: 700 }}>{rp?.read || "—"}</span>.</p>
+            <p style={{ margin: "4px 0", color: C.dim, fontSize: 10 }}>{spfN?.note}</p>
+          </div>
+        </Panel>
+        <Panel title="2026 FORECAST VINTAGES" note="MAS core & headline range, by statement">
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+            <tbody>
+              {vint.map((v) => (
+                <tr key={v.asOf} style={{ borderBottom: `1px solid ${C.border}` }}>
+                  <td style={{ fontFamily: C.mono, color: C.dim, padding: "4px 6px" }}>{v.asOf}</td>
+                  <td style={{ fontFamily: C.mono, color: C.text, padding: "4px 6px" }}>{v.low}–{v.high}%</td>
+                  <td style={{ color: C.sub, padding: "4px 6px", fontSize: 10 }}>{v.low === 1.5 && v.asOf === "2026-04-14" ? "raised (energy shock)" : v.asOf === "2026-01-29" ? "raised" : v.asOf === "2026-07-27" ? "held" : "baseline"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div style={{ fontSize: 9.5, color: C.dim, marginTop: 6 }}>
+            SPF Jun-26 medians sit at {pol.spf?.cpi2026}% headline / {pol.spf?.core2026}% core — upper half of the MAS range.
+          </div>
+        </Panel>
+      </div>
+      <Panel title="MPS DECISION HISTORY" note="slope / width / centre — since 2016">
+        <div style={{ maxHeight: 320, overflowY: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+            <tbody>
+              {[...(pol.decisions || [])].reverse().map((d) => (
+                <tr key={d.date} style={{ borderBottom: `1px solid ${C.border}` }}>
+                  <td style={{ fontFamily: C.mono, color: C.dim, padding: "3px 6px", width: 110 }}>{d.date}</td>
+                  <td style={{ color: d.action.includes("↑") ? C.up : d.action.includes("↓") || d.action.includes("0%") ? C.down : C.sub, padding: "3px 6px" }}>{d.action}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
+// ═══════════════════════ parent: sub-tab shell ═══════════════════════
+export default function SgFundamentals() {
+  const [tab, setTab] = useState("monitor");
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async (refresh = false) => {
+    setBusy(true); setErr(null);
+    try {
+      const r = await fetch(`/api/fund/sg${refresh ? "?refresh=1" : ""}`);
+      if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+      setData(await r.json());
+    } catch (e) { setErr(String(e).slice(0, 300)); }
+    setBusy(false);
+  }, []);
+  useEffect(() => { load(false); }, [load]);
+
+  const SUBTABS = [["monitor", "MONITOR"], ["model", "MODEL"], ["policy", "POLICY"]];
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 2, padding: "6px 14px 0", borderBottom: `1px solid ${C.border}`, background: C.bg }}>
+        {SUBTABS.map(([id, lbl]) => {
+          const on = tab === id;
+          return (
+            <button key={id} onClick={() => setTab(id)}
+              style={{ fontSize: 10.5, fontWeight: 800, letterSpacing: ".1em", padding: "8px 16px",
+                       background: "transparent", border: "none", cursor: "pointer",
+                       color: on ? C.cyan : C.dim, borderBottom: `2px solid ${on ? C.cyan : "transparent"}` }}>
+              {lbl}
+            </button>
+          );
+        })}
+      </div>
+      {tab === "monitor" ? <MonitorView data={data} err={err} busy={busy} load={load} />
+        : tab === "model" ? <ModelView consensus={data?.consensus?.rows} />
+        : <PolicyView monitor={data} />}
     </div>
   );
 }
