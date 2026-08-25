@@ -113,6 +113,50 @@ CORE_SERIES: Dict[str, str] = {
 }
 CORE_INDEX_SERIES: Dict[str, str] = {"CL": "aCLCPIEFEF/C"}   # index level → y/y derived
 
+# Per-country overrides for the core hover note (default note used otherwise)
+CORE_NOTES: Dict[str, Dict[str, str]] = {
+    "IN": {"kind": "substitute",
+           "note": "Core WPI — non-food manufactured products (OEA/DPIIT): a PRODUCER-price core, not CPI core. India publishes no official CPI core, and RBI's ex-food-fuel gauge is not carried on this Workspace. No services coverage — can diverge from consumer core."},
+}
+CORE_SERIES["IN"] = "aINWPCORF/C"
+
+# ── Frontier curve substitutes (marked † in the UI): no IRS market exists, so the
+# market convention is GOVERNMENT bills/bonds — benchmark yields verified live
+# 2026-08-26 with ~2y daily history each ({CC}xYT=RR, MID_YLD_1). Yields embed
+# sovereign credit + liquidity premia, so R1/R4/R5 read "cuts/hikes priced PLUS
+# credit", not pure policy expectations. TN: no benchmark series at all (gap).
+CURVE_SUBS: Dict[str, Dict[str, str]] = {
+    "EG": {"1Y": "EG1YT=RR", "2Y": "EG2YT=RR", "5Y": "EG5YT=RR", "10Y": "EG10YT=RR"},
+    "NG": {"1Y": "NG1YT=RR", "2Y": "NG2YT=RR", "5Y": "NG5YT=RR", "10Y": "NG10YT=RR"},
+    "MU": {"1Y": "MU1YT=RR", "2Y": "MU2YT=RR", "5Y": "MU5YT=RR", "10Y": "MU10YT=RR"},
+    "UG": {"1Y": "UG1YT=RR", "2Y": "UG2YT=RR", "5Y": "UG5YT=RR", "10Y": "UG10YT=RR"},
+    "MA": {"1Y": "MA2YT=RR", "2Y": "MA2YT=RR", "5Y": "MA5YT=RR", "10Y": "MA10YT=RR"},
+    "BW": {"1Y": "BW1YT=RR"},
+}
+_CURVE_SUB_NOTE = ("Curve from GOVERNMENT bond benchmarks, not swaps (no IRS market exists) — "
+                   "yields embed sovereign credit + liquidity premia, so cycle/premium reads "
+                   "include a credit component.")
+CURVE_SUB_NOTES: Dict[str, str] = {
+    "MA": _CURVE_SUB_NOTE + " Morocco has no 1Y benchmark — the 2Y stands in for the R1 leg.",
+    "BW": _CURVE_SUB_NOTE + " Botswana carries only a 1Y benchmark — R4/R5 stay blank.",
+}
+
+for _cc, _cfg in COUNTRIES.items():   # let helpers know their own country code
+    _cfg["cc"] = _cc
+
+# ── Derived REER fallback (market convention, marked † in the UI): where NO
+# trade-weighted REER series exists, desks fall back to the BILATERAL real
+# exchange rate vs USD — nominal value of the local currency deflated by the
+# CPI differential: RER = (1/spot) × CPI_local / CPI_US, read vs its 10y mean.
+# Inputs verified live 2026-08-26: standardized CPI indices a{CC}CCPIF/C
+# (11y monthly) for every gap country and the US. Real data, derived measure —
+# NOT a trade-weighted REER (single-partner weighting is its known limitation).
+DERIVED_RER_CPI: Dict[str, str] = {
+    "KZ": "aKZCCPIF/C", "QA": "aQACCPIF/C", "EG": "aEGCCPIF/C",
+    "MU": "aMUCCPIF/C", "BW": "aBWCCPIF/C",
+}
+_US_CPI_IDX = "aUSCCPIF/C"
+
 
 def _z(series: List[float], window: int) -> Optional[float]:
     xs = [x for x in series[-window:] if x is not None]
@@ -133,7 +177,9 @@ class EmRulesService:
     def _swap_ric(self, cfg: Dict[str, Any], t: str) -> Optional[str]:
         sw = cfg.get("swap")
         if sw is None:
-            return None
+            # frontier fallback: government bond benchmarks (marked † in the UI)
+            sub = CURVE_SUBS.get(cfg.get("cc", ""))
+            return sub.get(t) if sub else None
         return sw.get(t) if isinstance(sw, dict) else sw.format(t=t)
 
     def _snapshot(self) -> Dict[str, Dict[str, Any]]:
@@ -179,6 +225,30 @@ class EmRulesService:
                     out[ric] = h.get(ric) or h.get("default") or []
         return out
 
+    def _monthly_fx(self, rics: List[str], years: int = 11) -> Dict[str, Dict[str, float]]:
+        """Month-end FX mids over `years` — {ric: {YYYY-MM: mid}} (for the derived RER)."""
+        out: Dict[str, Dict[str, float]] = {}
+        start = (dt.date.today() - dt.timedelta(days=years * 372)).isoformat()
+        end = dt.date.today().isoformat()
+        for ric in rics:
+            try:
+                h = self.lseg.get_history([ric], fields=["BID", "ASK"], interval="monthly",
+                                          start=start, end=end) or {}
+            except Exception as e:
+                log.error("monthly fx hist failed %s: %s", ric, e)
+                continue
+            recs = h.get(ric) or h.get("default") or []
+            m: Dict[str, float] = {}
+            for r in recs:
+                b, a = r.get("BID"), r.get("ASK")
+                v = ((b + a) / 2.0 if isinstance(b, (int, float)) and isinstance(a, (int, float))
+                     else b if isinstance(b, (int, float)) else a)
+                if isinstance(v, (int, float)) and v > 0:
+                    m[str(r.get("Date", ""))[:7]] = float(v)
+            if m:
+                out[ric] = m
+        return out
+
     def _monthly_hist(self, rics: List[str], years: int = 4) -> Dict[str, List[dict]]:
         out: Dict[str, List[dict]] = {}
         start = f"{dt.date.today().year - years}-01-01"
@@ -204,6 +274,12 @@ class EmRulesService:
     def _vals(recs: List[dict]) -> List[float]:
         return [float(r["VALUE"]) for r in recs or []
                 if isinstance(r.get("VALUE"), (int, float))]
+
+    @staticmethod
+    def _mmap(recs: List[dict]) -> Dict[str, float]:
+        """Monthly records → {YYYY-MM: value} for date-aligned computations."""
+        return {str(r.get("Date", ""))[:7]: float(r["VALUE"]) for r in recs or []
+                if isinstance(r.get("VALUE"), (int, float))}
 
     @staticmethod
     def _num(snap_row: Dict[str, Any], *fields) -> Optional[float]:
@@ -241,20 +317,26 @@ class EmRulesService:
                 if pr and not pr.endswith("=ECI"):
                     policy_hist_rics.append(pr)
             dh = self._daily_hist(sorted(set(swap_hist_rics + spot_rics + ["LCOc1"])),
-                                  fields=["BID", "ASK", "TRDPRC_1"])
+                                  fields=["BID", "ASK", "TRDPRC_1", "MID_YLD_1"])
             us10 = self._daily_hist([_GLOBAL["us10y"]], fields=["MID_YLD_1", "B_YLD_1"])
             mh = self._monthly_hist(sorted(set(cpi_hist_rics + policy_hist_rics)))
             # REER (10y for the vs-10y-average valuation) + core-CPI econ series
             rh = self._monthly_hist(sorted(set(REER_RICS.values())), years=11)
             ch = self._monthly_hist(sorted(set(list(CORE_SERIES.values())
                                                + list(CORE_INDEX_SERIES.values()))), years=3)
+            # derived-RER inputs: CPI index levels (gap countries + US) + month-end FX
+            dcpi = self._monthly_hist(sorted(set(list(DERIVED_RER_CPI.values())
+                                                 + [_US_CPI_IDX])), years=11)
+            dfx = self._monthly_fx([COUNTRIES[cc]["spot"] for cc in DERIVED_RER_CPI], years=11)
 
             def dvals(ric: str) -> List[float]:
                 out = []
                 for r in dh.get(ric, []):
                     v = r.get("VALUE")
                     if v is None:
-                        for f in ("BID", "TRDPRC_1", "ASK"):
+                        # MID_YLD_1 before BID: bond bars carry yield there and PRICE in
+                        # BID; swap/spot bars have no MID_YLD_1 so they fall through
+                        for f in ("MID_YLD_1", "BID", "TRDPRC_1", "ASK"):
                             if isinstance(r.get(f), (int, float)):
                                 v = r[f]
                                 break
@@ -345,18 +427,33 @@ class EmRulesService:
                 cpi_now = srow["cpiYoY"]
                 srow["core"] = self._num(snap.get(cfg.get("core")), "ECON_ACT", "ECON_PRIOR") \
                     if cfg.get("core") else None
+                srow["coreMeta"] = None
                 if srow["core"] is None and cc in CORE_SERIES:
                     cv = self._vals(ch.get(CORE_SERIES[cc], []))
-                    srow["core"] = round(cv[-1], 2) if cv else None
+                    if cv:
+                        srow["core"] = round(cv[-1], 2)
+                        srow["coreMeta"] = CORE_NOTES.get(cc, {
+                            "kind": "substitute",
+                            "note": f"Official core via LSEG standardized econ series ({CORE_SERIES[cc]}) — no Reuters core poll carried for this country; monthly, can lag the poll-fed rows by a release."})
                 if srow["core"] is None and cc in CORE_INDEX_SERIES:
                     # index level → y/y (Chile CPIEFE): last vs the value ~12 months back
                     cv = self._vals(ch.get(CORE_INDEX_SERIES[cc], []))
                     if len(cv) >= 13 and cv[-13] > 0:
                         srow["core"] = round((cv[-1] / cv[-13] - 1.0) * 100.0, 2)
+                        srow["coreMeta"] = {"kind": "derived",
+                                            "note": "Chile CPIEFE (CPI ex food & energy — Chile's official core concept); y/y DERIVED from the published index level."}
                 # swaps
-                curve = {t: self._num(snap.get(self._swap_ric(cfg, t) or ""), "BID", "PRIMACT_1", "CF_LAST")
+                # bond benchmarks quote PRICE in BID and yield in MID_YLD_1 — for the
+                # frontier curve-subs the yield field must win or "1Y" ≈ 99 (a price)
+                _cf = (("MID_YLD_1", "B_YLD_1", "BID", "PRIMACT_1", "CF_LAST")
+                       if (cfg.get("swap") is None and cc in CURVE_SUBS)
+                       else ("BID", "PRIMACT_1", "CF_LAST"))
+                curve = {t: self._num(snap.get(self._swap_ric(cfg, t) or ""), *_cf)
                          for t in _TENORS}
                 srow["swap"] = curve
+                srow["curveMeta"] = ({"kind": "substitute",
+                                      "note": CURVE_SUB_NOTES.get(cc, _CURVE_SUB_NOTE)}
+                                     if (cfg.get("swap") is None and cc in CURVE_SUBS) else None)
                 srow["cds"] = self._num(snap.get(cfg.get("cds")), "PRIMACT_1", "CF_LAST") \
                     if cfg.get("cds") else None
 
@@ -439,6 +536,7 @@ class EmRulesService:
                 # doubles as a standalone valuation column. LIVE BIS/IMF-style series;
                 # None where no series exists (KZ QA EG MU BW) — never proxied.
                 srow["reer"] = None
+                srow["reerMeta"] = None
                 rr = REER_RICS.get(cc)
                 if rr:
                     rv = self._vals(rh.get(rr, []))
@@ -447,6 +545,22 @@ class EmRulesService:
                         if avg > 0:
                             srow["reer"] = {"vs10yPct": round((rv[-1] / avg - 1.0) * 100.0, 1),
                                             "cheap": bool(rv[-1] < avg)}
+                elif cc in DERIVED_RER_CPI:
+                    # market-convention fallback: bilateral REAL FX vs USD (marked †)
+                    cpi_l = self._mmap(dcpi.get(DERIVED_RER_CPI[cc], []))
+                    cpi_u = self._mmap(dcpi.get(_US_CPI_IDX, []))
+                    fx = dfx.get(cfg["spot"], {})
+                    ser = []
+                    for m in sorted(set(cpi_l) & set(cpi_u) & set(fx)):
+                        if fx[m] > 0 and cpi_u[m] > 0:
+                            ser.append((1.0 / fx[m]) * cpi_l[m] / cpi_u[m])
+                    if len(ser) >= 60:
+                        avg = float(np.mean(ser[-120:]))
+                        if avg > 0:
+                            srow["reer"] = {"vs10yPct": round((ser[-1] / avg - 1.0) * 100.0, 1),
+                                            "cheap": bool(ser[-1] < avg)}
+                            srow["reerMeta"] = {"kind": "derived",
+                                                "note": "DERIVED bilateral real FX vs USD (spot deflated by the CPI differential, vs 10y avg) — no trade-weighted REER series exists for this country; standard desk fallback. Limitation: single-partner (USD) weighting."}
                 if srow["r11"] is not None:
                     srow["r11"]["reerCheap"] = (srow["reer"]["cheap"] if srow["reer"] else None)
                     srow["r11"]["preconditionMet"] = (
@@ -500,9 +614,9 @@ class EmRulesService:
                 "notes": [
                     "Screener only — the book supplies the backtested evidence; verify before trading.",
                     "R1 'since' is approximate (1Y swap history vs CURRENT policy level).",
-                    "Frontier names without swap curves show FX/inflation rules only.",
-                    "REER = BIS real broad (IMF-style for NG/MA/TN/UG) vs 10y avg; none exists for KZ/QA/EG/MU/BW.",
-                    "Core: polls + verified econ series; none published/found for IN/MY/HK/AE/SA/QA/MA/TN/MU/BW.",
+                    "† frontier curves = government bond benchmarks (EG/NG/MU/UG/MA/BW — no IRS exists; TN has none at all): reads embed sovereign credit.",
+                    "REER: BIS real broad (IMF-style NG/MA/TN/UG); † derived bilateral real-FX-vs-USD for KZ/QA/EG/MU/BW.",
+                    "Core: polls + verified econ series (° = substitute convention; IN = WPI core, producer prices); none carried for MY/HK/AE/SA/QA/MA/TN/MU/BW.",
                     "R7 carry/vol comes from the Carry Basket service (frontend reads /api/carry/rank).",
                     "SCORE is a HOUSE composite (votes: R1 ±2 · R2 peaked +1 / rising −1 / flat 0 · R3 ±1 · R4 +1 · R11 −1) — not from the book; R11's vote uses only the σ-count half of the book's precondition.",
                 ],

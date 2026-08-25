@@ -29,6 +29,19 @@ function Chip({ text, tone }) {
   );
 }
 
+// Substitution marker: ° = a different official/market series stands in (its own
+// country's convention), † = a value DERIVED by market convention from real inputs.
+// Hover shows the reason; the ⓘ manual carries the full substitution table.
+function Mark({ meta }) {
+  if (!meta || !meta.note) return null;
+  return (
+    <span title={meta.note}
+      style={{ color: C.amber, fontSize: 9, cursor: "help", marginLeft: 2, fontWeight: 800 }}>
+      {meta.kind === "derived" ? "†" : "°"}
+    </span>
+  );
+}
+
 function GCard({ label, value, state, bad, warn, sub }) {
   const col = bad ? C.down : warn ? C.amber : null;
   return (
@@ -169,10 +182,11 @@ export default function EmRules() {
                     </td>
                     <td style={td}>{F(r.policy, 2)}</td>
                     <td style={td}>{F(r.cpiYoY, 2)}</td>
-                    <td style={{ ...td, color: C.sub }}>{F(r.core, 1)}</td>
+                    <td style={{ ...td, color: C.sub }}>{F(r.core, 1)}<Mark meta={r.coreMeta} /></td>
                     <td style={td}>
                       {r1 ? <Chip text={`${r1.state} ${FP(r1.gap1y, 2)}${r1.since ? " · " + r1.since : ""}`}
                                   tone={r1.state === "RECEIVE" ? "up" : r1.state === "PAY" ? "down" : undefined} /> : "—"}
+                      <Mark meta={r.curveMeta} />
                     </td>
                     <td style={td}>{r2 ? <Chip text={r2.peaked ? "PEAKED" : r2.rising ? "rising" : "flat"} tone={r2.peaked ? "up" : r2.rising ? "warn" : undefined} /> : "—"}</td>
                     <td style={{ ...td, color: (r3.real ?? 0) >= 0 ? C.text : C.down }}>{FP(r3.real, 2)}</td>
@@ -181,9 +195,9 @@ export default function EmRules() {
                       {r3.rank != null && <span style={{ marginLeft: 5 }}><Chip text={`#${r3.rank}`} tone={rankTone} /></span>}
                     </td>
                     <td style={{ ...td, color: (r4?.z3m ?? 0) > 1 ? C.up : C.sub }}>
-                      {r4 ? `${F(r4.tp, 2)} · z${FP(r4.z3m, 1)}` : "—"}
+                      {r4 ? `${F(r4.tp, 2)} · z${FP(r4.z3m, 1)}` : "—"}<Mark meta={r.curveMeta} />
                     </td>
-                    <td style={{ ...td, color: C.sub }}>{r5 ? `${r5.pair} ${FP(r5.slopeBp, 0)} (${FP(r5.chg3mBp, 0)})` : "—"}</td>
+                    <td style={{ ...td, color: C.sub }}>{r5 ? `${r5.pair} ${FP(r5.slopeBp, 0)} (${FP(r5.chg3mBp, 0)})` : "—"}{r5 ? <Mark meta={r.curveMeta} /> : null}</td>
                     <td style={{ ...td, color: C.sub }}>{cr && cr.carry != null ? FP(cr.carry, 2) : "—"}</td>
                     <td style={{ ...td, color: (r8?.mom1m ?? 0) >= 0 ? C.up : C.down }}>
                       {r8 ? `${FP(r8.mom1m, 1)}% · ${r8.upDays21}/21` : "—"}
@@ -192,7 +206,7 @@ export default function EmRules() {
                       {r11 ? <Chip text={String(r11.sigmaMoves100d)} tone={r11.preconditionMet ? "down" : r11.stressed ? "warn" : undefined} /> : "—"}
                     </td>
                     <td style={{ ...td, color: r.reer ? (r.reer.cheap ? C.up : C.down) : C.dim }}>
-                      {r.reer ? `${FP(r.reer.vs10yPct, 0)}%` : "—"}
+                      {r.reer ? `${FP(r.reer.vs10yPct, 0)}%` : "—"}<Mark meta={r.reerMeta} />
                     </td>
                     <td style={{ ...td, color: C.sub }}>{F(r.cds, 0)}</td>
                     <td style={td} title={r.score ? Object.entries(r.score.parts).map(([k, v]) => `${k} ${v > 0 ? "+" : ""}${v}`).join(" · ") : "no rules computed"}>
