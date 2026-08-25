@@ -8,6 +8,7 @@
 // manual rebuild; this tab never polls.
 import React, { useEffect, useState, useCallback } from "react";
 import { F, FP } from "../calc.js";
+import { InfoButton } from "./InfoDoc.jsx";
 
 const C = {
   bg: "#0B1220", panel: "#0F172A", panel2: "#131C2E", border: "#1E293B",
@@ -28,12 +29,13 @@ function Chip({ text, tone }) {
   );
 }
 
-function GCard({ label, value, state, bad, sub }) {
+function GCard({ label, value, state, bad, warn, sub }) {
+  const col = bad ? C.down : warn ? C.amber : null;
   return (
-    <div style={{ background: C.panel, border: `1px solid ${bad ? C.down : C.border}`, borderRadius: 8, padding: "8px 12px", minWidth: 150 }}>
+    <div style={{ background: C.panel, border: `1px solid ${col || C.border}`, borderRadius: 8, padding: "8px 12px", minWidth: 150 }}>
       <div style={{ fontSize: 9, letterSpacing: ".1em", color: C.dim, fontWeight: 700 }}>{label}</div>
-      <div style={{ fontFamily: C.mono, fontSize: 16, fontWeight: 600, color: bad ? C.down : C.text, marginTop: 2 }}>{value}</div>
-      <div style={{ fontSize: 9, color: bad ? C.down : C.sub, marginTop: 1 }}>{state}{sub ? ` · ${sub}` : ""}</div>
+      <div style={{ fontFamily: C.mono, fontSize: 16, fontWeight: 600, color: col || C.text, marginTop: 2 }}>{value}</div>
+      <div style={{ fontSize: 9, color: col || C.sub, marginTop: 1 }}>{state}{sub ? ` · ${sub}` : ""}</div>
     </div>
   );
 }
@@ -43,6 +45,7 @@ const REGION_ORDER = ["Latam", "CEEMEA", "Asia", "GCC", "Africa"];
 export default function EmRules() {
   const [data, setData] = useState(null);
   const [carry, setCarry] = useState({});
+  const [carryErr, setCarryErr] = useState(null);
   const [err, setErr] = useState(null);
   const [busy, setBusy] = useState(false);
 
@@ -57,12 +60,25 @@ export default function EmRules() {
   }, []);
   useEffect(() => { load(false); }, [load]);
   useEffect(() => {   // R7 carry from the Carry Basket service (cached 90s server-side)
-    fetch("/api/carry/rank").then((r) => r.json()).then((j) => {
-      const list = j.rows || j.rank || j.ranked || [];
-      const m = {};
-      list.forEach((r) => { const k = r.ccy || r.code; if (k) m[k] = r; });
-      setCarry(m);
-    }).catch(() => {});
+    let alive = true;
+    const load = async () => {
+      try {
+        const r = await fetch("/api/carry/rank");
+        const j = await r.json().catch(() => null);
+        if (!alive) return;
+        if (!r.ok) {   // no-proxy rule: a failed rank must be visible, not a silent "—" column
+          setCarryErr((j && (j.detail || j.error)) || `HTTP ${r.status}`);
+          return;
+        }
+        const list = j.rows || j.rank || j.ranked || [];
+        const m = {};
+        list.forEach((r2) => { const k = r2.ccy || r2.code; if (k) m[k] = r2; });
+        setCarry(m); setCarryErr(null);
+      } catch (e) { if (alive) setCarryErr(e?.message || "network error"); }
+    };
+    load();
+    const retry = setTimeout(load, 60000);   // one retry covers a transient rank outage; server-cached so it's cheap
+    return () => { alive = false; clearTimeout(retry); };
   }, []);
 
   if (err) return <div style={{ padding: 30, color: C.down, fontFamily: C.mono, fontSize: 12 }}>EM Rules failed: {err}</div>;
@@ -84,21 +100,32 @@ export default function EmRules() {
       {/* global overlays */}
       <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 12, alignItems: "stretch" }}>
         <GCard label="R6 · RISK OVERLAY" value={g.r6?.maxZ != null ? `z ${g.r6.maxZ}` : "—"}
-          state={g.r6?.state} bad={g.r6?.state === "CUT EXPOSURE"}
-          sub={Object.entries(g.r6?.z || {}).map(([k, v]) => `${k} ${v}`).join(" · ")} />
+          state={g.r6?.state} bad={g.r6?.state === "CUT EXPOSURE"} warn={g.r6?.state === "no data"}
+          sub={["realized-vol proxy", ...Object.entries(g.r6?.z || {}).map(([k, v]) => `${k} ${v}`)].join(" · ")} />
         <GCard label="R9 · UST 10Y Δ3M" value={g.r9?.ust3mBp != null ? `${FP(g.r9.ust3mBp, 0)}bp` : "—"}
-          state={g.r9?.state} bad={g.r9?.state !== "ok"} sub=">+100bp = EMFX negative" />
+          state={g.r9?.state} bad={g.r9?.state === "EMFX NEGATIVE"} warn={g.r9?.state === "no data"}
+          sub=">+100bp = EMFX negative" />
         <GCard label="R10 · CNH 12M FWD" value={g.r10?.cnh12mPct != null ? `${FP(g.r10.cnh12mPct, 2)}%` : "—"}
-          state={g.r10?.state} bad={g.r10?.state !== "ok"} sub=">+5% dep = extended shorts" />
+          state={g.r10?.state} bad={g.r10?.state === "EXTENDED SHORTS"} warn={g.r10?.state === "no data"}
+          sub=">+5% dep = extended shorts" />
         <div style={{ flex: 1 }} />
         <div style={{ display: "flex", flexDirection: "column", justifyContent: "center", gap: 4, alignItems: "flex-end" }}>
-          <button onClick={() => load(true)} disabled={busy}
-            style={{ background: C.panel2, color: C.cyan, border: `1px solid ${C.border}`, borderRadius: 6, padding: "6px 14px", fontSize: 10, fontWeight: 800, letterSpacing: ".08em", cursor: "pointer" }}>
-            {busy ? "REBUILDING…" : "REBUILD"}
-          </button>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <InfoButton docKey="rules" />
+            <button onClick={() => load(true)} disabled={busy}
+              style={{ background: C.panel2, color: C.cyan, border: `1px solid ${C.border}`, borderRadius: 6, padding: "6px 14px", fontSize: 10, fontWeight: 800, letterSpacing: ".08em", cursor: "pointer" }}>
+              {busy ? "REBUILDING…" : "REBUILD"}
+            </button>
+          </div>
           <div style={{ fontSize: 8.5, color: C.dim, fontFamily: C.mono }}>built {String(data.asOf).slice(5, 16)} · {data.buildSecs}s · cached 12h</div>
         </div>
       </div>
+
+      {carryErr && (
+        <div style={{ marginBottom: 10, padding: "7px 11px", borderRadius: 6, background: "rgba(251,191,36,0.10)", border: `1px solid ${C.amber}55`, color: C.amber, fontSize: 10, fontWeight: 600 }}>
+          CARRY column unavailable — {carryErr} (Carry Basket rank service; "—" below means unfetched, not unpriced)
+        </div>
+      )}
 
       {/* the matrix */}
       <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 8, overflow: "auto", maxHeight: "72vh" }}>

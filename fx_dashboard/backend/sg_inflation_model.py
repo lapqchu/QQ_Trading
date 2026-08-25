@@ -546,12 +546,16 @@ class SgInflationModel:
                 "backtest": backtest,
                 "surpriseLog": surprise_log,
                 "policy": {
+                    # No-proxy rule: if the core nowcast failed, the gap/read are
+                    # unknowable — return None (UI shows "—"), never a 0-based gap.
                     "reactionPrior": {
-                        "coreGap": round((nowcast.get("coreYoY") or 0) - 2.0, 2),
+                        "coreGap": (round(nowcast["coreYoY"] - 2.0, 2)
+                                    if nowcast.get("coreYoY") is not None else None),
                         "outputGap": 0.7,
                         "rule": "MR Oct-18 Box A: slope ← core gap (vs ~2% medium-term) + output gap; MR Oct-21 SF A: +1pp expected inflation → +1.7% NEER, +1pp gap → +0.9%",
-                        "read": ("tightening bias" if (nowcast.get("coreYoY") or 0) > 2.0
-                                 else "neutral-to-tightening" if (nowcast.get("coreYoY") or 0) > 1.5
+                        "read": (None if nowcast.get("coreYoY") is None
+                                 else "tightening bias" if nowcast["coreYoY"] > 2.0
+                                 else "neutral-to-tightening" if nowcast["coreYoY"] > 1.5
                                  else "neutral"),
                     },
                     "spfNextMeeting": SPF_NEXT_MEETING,

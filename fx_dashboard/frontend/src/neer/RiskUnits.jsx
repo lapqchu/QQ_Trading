@@ -12,6 +12,7 @@
 // vol — so typing a size doesn't hammer the LSEG feed.
 import React, { useEffect, useState, useCallback } from "react";
 import { F, FP } from "../calc.js";
+import { InfoButton } from "./InfoDoc.jsx";
 
 // ── Dark theme (mirrors NeerApp / the pricer) ──
 const C = {
@@ -223,6 +224,7 @@ export default function RiskUnits() {
         <div style={{ display: "flex", flexWrap: "wrap", alignItems: "baseline", gap: 12, paddingBottom: 12, borderBottom: `1px solid ${C.border}` }}>
           <span style={{ fontSize: 16, fontWeight: 900, letterSpacing: ".05em", color: C.text }}>RISK UNITS</span>
           <span style={{ fontSize: 10, color: C.sub }}>vol-based position sizing — size a known product to a USD risk budget</span>
+          <span style={{ marginLeft: "auto", alignSelf: "center" }}><InfoButton docKey="risk" /></span>
         </div>
 
         {/* ── Body: inputs + results ── */}

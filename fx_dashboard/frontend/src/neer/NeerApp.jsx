@@ -4,6 +4,7 @@ import React, { useEffect, useState, useCallback } from "react";
 import Plot from "react-plotly.js";
 import { F, FP } from "../calc.js";
 import NeerAnalysis from "./NeerAnalysis.jsx";
+import { InfoButton } from "./InfoDoc.jsx";
 
 // ── Dark theme (mirrors the pricer) ──
 const C = {
@@ -242,7 +243,7 @@ function IntradayPanel() {
         <span style={{ fontFamily: C.mono, fontSize: 12, fontWeight: 700, color: C.cyan }}>{num(last, 3)}</span>
         {btns}
       </div>}
-      note={hasData ? `${d.interval || ""} bars · ${d.count ?? times.length} pts · ceiling ${num(d.upper, 2)} / mid ${num(d.midpoint, 2)} / floor ${num(d.lower, 2)} · polls 30s` : null}>
+      note={hasData ? `${d.interval || ""} bars · ${d.count ?? times.length} pts · ceiling ${num(d.upper, 2)} / mid ${num(d.midpoint, 2)} / floor ${num(d.lower, 2)} · polls 60s` : null}>
       {body}
     </Panel>
   );
@@ -469,7 +470,7 @@ export default function NeerApp() {
     return () => { alive = false; clearInterval(id); document.removeEventListener("visibilitychange", onVis); };
   }, []);
 
-  // History (10y daily band): STATIC — fetch once, refresh only hourly. The live
+  // History (~2y / 760d daily band): STATIC — fetch once, refresh only hourly. The live
   // position updates via the 20s snapshot poll (the last point effectively ticks
   // through the gauge/readout); no need to re-pull the whole series every tick.
   useEffect(() => {
@@ -505,7 +506,9 @@ export default function NeerApp() {
   const metrics = snap?.metrics;
   const sora = snap?.sora;
   const carry = snap?.carry;
-  const live = lastOk && (Date.now() - lastOk < 20000) && !error;
+  // Freshness window ≈ 2× the 45s poll interval: renders between polls (tab clicks,
+  // hourly history load) must not flip a healthy feed to STALE.
+  const live = lastOk && (Date.now() - lastOk < 100000) && !error;
 
   const wrap = { maxWidth: 1360, margin: "0 auto", padding: "12px 16px 40px" };
   const gridStyle = { display: "grid", gap: 12 };
@@ -530,7 +533,7 @@ export default function NeerApp() {
         </div>
 
         {/* ── Tab bar ── */}
-        <div style={{ display: "flex", gap: 4, marginTop: 10, borderBottom: `1px solid ${C.border}` }}>
+        <div style={{ display: "flex", gap: 4, marginTop: 10, borderBottom: `1px solid ${C.border}`, alignItems: "center" }}>
           {[["monitor", "MONITOR"], ["analysis", "ANALYSIS"]].map(([id, lbl]) => {
             const on = activeTab === id;
             return (
@@ -542,6 +545,8 @@ export default function NeerApp() {
               }}>{lbl}</button>
             );
           })}
+          <div style={{ flex: 1 }} />
+          <InfoButton docKey={`neer.${activeTab}`} />
         </div>
 
         {/* ── error banner ── */}
@@ -587,7 +592,8 @@ export default function NeerApp() {
 
         {/* ── 2. Band position gauge (prominent) ── */}
         <div style={{ marginTop: 8 }}>
-          <Panel title="Band Position — Policy Band (floor → ceiling)" style={{ borderColor: "#334155" }}>
+          <Panel title="Band Position — Policy Band (floor → ceiling)" style={{ borderColor: "#334155" }}
+            note="band parameters (slope · width ±2% · midpoint anchor) are street/model ESTIMATES — MAS does not disclose them; see the ⓘ manual and the Calibration panel for how the replica is validated">
             <BandGauge neer={neer} metrics={metrics} />
           </Panel>
         </div>
@@ -639,7 +645,7 @@ export default function NeerApp() {
         </div>
 
         <div style={{ marginTop: 16, textAlign: "center", fontSize: 8.5, color: C.dim }}>
-          SGD NEER deep-dive · live 20s · history cached (hourly) · intraday 30s · replicated basket (Barclays weights)
+          SGD NEER deep-dive · snapshot 45s · history cached (hourly) · intraday 60s · replicated basket (Barclays weight estimates; band = street estimates)
         </div>
 
         </>)}

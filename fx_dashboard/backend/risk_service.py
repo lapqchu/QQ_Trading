@@ -148,15 +148,20 @@ class RiskService:
     def _ffiy_series(self, cfg, near_m: int, far_m: int) -> List[Tuple[str, float]]:
         """Daily forward-forward implied-yield (%) series for a near×far curve trade.
         SOFR held at current level (its daily change is negligible vs FX points)."""
+        pf = cfg.pip_factor or 1.0
+        dn, df = _days(near_m), _days(far_m)
+        # current USD curve (constant across history) — checked FIRST so a SOFR outage
+        # fails fast instead of after three 400d history fetches.
+        sof_n = self._snap_mid(self._sofr_ric(near_m))
+        sof_f = self._snap_mid(self._sofr_ric(far_m))
+        if sof_n is None or sof_f is None or not (0 < sof_n < 20) or not (0 < sof_f < 20):
+            # No-proxy rule: never substitute an assumed SOFR — fail visibly
+            # (vol() converts this into the UI's amber "vol unavailable" note).
+            raise RuntimeError(f"USD SOFR OIS unusable (near={sof_n}, far={sof_f}) — fwd-fwd rate not computed (no fallback rate)")
+        usd = DiscountCurve.from_ois({dn: sof_n, df: sof_f})
         spot = dict(self._hist_mid(cfg.spot_ric))
         near_pts = dict(self._hist_mid(cfg.swap_points_ric(near_m)))
         far_pts = dict(self._hist_mid(cfg.swap_points_ric(far_m)))
-        pf = cfg.pip_factor or 1.0
-        dn, df = _days(near_m), _days(far_m)
-        # current USD curve (constant across history)
-        sof_n = self._snap_mid(self._sofr_ric(near_m)) or 4.3
-        sof_f = self._snap_mid(self._sofr_ric(far_m)) or 4.3
-        usd = DiscountCurve.from_ois({dn: sof_n, df: sof_f})
         out = []
         for dt in sorted(set(spot) & set(near_pts) & set(far_pts)):
             s = spot[dt]

@@ -274,14 +274,19 @@ class EmRulesService:
             if cnh_spot and cnh_pts is not None:
                 r10 = round(cnh_pts / _CNH_PIP / cnh_spot * 100.0, 2)   # % 12m depreciation priced
 
+            # No-proxy rule: a missing input must read "no data", never default to
+            # the benign state ("risk on"/"ok") — that renders an outage as an all-clear.
             global_block = {
                 "r6": {"maxZ": r6_max, "z": vol_z, "vixLive": vix_live,
-                       "state": "CUT EXPOSURE" if (r6_max or 0) > 2 else "risk on",
+                       "state": ("no data" if r6_max is None
+                                 else "CUT EXPOSURE" if r6_max > 2 else "risk on"),
                        "rule": "max z of EMFX/US-rates/oil REALIZED vol > 2 → cut "
                                "(realized proxy — IV history not entitled on this Workspace)"},
-                "r9": {"ust3mBp": r9, "state": "EMFX NEGATIVE" if (r9 or 0) > 100 else "ok",
+                "r9": {"ust3mBp": r9, "state": ("no data" if r9 is None
+                                                else "EMFX NEGATIVE" if r9 > 100 else "ok"),
                        "rule": "UST 10Y +100bp in 3m is reliably EMFX-negative"},
-                "r10": {"cnh12mPct": r10, "state": "EXTENDED SHORTS" if (r10 or 0) > 5 else "ok",
+                "r10": {"cnh12mPct": r10, "state": ("no data" if r10 is None
+                                                    else "EXTENDED SHORTS" if r10 > 5 else "ok"),
                         "rule": "CNH 12M fwd >5% weaker than spot = extended positioning"},
             }
 

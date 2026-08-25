@@ -163,7 +163,7 @@ class CarryBasketService:
     def _sofr_1m(self) -> float:
         if self._sofr_cache and (_t.time() - self._sofr_cache[0]) < 300:
             return self._sofr_cache[1]
-        val = 4.3
+        val = None
         try:
             snap = self.lseg.get_snapshot([SOFR_RICS[1]], SNAP_FIELDS)
             q = snap.get(SOFR_RICS[1]) or {}
@@ -176,6 +176,12 @@ class CarryBasketService:
                 val = v
         except Exception:
             log.exception("carry: SOFR 1M snapshot failed")
+        if val is None:
+            # No-proxy rule: every impliedYield/carry in the rank keys off this rate,
+            # so an assumed fallback would silently poison the whole table. Fail the
+            # build visibly instead (surfaces as the amber banner in the UI); the
+            # failure is not cached, so the next poll retries.
+            raise RuntimeError(f"1M SOFR OIS ({SOFR_RICS[1]}) unavailable — carry rank not computed (no fallback rate)")
         self._sofr_cache = (_t.time(), val)
         return val
 
@@ -238,6 +244,10 @@ class CarryBasketService:
         if not force and self._rank_cache and (_t.time() - self._rank_cache[0]) < 90:
             return self._rank_cache[1]
 
+        # SOFR first: it can raise (no-fallback rule), and it is a single-RIC snapshot —
+        # fail fast BEFORE burning the full-universe snapshot on every 120s retry.
+        sofr = self._sofr_1m()
+
         uni = self._universe()
         rics: List[str] = []
         for u in uni:
@@ -257,7 +267,6 @@ class CarryBasketService:
         except Exception:
             log.exception("carry: rank snapshot failed")
 
-        sofr = self._sofr_1m()
         # USD curves cached by day count (only a couple distinct values across the universe)
         usd_by_days: Dict[int, DiscountCurve] = {}
 

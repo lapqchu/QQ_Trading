@@ -14,6 +14,7 @@
 //   POST /api/carry/basket {longs,shorts,sizingMode,weighting,window} → sized book
 import React, { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import { F, FP } from "../calc.js";
+import { InfoButton } from "./InfoDoc.jsx";
 
 // ── Dark theme (mirrors NeerApp / RiskUnits / the pricer) ──
 const C = {
@@ -105,7 +106,7 @@ export default function CarryBasket() {
   const [bookErr, setBookErr] = useState(null);
   const [bookLoading, setBookLoading] = useState(false);
 
-  // ── Yield rank (poll 60s; yields move slowly) ──
+  // ── Yield rank (poll 120s, visible tab only; yields move slowly) ──
   useEffect(() => {
     let alive = true;
     const load = async (force) => {
@@ -205,6 +206,7 @@ export default function CarryBasket() {
           <span style={{ marginLeft: "auto", fontSize: 9, color: C.dim, fontFamily: C.mono }}>
             {rank ? `as of ${rank.asOf} · SOFR1M ${num(rank.sofr1m, 2)}% · ${rank.nWithData}/${rank.nTotal} priced` : "loading…"}
           </span>
+          <span style={{ alignSelf: "center" }}><InfoButton docKey="carry" /></span>
         </div>
 
         {rankErr && (
@@ -421,7 +423,7 @@ export default function CarryBasket() {
         </div>
 
         <div style={{ fontSize: 8.5, color: C.dim, marginTop: 14, lineHeight: 1.6 }}>
-          Rank on 1M forward-implied yield vs USD (CIP); NDF names use the offshore NDF-implied yield (NGN/EGP derived from broker outrights where the composite point is null). Day count is holiday-adjusted (US + local calendar, T+1 for CAD/TRY/RUB/PHP) — matches the pricer to &lt;1bp for 40/42; a couple of names (e.g. INR) can differ ≤1 day / ~6bp where the holiday-calendar source diverges from the pricer's. Vol = realized daily vol of the currency's appreciation return over the lookback window; book vol from the full covariance of the basket's returns (signed exposures). Sizing default: vol-neutral short leg, inverse-vol within-leg (JPMorgan / Bloomberg-GSAM convention). rank 60s · sizing on selection change (history cached).
+          Rank on 1M forward-implied yield vs USD (CIP); NDF names use the offshore NDF-implied yield (NGN/EGP derived from broker outrights where the composite point is null). Day count is holiday-adjusted (US + local calendar, T+1 for CAD/TRY/RUB/PHP) — matches the pricer to &lt;1bp for 40/42; a couple of names (e.g. INR) can differ ≤1 day / ~6bp where the holiday-calendar source diverges from the pricer's. Vol = realized daily vol of the currency's appreciation return over the lookback window; book vol from the full covariance of the basket's returns (signed exposures). Sizing default: vol-neutral short leg, inverse-vol within-leg (JPMorgan / Bloomberg-GSAM convention). rank 120s (visible tab only) · sizing on selection change (history cached).
         </div>
       </div>
     </div>

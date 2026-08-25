@@ -11,6 +11,7 @@
 import React, { useEffect, useState, useCallback } from "react";
 import Plot from "react-plotly.js";
 import { F, FP } from "../calc.js";
+import { InfoButton } from "./InfoDoc.jsx";
 
 // ── Dark theme (mirrors NeerApp / the pricer) ──
 const C = {
@@ -485,16 +486,22 @@ function PolicyView({ monitor }) {
   }, []);
   if (!monitor) return <div style={{ padding: 30, color: C.dim, fontSize: 12 }}>Loading…</div>;
   const pol = monitor.policy || {};
+  const act = monitor.activity || {};
   const vint = (monitor.inflation || {}).forecastVintages2026 || [];
   const rp = model?.policy?.reactionPrior;
   const spfN = model?.policy?.spfNextMeeting;
   const proj = model?.phillips?.projection || [];
+  // Phillips path direction computed from the live projection — never hardcoded prose.
+  const projDir = proj.length >= 2 && proj[0].coreYoY != null && proj[proj.length - 1].coreYoY != null
+    ? (proj[proj.length - 1].coreYoY - proj[0].coreYoY > 0.05 ? "rising"
+       : proj[proj.length - 1].coreYoY - proj[0].coreYoY < -0.05 ? "falling" : "flat")
+    : null;
 
   return (
     <div style={{ padding: 14, maxWidth: 1200, margin: "0 auto" }}>
       <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 12 }}>
         <Stat label="NEXT MPS" value="≤ 14 Oct 2026" sub="quarterly · MR same day" color={C.amber} />
-        <Stat label="REACTION PRIOR" value={rp ? rp.read.toUpperCase() : "—"} sub={rp ? `core gap ${FP(rp.coreGap, 2)}pp · output gap +${rp.outputGap}%` : "from model"} color={C.cyan} />
+        <Stat label="REACTION PRIOR" value={rp?.read ? rp.read.toUpperCase() : "—"} sub={rp?.read ? `core gap ${FP(rp.coreGap, 2)}pp · output gap ${FP(act.outputGap2026 ?? rp.outputGap, 1)}%` : "from model (unavailable until nowcast builds)"} color={C.cyan} />
         <Stat label="SPF: OCT SLOPE ↑" value={spfN ? `${spfN.slopeUpPct}%` : "—"} sub="of respondents (Jun-26 survey)" />
         <Stat label="M2 CORE @ OCT MPS" value={proj.length >= 3 ? `${proj[2].coreYoY}%` : "—"} sub="Phillips projection for Sep y/y" />
       </div>
@@ -502,7 +509,7 @@ function PolicyView({ monitor }) {
         <Panel title="POLICY REACTION FRAMEWORK" note="MR Oct-2018 Box A · MR Oct-2021 SF A">
           <div style={{ fontSize: 11.5, color: C.sub, lineHeight: 1.7 }}>
             <p style={{ margin: "4px 0" }}>MAS's estimated rule: <span style={{ color: C.text }}>band slope ← core-inflation gap (vs ~2% medium-term) + output gap</span>. Estimated sensitivities: +1pp expected inflation → +1.7% NEER appreciation; +1pp output gap → +0.9%.</p>
-            <p style={{ margin: "4px 0" }}>Current inputs: core nowcast <span style={{ fontFamily: C.mono, color: C.cyan }}>{model?.nowcast?.coreYoY ?? "—"}%</span> (gap {rp ? FP(rp.coreGap, 2) : "—"}pp), output gap <span style={{ fontFamily: C.mono, color: C.cyan }}>+0.7%</span> (MR Jul-26), Phillips path rising into year-end → <span style={{ color: C.amber, fontWeight: 700 }}>{rp?.read || "—"}</span>.</p>
+            <p style={{ margin: "4px 0" }}>Current inputs: core nowcast <span style={{ fontFamily: C.mono, color: C.cyan }}>{model?.nowcast?.coreYoY ?? "—"}%</span> (gap {rp?.coreGap != null ? FP(rp.coreGap, 2) : "—"}pp), output gap <span style={{ fontFamily: C.mono, color: C.cyan }}>{act.outputGap2026 != null ? FP(act.outputGap2026, 1) + "%" : "—"}</span> (MR Jul-26), Phillips path {projDir ? `${projDir} over the projection` : "— (model unavailable)"} → <span style={{ color: C.amber, fontWeight: 700 }}>{rp?.read || "—"}</span>.</p>
             <p style={{ margin: "4px 0", color: C.dim, fontSize: 10 }}>{spfN?.note}</p>
           </div>
         </Panel>
@@ -562,6 +569,8 @@ function NowcastView() {
   if (!data) return <div style={{ padding: 30, color: C.dim, fontSize: 12 }}>Loading high-frequency trackers…</div>;
 
   const t = data.tariff || {};
+  const staleSrc = [["coe", data.coe], ["fao", data.fao], ["hdbRent", data.hdbRent]]
+    .filter(([, v]) => v?.stale || v?.error).map(([k]) => k);
   const coeH = data.coe?.history || {};
   const coeLatest = data.coe?.latest || {};
   const coeTraces = [["Category A", C.cyan], ["Category B", C.blue], ["Category E", C.violet]]
@@ -579,7 +588,7 @@ function NowcastView() {
         <Stat label="TARIFF NOW" value={`${t.currentTariffCents}¢`} sub={`${t.asOf} · energy ${t.energyComponentCents}¢`} color={C.amber} />
         <Stat label="NEXT-Q TARIFF EST" value={t.estNextStepPct != null ? `${FP(t.estNextStepPct, 1)}%` : "—"} sub={`window ${t.windowForNext?.daysIn}d in · Brent ${F(t.windowForNext?.brentAvgSoFar, 1)} vs ${F(t.windowForCurrent?.brentAvg, 1)}`} color={C.cyan} />
         <Stat label="BRENT" value={data.brent?.values?.length ? F(data.brent.values[data.brent.values.length - 1], 2) : "—"} sub="LCOc1 · drives tariff + imported energy" />
-        <Stat label="FAO FOOD Y/Y" value={data.fao?.yoy?.values?.length ? `${FP(data.fao.yoy.values[data.fao.yoy.values.length - 1], 1)}%` : "—"} sub={`index ${data.fao?.index?.values?.length ? F(data.fao.index.values[data.fao.index.values.length - 1], 1) : "—"} · leads food CPI 3–6m`} />
+        <Stat label="FAO FOOD Y/Y" value={data.fao?.yoy?.values?.length ? `${FP(data.fao.yoy.values[data.fao.yoy.values.length - 1], 1)}%` : "—"} sub={`index ${data.fao?.index?.values?.length ? F(data.fao.index.values[data.fao.index.values.length - 1], 1) : "—"} · feeds food CPI via import prices`} />
         <Stat label="HDB 4RM RENT Y/Y" value={data.hdbRent?.yoy?.values?.length ? `${FP(data.hdbRent.yoy.values[data.hdbRent.yoy.values.length - 1], 1)}%` : "—"} sub="avg of town medians · leads accommodation 4–8q" />
         <Stat label="COE CAT A" value={coeLatest["Category A"] ? `${Math.round(coeLatest["Category A"].premium / 1000)}k` : "—"} sub={`latest exercise ${coeLatest["Category A"]?.exercise || ""}`} />
         <div style={{ flex: 1 }} />
@@ -588,7 +597,9 @@ function NowcastView() {
             style={{ background: C.panel2, color: C.cyan, border: `1px solid ${C.border}`, borderRadius: 6, padding: "6px 14px", fontSize: 10, fontWeight: 800, letterSpacing: ".08em", cursor: "pointer" }}>
             {busy ? "REFRESHING…" : "REFRESH"}
           </button>
-          <div style={{ fontSize: 8.5, color: C.dim, fontFamily: C.mono }}>built {String(data.asOf).slice(5, 16)} · {data.buildSecs}s</div>
+          <div style={{ fontSize: 8.5, color: staleSrc.length ? C.amber : C.dim, fontFamily: C.mono }}>
+            built {String(data.asOf).slice(5, 16)} · {data.buildSecs}s{staleSrc.length ? ` · stale: ${staleSrc.join(",")}` : ""}
+          </div>
         </div>
       </div>
 
@@ -603,7 +614,7 @@ function NowcastView() {
         </Panel>
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginBottom: 10 }}>
-        <Panel title="FAO FOOD PRICE INDEX" note="y/y % · leads non-cooked food CPI 3–6m (MR Apr-17 Box B)">
+        <Panel title="FAO FOOD PRICE INDEX" note="y/y % · 0.63 LR pass-through to food import prices; →CPI ~half within 4q (MR Apr-17 Box B)">
           <Lines id="sgn-fao" height={190} series={[line(data.fao?.yoy, "FAO food y/y", C.cyan)]} />
         </Panel>
         <Panel title="HDB RENTS" note="avg of town median 4-room rents, quarterly → accommodation CPI with 4–8q lag">
@@ -643,7 +654,7 @@ export default function SgFundamentals() {
   const SUBTABS = [["monitor", "MONITOR"], ["model", "MODEL"], ["nowcast", "NOWCAST"], ["policy", "POLICY"]];
   return (
     <div>
-      <div style={{ display: "flex", gap: 2, padding: "6px 14px 0", borderBottom: `1px solid ${C.border}`, background: C.bg }}>
+      <div style={{ display: "flex", gap: 2, padding: "6px 14px 0", borderBottom: `1px solid ${C.border}`, background: C.bg, alignItems: "center" }}>
         {SUBTABS.map(([id, lbl]) => {
           const on = tab === id;
           return (
@@ -655,6 +666,8 @@ export default function SgFundamentals() {
             </button>
           );
         })}
+        <div style={{ flex: 1 }} />
+        <InfoButton docKey={`fund.${tab}`} />
       </div>
       {tab === "monitor" ? <MonitorView data={data} err={err} busy={busy} load={load} />
         : tab === "model" ? <ModelView consensus={data?.consensus?.rows} />
