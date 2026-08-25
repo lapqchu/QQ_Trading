@@ -146,7 +146,7 @@ export default function EmRules() {
               <th style={th} title="R8: 1M FX appreciation vs USD; up-days of 21">R8 MOM</th>
               <th style={th} title="R11: |daily ret|>1σ days in trailing 100d. >30 = stressed (emergency-hike precondition).">R11 σ</th>
               <th style={th}>CDS</th>
-              <th style={th} title="HOUSE composite (not from the book): unweighted rule votes — R1 RECEIVE +2 / PAY −2 · R2 peaked +1, rising −1 · R3 rank top-3 +1 / bottom-3 −1 · R4 z>1 +1 · R11 stressed −1. Positive = receive bias, negative = pay bias.">SCORE</th>
+              <th style={th} title="HOUSE composite (not from the book): rule votes — R1 RECEIVE +2 / PAY −2 · R2 peaked +1 / rising −1 / flat 0 · R3 rank top-3 +1 / bottom-3 −1 · R4 z>1 +1 · R11 stressed −1 (σ-count half only — the REER precondition is unbuilt). Positive = receive bias, negative = pay bias.">SCORE</th>
             </tr>
           </thead>
           <tbody>
@@ -173,7 +173,7 @@ export default function EmRules() {
                       {r1 ? <Chip text={`${r1.state} ${FP(r1.gap1y, 2)}${r1.since ? " · " + r1.since : ""}`}
                                   tone={r1.state === "RECEIVE" ? "up" : r1.state === "PAY" ? "down" : undefined} /> : "—"}
                     </td>
-                    <td style={td}>{r2 ? <Chip text={r2.peaked ? "PEAKED" : "rising"} tone={r2.peaked ? "up" : "warn"} /> : "—"}</td>
+                    <td style={td}>{r2 ? <Chip text={r2.peaked ? "PEAKED" : r2.rising ? "rising" : "flat"} tone={r2.peaked ? "up" : r2.rising ? "warn" : undefined} /> : "—"}</td>
                     <td style={{ ...td, color: (r3.real ?? 0) >= 0 ? C.text : C.down }}>{FP(r3.real, 2)}</td>
                     <td style={td}>
                       {r3.realVsTarget != null ? FP(r3.realVsTarget, 2) : "—"}

@@ -195,7 +195,8 @@ class CarryBasketService:
         multi-year pulls in their own cache (24h-class TTLs) apart from the 420d
         working series."""
         cache = self._deep_hist_cache if deep else self._hist_cache
-        c = cache.get(ric)
+        key = (ric, days) if deep else ric   # deep pulls vary by span — key on both
+        c = cache.get(key)
         if c and (_t.time() - c[0]) < ttl:
             return c[1]
         start = (date.today() - timedelta(days=days)).isoformat()
@@ -212,7 +213,10 @@ class CarryBasketService:
             out.sort()
         except Exception:
             log.exception("carry: history failed for %s", ric)
-        cache[ric] = (_t.time(), out)
+        # never cache an EMPTY series: one transient 429 must not blank a currency
+        # for the whole TTL (it silently drops the name from sizing / the history)
+        if out:
+            cache[key] = (_t.time(), out)
         return out
 
     @staticmethod
@@ -420,7 +424,7 @@ class CarryBasketService:
         cache; result cached 1h per window."""
         window = window if window in VOL_WINDOWS else 60
         c = self._beta_cache.get(window)
-        if c and (_t.time() - c[0]) < 3600:
+        if c and (_t.time() - c[0]) < 7200:   # matches the history-cache TTL
             return c[1]
         uni = self._universe()
         rets: Dict[str, Dict[str, float]] = {}
@@ -442,7 +446,7 @@ class CarryBasketService:
                 out[u["code"]] = None
                 continue
             common = sorted(set(r) & set(bser))[-window:]
-            if len(common) < max(5, window // 2):
+            if len(common) < window:   # require the FULL window — a partial β is noise
                 out[u["code"]] = None
                 continue
             x = [bser[d] for d in common]
@@ -454,7 +458,8 @@ class CarryBasketService:
             out[u["code"]] = round(cov / varx, 2) if varx > 0 else None
         res = {"window": window, "nBasket": len(em), "betas": out,
                "note": ("β of daily appreciation returns vs equal-weight EM FX basket "
-                        f"({len(em)} members incl. pegged names, which damp it)")}
+                        f"({len(em)} members incl. pegged names, which damp it) · "
+                        "10/20d β is statistically noisy — use 60/90d for funder selection")}
         self._beta_cache[window] = (_t.time(), res)
         return res
 
@@ -500,16 +505,34 @@ class CarryBasketService:
                 if sfx and fwd:
                     mm[dts[:7]] = (fwd, sfx)
             leg_month[code] = mm
+            # interior gaps ≠ late entry: forward-data outages cluster in crisis
+            # months (sanctions, NDF seizure), so disclose them per leg
+            gap_months = 0
+            if mm:
+                y0, mo0 = int(min(mm)[:4]), int(min(mm)[5:7])
+                y1, mo1 = int(max(mm)[:4]), int(max(mm)[5:7])
+                gap_months = max(0, (y1 - y0) * 12 + (mo1 - mo0) + 1 - len(mm))
             leg_out.append({"code": code, "side": "long" if sign > 0 else "short",
                             "notionalUsd": notl, "from": (min(mm) if mm else None),
-                            "nMonths": len(mm)})
+                            "nMonths": len(mm), "gapMonths": gap_months})
         months_all = sorted(set().union(*[set(m) for m in leg_month.values()])) if leg_month else []
+        cur_month = date.today().isoformat()[:7]
+        if months_all and months_all[-1] == cur_month:
+            months_all.pop()   # the forming month is not a month-end — drop it
+
+        def _next_month(m: str) -> str:
+            y, mo = int(m[:4]), int(m[5:7])
+            return f"{y + (mo == 12)}-{(mo % 12) + 1:02d}"
+
         cum = 0.0
         out_months: List[str] = []
         cum_ser: List[float] = []
         mon_ser: List[float] = []
+        active_ser: List[int] = []
         for i in range(1, len(months_all)):
             m0, m1 = months_all[i - 1], months_all[i]
+            if m1 != _next_month(m0):
+                continue   # never book a 1M forward's carry across a multi-month gap
             pnl, active = 0.0, 0
             for code, sign, notl in legs:
                 mm = leg_month.get(code) or {}
@@ -524,13 +547,18 @@ class CarryBasketService:
             out_months.append(m1)
             mon_ser.append(round(pnl, 0))
             cum_ser.append(round(cum, 0))
+            active_ser.append(active)
         return {"months": out_months, "cumPnlUsd": cum_ser, "monthlyPnlUsd": mon_ser,
-                "legs": leg_out,
+                "nLegsActive": active_ser, "nLegs": len(legs), "legs": leg_out,
                 "note": ("per-leg excess return F(1M,t)/S(t+1M)−1 (USD leg cancels — no "
                          "historical USD rate assumed) · today's signed notionals held "
                          "constant → additive cumulative P&L, not compounded NAV · "
-                         "month-end sampling, composite 1M points only · a leg enters "
-                         "when its history begins (see coverage)")}
+                         "month-end sampling, composite 1M points only (per-leg month-ends "
+                         "can differ by a few days) · MID-TO-MID, NO transaction costs — "
+                         "~12 rolls/yr flatters wide-spread NDF legs · a leg enters when "
+                         "its history begins, and interior data gaps (which cluster in "
+                         "crisis months) drop that leg for those months — cliffs can be "
+                         "UNDERSTATED; see gapMonths per leg and the legs-active count")}
 
     def _covariance(self, codes: List[str], window: int) -> Tuple[List[str], List[List[float]], Dict[str, List[float]]]:
         """Sample covariance of daily appreciation returns over the common last-`window`

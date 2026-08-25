@@ -337,13 +337,17 @@ class EmRulesService:
                     srow["r1"] = {"gap1y": gap, "state": state, "since": since}
                 else:
                     srow["r1"] = None
-                # R2 — inflation peaked
+                # R2 — inflation peaked / rising / flat. "rising" (near the recent max
+                # AND above the prior print) is the PAY-side state; flat-at-target is
+                # NEITHER — the book's rule is a hiking-cycle turn-timer with no signal
+                # in the steady state (pegs, long-since-disinflated countries).
                 if len(cpi_series) >= 8:
                     recent = cpi_series[-7:]
                     mx = max(recent)
                     peaked = (recent[-1] < mx - 0.15) and (recent[-1] <= recent[-2] or recent[-2] <= recent[-3])
-                    srow["r2"] = {"peaked": bool(peaked), "latest": round(recent[-1], 2),
-                                  "max6m": round(mx, 2)}
+                    rising = (not peaked) and recent[-1] >= mx - 0.15 and recent[-1] > recent[-2]
+                    srow["r2"] = {"peaked": bool(peaked), "rising": bool(rising),
+                                  "latest": round(recent[-1], 2), "max6m": round(mx, 2)}
                 else:
                     srow["r2"] = None
                 # R3 — real rates
@@ -416,14 +420,17 @@ class EmRulesService:
                     parts["r1"] = (2 if r1s.get("state") == "RECEIVE"
                                    else -2 if r1s.get("state") == "PAY" else 0)
                 if r2s is not None:
-                    parts["r2"] = 1 if r2s.get("peaked") else -1
+                    # peaked +1 · RISING −1 · flat 0 (steady-state inflation is no signal)
+                    parts["r2"] = 1 if r2s.get("peaked") else (-1 if r2s.get("rising") else 0)
                 if r3s.get("rank") is not None and n_ranked >= 6:
                     parts["r3"] = (1 if r3s["rank"] <= 3
                                    else -1 if r3s["rank"] > n_ranked - 3 else 0)
                 if r4s and r4s.get("z3m") is not None:
                     parts["r4"] = 1 if r4s["z3m"] > 1 else 0
-                if r11s and r11s.get("stressed"):
-                    parts["r11"] = -1
+                if r11s and r11s.get("sigmaMoves100d") is not None:
+                    # explicit 0 when computed-and-calm, so the hover can tell
+                    # "voted 0" from "not computable" (mirrors R4)
+                    parts["r11"] = -1 if r11s.get("stressed") else 0
                 r["score"] = ({"total": int(sum(parts.values())), "parts": parts}
                               if parts else None)
 
@@ -438,7 +445,7 @@ class EmRulesService:
                     "R1 'since' is approximate (1Y swap history vs CURRENT policy level).",
                     "Frontier names without swap curves show FX/inflation rules only.",
                     "R7 carry/vol comes from the Carry Basket service (frontend reads /api/carry/rank).",
-                    "SCORE is a HOUSE composite (unweighted votes: R1 ±2 · R2 ±1 · R3 ±1 · R4 +1 · R11 −1) — not from the book.",
+                    "SCORE is a HOUSE composite (votes: R1 ±2 · R2 peaked +1 / rising −1 / flat 0 · R3 ±1 · R4 +1 · R11 −1) — not from the book; R11's vote uses only the σ-count half of the book's precondition.",
                 ],
             }
             self._cache = payload

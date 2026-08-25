@@ -349,8 +349,9 @@ def carry_basket_history(req: _BasketHistReq) -> Dict[str, Any]:
     try:
         longs = [{"code": l.code.upper(), "notionalUsd": l.notionalUsd} for l in req.longs]
         shorts = [c.upper() for c in req.shorts]
+        years = max(1, min(25, req.years))   # bound the per-leg history pull
         return carry.basket_history(longs, shorts, req.sizingMode, req.weighting,
-                                    req.window, req.years)
+                                    req.window, years)
     except Exception as e:
         log.exception("carry_basket_history failed")
         raise HTTPException(500, str(e))

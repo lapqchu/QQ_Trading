@@ -143,7 +143,7 @@ CALENDAR = [  # upcoming releases (MAS/DOS advance release calendar, verified)
     {"date": "2026-09-16", "event": "SPF Q3 survey (NLT)"},
     {"date": "2026-09-17", "event": "NODX Aug"},
     {"date": "2026-09-23", "event": "CPI Aug"},
-    {"date": "2026-09-30", "event": "FX intervention H1-2026 print (~end-Sep)"},
+    {"date": "2026-09-30", "event": "~FX intervention H1-2026 print (end-Sep, timing est)", "est": True},
     {"date": "2026-10-14", "event": "MPS + Macroeconomic Review Oct (NLT)"},
     {"date": "2026-10-23", "event": "CPI Sep"},
 ]
@@ -182,26 +182,50 @@ def _gen_calendar(poll_rows, months_ahead: int = 6):
         if len(date_iso) != 10 or not date_iso[:4].isdigit():
             return
         keys = [(p, date_iso[:7]) for p in prefixes]
-        if any(k in seen for k in keys) or not (today.isoformat() <= date_iso <= horizon):
-            return
-        seen.update(keys)
-        out.append({"date": date_iso, "event": event, "est": est})
+        in_range = today.isoformat() <= date_iso <= horizon
+        if not est:
+            # Confirmed: always claim the topic-months — including already-past dates,
+            # so a release that printed earlier this month doesn't resurface as an
+            # estimate. Display whenever in range (the caller handles poll-vs-curated
+            # duplicate suppression).
+            seen.update(keys)
+            if in_range:
+                out.append({"date": date_iso, "event": event, "est": est})
+        else:
+            # Estimate: only shown for a topic-month nothing has claimed yet.
+            if in_range and any(k not in seen for k in keys):
+                seen.update(keys)
+                out.append({"date": date_iso, "event": event, "est": est})
 
     for r in poll_rows or []:
         rd = r.get("releaseDate")
         if rd:
             lbl = r.get("label") or r.get("key") or "release"
-            # headline + core CPI polls share one print — claim both topics
+            # headline + core CPI polls share one print — claim both topics, and
+            # suppress the second row of an already-claimed print (core after cpi)
             pfx = ["CPI", "Core"] if r.get("key") in ("cpiYoY", "coreYoY") else _topics(lbl)
-            add(rd, f"{lbl} (Reuters poll date)", False, pfx)
+            keys = [(p, str(rd)[:7]) for p in pfx]
+            if any(k not in seen for k in keys):
+                add(rd, f"{lbl} (Reuters poll date)", False, pfx)
+            else:
+                seen.update(keys)
+    seen_confirmed = set(seen)
     for c in CALENDAR:
-        add(c["date"], c["event"], False, _topics(c["event"]))
-    # (event, habitual day-of-month, data-month offset) — anchors from the verified calendar
+        # a curated one-off appears if any of its topics is not already poll-confirmed
+        keys = [(p, str(c["date"])[:7]) for p in _topics(c["event"])]
+        if any(k not in seen_confirmed for k in keys):
+            add(c["date"], c["event"], bool(c.get("est")), _topics(c["event"]))
+        else:
+            seen.update(keys)
+    # (event, habitual day-of-month [31 = month-end], data-month offset) — anchors
+    # from the verified calendar entries above
     MONTHLY = [("CPI", 23, 1), ("Industrial production", 26, 1), ("NODX", 17, 1),
                ("Retail sales", 5, 2), ("Official reserves · weekly S$NEER", 7, 1),
-               ("FAO food price index", 4, 1), ("MAS Monthly Statistical Bulletin", 30, 1)]
-    QUARTERLY = [("MPS + Macroeconomic Review (NLT, timing est)", (1, 4, 7, 10), 14),
-                 ("SPF survey (NLT, timing est)", (3, 6, 9, 12), 16)]
+               ("FAO food price index", 4, 1), ("MAS Monthly Statistical Bulletin", 31, 1)]
+    # MPS/MR habitual timing is late-Jan / mid-Apr / late-Jul / mid-Oct (see
+    # MPS_DECISIONS above) — per-quarter day anchors, not one day for all four
+    QUARTERLY = [("MPS + Macroeconomic Review (NLT, timing est)", {1: 28, 4: 14, 7: 28, 10: 14}),
+                 ("SPF survey (NLT, timing est)", {3: 16, 6: 16, 9: 16, 12: 16})]
     for k in range(months_ahead + 1):
         yy = today.year + (today.month - 1 + k) // 12
         mm = (today.month - 1 + k) % 12 + 1
@@ -210,10 +234,10 @@ def _gen_calendar(poll_rows, months_ahead: int = 6):
             dy, dm = (yy, mm - off) if mm > off else (yy - 1, mm - off + 12)
             add(_dt.date(yy, mm, min(dom, last)).isoformat(),
                 f"~{name} {_dt.date(dy, dm, 1).strftime('%b')}", True, _topics(name))
-        for name, months_t, dom in QUARTERLY:
-            if mm in months_t:
-                add(_dt.date(yy, mm, min(dom, last)).isoformat(), f"~{name}", True,
-                    _topics(name))
+        for name, month_dom in QUARTERLY:
+            if mm in month_dom:
+                add(_dt.date(yy, mm, min(month_dom[mm], last)).isoformat(), f"~{name}",
+                    True, _topics(name))
     out.sort(key=lambda e: e["date"])
     return out
 

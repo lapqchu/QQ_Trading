@@ -136,17 +136,20 @@ export default function CarryBasket() {
     return () => { alive = false; clearInterval(id); document.removeEventListener("visibilitychange", onVis); };
   }, []);
 
-  // β per window; refetch when the vol lookback changes (server caches 1h per window)
+  // β per window; refetch when the vol lookback changes (server caches per window).
+  // Cleared first so a failed refetch shows "—", never the previous window's numbers.
   useEffect(() => {
     let alive = true;
+    setBetas(null);
     fetch(`/api/carry/betas?window=${window}`)
       .then(async (r) => { const j = await r.json().catch(() => null); if (alive && r.ok) setBetas(j); })
       .catch(() => {});
     return () => { alive = false; };
   }, [window]);
 
-  // the 20y chart describes ONE specific book — clear it when the book changes
-  useEffect(() => { setHist(null); setHistErr(null); }, [longs, shorts, sizingMode, weighting]);
+  // the 20y chart describes ONE specific book — clear it when the book (incl. the
+  // window that sizes the vol-neutral shorts) changes
+  useEffect(() => { setHist(null); setHistErr(null); }, [longs, shorts, sizingMode, weighting, window]);
 
   const loadHist = useCallback(() => {
     if (!longs.length || !shorts.length) return;
@@ -449,7 +452,8 @@ export default function CarryBasket() {
                 <div style={{ fontFamily: C.mono, fontSize: 9.5, color: C.sub, marginTop: 6 }}>
                   total {usdM(hist.cumPnlUsd?.[hist.cumPnlUsd.length - 1])} over {hist.months?.length ?? 0} months ·
                   worst month {usdM(hist.monthlyPnlUsd?.length ? Math.min(...hist.monthlyPnlUsd) : null)} ·
-                  coverage: {(hist.legs || []).map((l) => `${l.code} ${l.from ? l.from.slice(0, 7) : "—"}`).join(" · ")}
+                  all-{hist.nLegs}-legs months: {hist.nLegsActive?.length ? hist.nLegsActive.filter((n) => n === hist.nLegs).length : 0}/{hist.months?.length ?? 0} ·
+                  coverage: {(hist.legs || []).map((l) => `${l.code} ${l.from ? l.from.slice(0, 7) : "—"}${l.gapMonths ? ` (${l.gapMonths} gap-mo)` : ""}`).join(" · ")}
                 </div>
                 <div style={{ fontSize: 8.5, color: C.dim, marginTop: 4, lineHeight: 1.5 }}>{hist.note}</div>
               </>)}
@@ -464,7 +468,7 @@ export default function CarryBasket() {
                     <tr>
                       <th style={{ ...th, width: 30 }}>#</th><th style={thL}>Pair</th><th style={thL}>Ccy</th>
                       <th style={th}>Grp</th><th style={th}>Yield%</th><th style={th}>Carry%</th>
-                      <th style={th} title={`${window}d rolling β of daily appreciation returns vs an equal-weight EM FX basket (${betas?.nBasket ?? "…"} names). Funders are often picked low-β — shorting a high-β name hedges EM risk-off; a low-β short is a purer funding trade.`}>β EM</th>
+                      <th style={th} title={`${betas?.window ?? window}d rolling β of daily appreciation returns vs an equal-weight EM FX basket (${betas?.nBasket ?? "…"} names). Funders are often picked low-β — shorting a high-β name hedges EM risk-off; a low-β short is a purer funding trade; β<0 safe-havens (JPY/CHF) concentrate risk-off pain when shorted. 10/20d β is noisy — use 60/90d for selection.`}>β EM</th>
                       <th style={{ ...th, width: 34 }}>d</th><th style={{ ...th, textAlign: "center", width: 84 }}>L / S</th>
                     </tr>
                   </thead>
