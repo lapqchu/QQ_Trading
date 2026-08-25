@@ -42,6 +42,29 @@ if _proxy:
     _session.proxies.update({"http": _proxy, "https": _proxy})
     log.info("ext_data: routing via EXT_DATA_PROXY=%s", _proxy)
 
+# Per-host circuit breaker: on a network that silently drops these hosts (corporate
+# firewall), every fetch would hang to its timeout on every build. After a failure
+# we skip that host for a while and serve the disk snapshot immediately (stale=True),
+# so blocked networks stay fast and the synced .fund_cache does the work.
+_fail_ts: Dict[str, float] = {}
+_FAIL_SKIP_SECS = 600.0
+
+
+def _host(url: str) -> str:
+    return url.split("//", 1)[-1].split("/", 1)[0]
+
+
+def _host_open(url: str) -> bool:
+    t = _fail_ts.get(_host(url))
+    return t is None or (time.time() - t) > _FAIL_SKIP_SECS
+
+
+def _mark_host(url: str, ok: bool) -> None:
+    if ok:
+        _fail_ts.pop(_host(url), None)
+    else:
+        _fail_ts[_host(url)] = time.time()
+
 
 def _cache_path(key: str) -> str:
     safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in key)
@@ -77,14 +100,24 @@ def get_json(url: str, key: str, ttl: float, params: Optional[Dict[str, str]] = 
     if cached and (now - cached.get("fetchedAt", 0)) < ttl:
         cached["stale"] = False
         return cached
+    if not _host_open(url):
+        # host recently unreachable — don't hang on it again, serve the snapshot
+        if cached:
+            cached["stale"] = True
+            cached["error"] = "host unreachable (circuit open; retries ≤10min)"
+            return cached
+        return {"data": None, "fetchedAt": None, "stale": True,
+                "error": "host unreachable (circuit open; retries ≤10min)"}
     try:
         r = _session.get(url, params=params, timeout=timeout)
         r.raise_for_status()
         data = r.json()
+        _mark_host(url, True)
         payload = {"data": data, "fetchedAt": now, "stale": False, "url": r.url}
         _write_cache(key, payload)
         return payload
     except Exception as e:
+        _mark_host(url, False)
         log.warning("ext fetch failed %s (%s): %s", key, url, str(e)[:200])
         if cached:
             cached["stale"] = True
@@ -225,13 +258,18 @@ def fao_food_index(ttl: float = 3 * 86400) -> Dict[str, Any]:
         return cached
     text, err = None, None
     for url in _FAO_URLS:
+        if not _host_open(url):
+            err = "host unreachable (circuit open; retries ≤10min)"
+            break
         try:
             r = _session.get(url, timeout=30)
             r.raise_for_status()
             if "," in r.text[:200]:
+                _mark_host(url, True)
                 text = r.text
                 break
         except Exception as e:
+            _mark_host(url, False)
             err = str(e)[:150]
     if text is None:
         if cached:

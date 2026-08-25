@@ -1,5 +1,6 @@
 __pycache__/
-backend/.fund_cache/
+# .fund_cache is DELIBERATELY tracked: it is the snapshot-sync layer for machines
+# whose network blocks the external statistics hosts (see OFFICE_SETUP.md).
 frontend/dist/
 backend/venv/
 backend/.venv*/

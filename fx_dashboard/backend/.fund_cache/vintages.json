@@ -1,0 +1,40 @@
+{
+ "consensus:cpiYoY:2026-08-24": {
+  "kind": "consensus",
+  "series": "cpiYoY",
+  "releaseDate": "2026-08-24",
+  "mean": 2.31,
+  "high": 2.5,
+  "low": 2.0,
+  "prior": 1.9,
+  "lastSeen": "2026-08-24T22:49:03",
+  "firstSeen": "2026-08-23T23:59:37"
+ },
+ "consensus:coreYoY:2026-08-24": {
+  "kind": "consensus",
+  "series": "coreYoY",
+  "releaseDate": "2026-08-24",
+  "mean": 2.2,
+  "high": 2.3,
+  "low": 1.8,
+  "prior": 1.6,
+  "lastSeen": "2026-08-24T22:49:03",
+  "firstSeen": "2026-08-23T23:59:37"
+ },
+ "nowcast:2026-07": {
+  "kind": "nowcast",
+  "target": "2026-07",
+  "headline": 2.36,
+  "core": 2.22,
+  "lastSeen": "2026-08-23T23:59:43",
+  "firstSeen": "2026-08-23T23:59:43"
+ },
+ "nowcast:2026-08": {
+  "kind": "nowcast",
+  "target": "2026-08",
+  "headline": 2.32,
+  "core": 2.12,
+  "lastSeen": "2026-08-24T22:34:05",
+  "firstSeen": "2026-08-24T22:34:05"
+ }
+}
