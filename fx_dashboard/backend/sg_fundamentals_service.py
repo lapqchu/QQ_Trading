@@ -153,6 +153,71 @@ MAS_RANGE_2026 = {"low": 1.5, "high": 2.5, "asOf": "2026-07-27",
 OUTPUT_GAP_2026 = 0.7   # % of potential GDP, MR Jul 2026 Ch.3 (EPG estimate)
 
 
+def _gen_calendar(poll_rows, months_ahead: int = 6):
+    """Release calendar for the next `months_ahead` months, merged from three layers
+    so the panel never runs dry on a stale hand-maintained horizon:
+      1. vendor-confirmed next release dates from the live Reuters polls (VALUE_DT1),
+      2. the hand-verified one-off entries in CALENDAR (MPS/MR, SPF, FX-intervention),
+      3. recurrence projections from each release's habitual day-of-month — marked
+         est=True (rendered "~"): ESTIMATED timings, never presented as official.
+    Dedupe is per (event-prefix, month): a confirmed date suppresses its estimate."""
+    import calendar as _cal
+    import datetime as _dt
+    today = _dt.date.today()
+    horizon = (today + _dt.timedelta(days=months_ahead * 31)).isoformat()
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    # canonical topics for (topic, month) dedupe — a confirmed entry claims every
+    # topic its wording mentions, suppressing that topic's estimate for the month
+    TOPICS = ["CPI", "Core", "Industrial production", "NODX", "Retail sales",
+              "Official reserves", "FAO", "MAS Monthly Statistical Bulletin",
+              "MPS", "SPF", "GDP", "Unemployment", "FX intervention"]
+
+    def _topics(text: str) -> List[str]:
+        hits = [t for t in TOPICS if t.lower() in text.lower()]
+        return hits or [text.split(" ")[0]]
+
+    def add(date_iso, event: str, est: bool, prefixes: List[str]) -> None:
+        date_iso = str(date_iso)[:10]   # tolerate vendor timestamps ("YYYY-MM-DD hh:mm:ss")
+        if len(date_iso) != 10 or not date_iso[:4].isdigit():
+            return
+        keys = [(p, date_iso[:7]) for p in prefixes]
+        if any(k in seen for k in keys) or not (today.isoformat() <= date_iso <= horizon):
+            return
+        seen.update(keys)
+        out.append({"date": date_iso, "event": event, "est": est})
+
+    for r in poll_rows or []:
+        rd = r.get("releaseDate")
+        if rd:
+            lbl = r.get("label") or r.get("key") or "release"
+            # headline + core CPI polls share one print — claim both topics
+            pfx = ["CPI", "Core"] if r.get("key") in ("cpiYoY", "coreYoY") else _topics(lbl)
+            add(rd, f"{lbl} (Reuters poll date)", False, pfx)
+    for c in CALENDAR:
+        add(c["date"], c["event"], False, _topics(c["event"]))
+    # (event, habitual day-of-month, data-month offset) — anchors from the verified calendar
+    MONTHLY = [("CPI", 23, 1), ("Industrial production", 26, 1), ("NODX", 17, 1),
+               ("Retail sales", 5, 2), ("Official reserves · weekly S$NEER", 7, 1),
+               ("FAO food price index", 4, 1), ("MAS Monthly Statistical Bulletin", 30, 1)]
+    QUARTERLY = [("MPS + Macroeconomic Review (NLT, timing est)", (1, 4, 7, 10), 14),
+                 ("SPF survey (NLT, timing est)", (3, 6, 9, 12), 16)]
+    for k in range(months_ahead + 1):
+        yy = today.year + (today.month - 1 + k) // 12
+        mm = (today.month - 1 + k) % 12 + 1
+        last = _cal.monthrange(yy, mm)[1]
+        for name, dom, off in MONTHLY:
+            dy, dm = (yy, mm - off) if mm > off else (yy - 1, mm - off + 12)
+            add(_dt.date(yy, mm, min(dom, last)).isoformat(),
+                f"~{name} {_dt.date(dy, dm, 1).strftime('%b')}", True, _topics(name))
+        for name, months_t, dom in QUARTERLY:
+            if mm in months_t:
+                add(_dt.date(yy, mm, min(dom, last)).isoformat(), f"~{name}", True,
+                    _topics(name))
+    out.sort(key=lambda e: e["date"])
+    return out
+
+
 # ───────────────────────── helpers ─────────────────────────
 def _yoy(dates: List[str], values: List[float]) -> Dict[str, List]:
     """% y/y from a monthly (or quarterly) index level series keyed by month-end dates."""
@@ -607,7 +672,7 @@ class SgFundamentalsService:
                     "nextMeeting": "NLT 2026-10-14",
                     "spf": SPF_LATEST,
                 },
-                "calendar": CALENDAR,
+                "calendar": _gen_calendar(polls.get("rows")),
                 "sources": {
                     "cpiGroups": {"stale": cpi_tbl.get("stale"), "lastUpdated": cpi_tbl.get("lastUpdated"), "error": cpi_tbl.get("error")},
                     "coreGroups": {"stale": core_tbl.get("stale"), "error": core_tbl.get("error")},

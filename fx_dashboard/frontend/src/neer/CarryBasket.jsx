@@ -13,6 +13,7 @@
 //   GET  /api/carry/rank                → 1M fwd-implied yield rank (EM + G10)
 //   POST /api/carry/basket {longs,shorts,sizingMode,weighting,window} → sized book
 import React, { useEffect, useState, useCallback, useRef, useMemo } from "react";
+import Plot from "react-plotly.js";
 import { F, FP } from "../calc.js";
 import { InfoButton } from "./InfoDoc.jsx";
 
@@ -106,6 +107,13 @@ export default function CarryBasket() {
   const [bookErr, setBookErr] = useState(null);
   const [bookLoading, setBookLoading] = useState(false);
 
+  // β vs equal-weight EM basket (window = the vol lookback) — rank-table column
+  const [betas, setBetas] = useState(null);
+  // 20y basket history (on demand — heavy pull, cached 24h server-side)
+  const [hist, setHist] = useState(null);
+  const [histErr, setHistErr] = useState(null);
+  const [histLoading, setHistLoading] = useState(false);
+
   // ── Yield rank (poll 120s, visible tab only; yields move slowly) ──
   useEffect(() => {
     let alive = true;
@@ -127,6 +135,34 @@ export default function CarryBasket() {
     document.addEventListener("visibilitychange", onVis);
     return () => { alive = false; clearInterval(id); document.removeEventListener("visibilitychange", onVis); };
   }, []);
+
+  // β per window; refetch when the vol lookback changes (server caches 1h per window)
+  useEffect(() => {
+    let alive = true;
+    fetch(`/api/carry/betas?window=${window}`)
+      .then(async (r) => { const j = await r.json().catch(() => null); if (alive && r.ok) setBetas(j); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [window]);
+
+  // the 20y chart describes ONE specific book — clear it when the book changes
+  useEffect(() => { setHist(null); setHistErr(null); }, [longs, shorts, sizingMode, weighting]);
+
+  const loadHist = useCallback(() => {
+    if (!longs.length || !shorts.length) return;
+    setHistLoading(true); setHistErr(null);
+    fetch("/api/carry/basket_history", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ longs, shorts, sizingMode, weighting, window, years: 20 }),
+    })
+      .then(async (r) => {
+        const j = await r.json().catch(() => null);
+        if (!r.ok || (j && j.error)) { setHist(null); setHistErr((j && (j.detail || j.error)) || `HTTP ${r.status}`); }
+        else { setHist(j); setHistErr(null); }
+      })
+      .catch((e) => { setHist(null); setHistErr(e?.message || "network error"); })
+      .finally(() => setHistLoading(false));
+  }, [longs, shorts, sizingMode, weighting, window]);
 
   const ranked = rank?.rank || [];
   const byCode = useMemo(() => Object.fromEntries(ranked.map(r => [r.code, r])), [ranked]);
@@ -370,15 +406,65 @@ export default function CarryBasket() {
               )}
             </Panel>
 
+            {/* 20y basket history — on demand (multi-year history pull per leg) */}
+            <Panel title="Basket history — 20y cumulative P&L (monthly excess returns)"
+              right={<button onClick={loadHist} disabled={histLoading || !longs.length || !shorts.length}
+                style={{ fontSize: 9, fontWeight: 800, fontFamily: C.mono, borderRadius: 5, cursor: "pointer",
+                         padding: "4px 12px", background: "rgba(34,211,238,0.12)",
+                         border: `1px solid ${C.cyan}66`, color: histLoading ? C.dim : C.cyan, letterSpacing: ".06em" }}>
+                {histLoading ? "LOADING…" : hist ? "RELOAD" : "LOAD 20Y"}
+              </button>}>
+              {histErr && (
+                <div style={{ marginBottom: 10, padding: "8px 11px", borderRadius: 6, background: "rgba(251,191,36,0.10)", border: `1px solid ${C.amber}55`, color: C.amber, fontSize: 10, fontWeight: 600 }}>
+                  history unavailable — {histErr}
+                </div>
+              )}
+              {!hist && !histErr && (
+                <div style={{ fontSize: 10, color: C.dim, fontStyle: "italic", padding: "4px 0" }}>
+                  {longs.length && shorts.length
+                    ? "press LOAD 20Y — replays TODAY'S signed notionals through ~20y of monthly excess returns (first pull is heavy: two decades of daily history per leg; cached 24h)"
+                    : "select longs and shorts first"}
+                </div>
+              )}
+              {hist && (<>
+                <Plot
+                  data={[{
+                    x: hist.months, y: hist.cumPnlUsd, name: "Cumulative P&L",
+                    type: "scatter", mode: "lines", line: { color: C.cyan, width: 1.6 },
+                    fill: "tozeroy", fillcolor: "rgba(34,211,238,0.06)",
+                    hovertemplate: "%{x}<br>$%{y:,.0f}<extra></extra>",
+                  }]}
+                  layout={{
+                    paper_bgcolor: C.panel, plot_bgcolor: C.panel2, height: 240,
+                    font: { color: C.sub, size: 9, family: "Inter,system-ui" },
+                    margin: { l: 60, r: 14, t: 10, b: 26 }, hovermode: "x unified",
+                    uirevision: "carry-hist",
+                    xaxis: { gridcolor: C.border, tickfont: { size: 8 }, automargin: true },
+                    yaxis: { gridcolor: C.border, zerolinecolor: "#475569", zeroline: true,
+                             tickfont: { size: 8 }, tickprefix: "$", automargin: true },
+                  }}
+                  config={{ responsive: true, displayModeBar: false, displaylogo: false }}
+                  style={{ width: "100%" }} useResizeHandler
+                />
+                <div style={{ fontFamily: C.mono, fontSize: 9.5, color: C.sub, marginTop: 6 }}>
+                  total {usdM(hist.cumPnlUsd?.[hist.cumPnlUsd.length - 1])} over {hist.months?.length ?? 0} months ·
+                  worst month {usdM(hist.monthlyPnlUsd?.length ? Math.min(...hist.monthlyPnlUsd) : null)} ·
+                  coverage: {(hist.legs || []).map((l) => `${l.code} ${l.from ? l.from.slice(0, 7) : "—"}`).join(" · ")}
+                </div>
+                <div style={{ fontSize: 8.5, color: C.dim, marginTop: 4, lineHeight: 1.5 }}>{hist.note}</div>
+              </>)}
+            </Panel>
+
             {/* Yield rank (always shown) */}
             <Panel title="Yield rank — all traded EM + G10 (1M fwd-implied yield vs USD)"
               right={<span style={{ fontSize: 8.5, color: C.dim }}>⊕L long · ⊕S short · click to toggle</span>}>
               <div style={{ overflowX: "auto", maxHeight: 520, overflowY: "auto" }}>
-                <table style={{ borderCollapse: "collapse", width: "100%", minWidth: 560 }}>
+                <table style={{ borderCollapse: "collapse", width: "100%", minWidth: 620 }}>
                   <thead style={{ position: "sticky", top: 0, background: C.panel, zIndex: 1 }}>
                     <tr>
                       <th style={{ ...th, width: 30 }}>#</th><th style={thL}>Pair</th><th style={thL}>Ccy</th>
                       <th style={th}>Grp</th><th style={th}>Yield%</th><th style={th}>Carry%</th>
+                      <th style={th} title={`${window}d rolling β of daily appreciation returns vs an equal-weight EM FX basket (${betas?.nBasket ?? "…"} names). Funders are often picked low-β — shorting a high-β name hedges EM risk-off; a low-β short is a purer funding trade.`}>β EM</th>
                       <th style={{ ...th, width: 34 }}>d</th><th style={{ ...th, textAlign: "center", width: 84 }}>L / S</th>
                     </tr>
                   </thead>
@@ -396,6 +482,7 @@ export default function CarryBasket() {
                           <td style={{ ...td, color: r.group === "G10" ? C.violet : C.dim, fontSize: 9 }}>{r.group}</td>
                           <td style={{ ...td, color: r.hasData ? C.text : C.dim }}>{r.hasData ? num(r.impliedYield, 2) : "—"}</td>
                           <td style={{ ...td, color: carryColor(r.carry) }}>{r.hasData ? sgn(r.carry, 2) : "—"}</td>
+                          <td style={{ ...td, color: C.sub }}>{betas?.betas?.[r.code] != null ? num(betas.betas[r.code], 2) : "—"}</td>
                           <td style={{ ...td, color: C.dim, fontSize: 9 }}>{r.days1m ?? "—"}</td>
                           <td style={{ ...td, textAlign: "center" }}>
                             <button onClick={() => toggleLong(r.code)} disabled={!r.hasData} title="toggle long" style={{

@@ -112,6 +112,10 @@ class CarryBasketService:
         self.lseg = lseg
         self._rank_cache: Optional[Tuple[float, Dict[str, Any]]] = None
         self._hist_cache: Dict[str, Tuple[float, List[Tuple[str, float]]]] = {}
+        # multi-year pulls for the basket-history chart — separate cache so they
+        # never clobber (or get clobbered by) the 420d working histories
+        self._deep_hist_cache: Dict[str, Tuple[float, List[Tuple[str, float]]]] = {}
+        self._beta_cache: Dict[int, Tuple[float, Dict[str, Any]]] = {}
         self._sofr_cache: Optional[Tuple[float, float]] = None
         self._days_cache: Dict[str, Tuple[str, int]] = {}    # code -> (asOfIso, days)
 
@@ -185,9 +189,13 @@ class CarryBasketService:
         self._sofr_cache = (_t.time(), val)
         return val
 
-    def _hist_mid(self, ric: str, days: int = 420, ttl: float = 7200) -> List[Tuple[str, float]]:
-        """Cached daily (date, mid) series for an FX RIC (BID/ASK)."""
-        c = self._hist_cache.get(ric)
+    def _hist_mid(self, ric: str, days: int = 420, ttl: float = 7200,
+                  deep: bool = False) -> List[Tuple[str, float]]:
+        """Cached daily (date, mid) series for an FX RIC (BID/ASK). deep=True keeps
+        multi-year pulls in their own cache (24h-class TTLs) apart from the 420d
+        working series."""
+        cache = self._deep_hist_cache if deep else self._hist_cache
+        c = cache.get(ric)
         if c and (_t.time() - c[0]) < ttl:
             return c[1]
         start = (date.today() - timedelta(days=days)).isoformat()
@@ -204,7 +212,7 @@ class CarryBasketService:
             out.sort()
         except Exception:
             log.exception("carry: history failed for %s", ric)
-        self._hist_cache[ric] = (_t.time(), out)
+        cache[ric] = (_t.time(), out)
         return out
 
     @staticmethod
@@ -399,6 +407,130 @@ class CarryBasketService:
                 "n": len(w), "window": window,
             }
         return out
+
+    def betas(self, window: int = 60) -> Dict[str, Any]:
+        """Rolling β of each currency's daily appreciation returns vs an equal-weight
+        EM FX basket, over the trailing `window` common days.
+
+        Basket = simple mean of the daily appreciation returns of every EM-group
+        member with spot history (pegged names included — they damp the basket;
+        each name's ~1/n self-inclusion is accepted, standard for an index β).
+        Funders are often chosen low-β: shorting a high-β name hedges EM risk-off,
+        shorting a low-β name is a purer funding trade. Reuses the 2h spot-history
+        cache; result cached 1h per window."""
+        window = window if window in VOL_WINDOWS else 60
+        c = self._beta_cache.get(window)
+        if c and (_t.time() - c[0]) < 3600:
+            return c[1]
+        uni = self._universe()
+        rets: Dict[str, Dict[str, float]] = {}
+        for u in uni:
+            r = dict(self._appr_returns(u["code"], u))
+            if r:
+                rets[u["code"]] = r
+        em = [u["code"] for u in uni if u["group"] != "G10" and u["code"] in rets]
+        acc: Dict[str, List[float]] = {}
+        for code in em:
+            for d, r in rets[code].items():
+                acc.setdefault(d, []).append(r)
+        need = max(5, int(len(em) * 0.67))   # a basket print needs 2/3 of members
+        bser = {d: sum(v) / len(v) for d, v in acc.items() if len(v) >= need}
+        out: Dict[str, Optional[float]] = {}
+        for u in uni:
+            r = rets.get(u["code"])
+            if not r:
+                out[u["code"]] = None
+                continue
+            common = sorted(set(r) & set(bser))[-window:]
+            if len(common) < max(5, window // 2):
+                out[u["code"]] = None
+                continue
+            x = [bser[d] for d in common]
+            y = [r[d] for d in common]
+            n = len(common)
+            mx, my = sum(x) / n, sum(y) / n
+            varx = sum((a - mx) ** 2 for a in x) / n
+            cov = sum((x[k] - mx) * (y[k] - my) for k in range(n)) / n
+            out[u["code"]] = round(cov / varx, 2) if varx > 0 else None
+        res = {"window": window, "nBasket": len(em), "betas": out,
+               "note": ("β of daily appreciation returns vs equal-weight EM FX basket "
+                        f"({len(em)} members incl. pegged names, which damp it)")}
+        self._beta_cache[window] = (_t.time(), res)
+        return res
+
+    def basket_history(self, longs: List[Dict[str, Any]], short_codes: List[str],
+                       sizing_mode: str = "vol_neutral", weighting: str = "inverse_vol",
+                       window: int = DEFAULT_WINDOW, years: int = 20) -> Dict[str, Any]:
+        """Cumulative monthly excess-return history of TODAY'S sized basket.
+
+        Per leg the standard carry-trade excess return: hold the 1M forward one
+        month → r = F(1M, t) / S(t+1M) − 1 (both foreign-per-USD) — the USD funding
+        leg cancels, so no historical USD rate is needed (nothing proxied).
+        Today's signed notionals are held constant, so the chart is ADDITIVE
+        cumulative P&L in USD on today's book — not a compounded NAV. Month-end
+        sampling of daily closes; only the COMPOSITE 1M points RIC is used for
+        history (broker-only names like EGP/NGN enter only where it exists);
+        a calendar-month hold approximates the exact 1M roll. Coverage per leg is
+        disclosed, never backfilled."""
+        book = self.basket(longs, short_codes, sizing_mode, weighting, window)
+        if book.get("error"):
+            return {"error": book["error"]}
+        legs = ([(l["code"], 1.0, float(l.get("notionalUsd") or 0)) for l in book.get("longs", [])]
+                + [(l["code"], -1.0, float(l.get("notionalUsd") or 0)) for l in book.get("shorts", [])])
+        legs = [(c, s, n) for c, s, n in legs if n > 0]
+        if not legs:
+            return {"error": "no sized legs"}
+        days = years * 365 + 40
+        leg_month: Dict[str, Dict[str, Tuple[float, float]]] = {}   # code -> month -> (fwd, spotFx)
+        leg_out: List[Dict[str, Any]] = []
+        for code, sign, notl in legs:
+            u = self._u_for(code)
+            if not u:
+                continue
+            spot_ser = self._hist_mid(u["spot_ric"], days=days, ttl=86400, deep=True)
+            pts_ric, pts_vm = (u["pts_sources"][0] if u.get("pts_sources") else (None, None))
+            pts_by = dict(self._hist_mid(pts_ric, days=days, ttl=86400, deep=True)) if pts_ric else {}
+            mm: Dict[str, Tuple[float, float]] = {}
+            for dts, s in spot_ser:            # sorted asc → keeps the LAST obs per month
+                p = pts_by.get(dts)
+                if p is None:
+                    continue
+                sfx = self._spot_fx(s, u)
+                fwd = self._outright(s, p, u, pts_vm)
+                if sfx and fwd:
+                    mm[dts[:7]] = (fwd, sfx)
+            leg_month[code] = mm
+            leg_out.append({"code": code, "side": "long" if sign > 0 else "short",
+                            "notionalUsd": notl, "from": (min(mm) if mm else None),
+                            "nMonths": len(mm)})
+        months_all = sorted(set().union(*[set(m) for m in leg_month.values()])) if leg_month else []
+        cum = 0.0
+        out_months: List[str] = []
+        cum_ser: List[float] = []
+        mon_ser: List[float] = []
+        for i in range(1, len(months_all)):
+            m0, m1 = months_all[i - 1], months_all[i]
+            pnl, active = 0.0, 0
+            for code, sign, notl in legs:
+                mm = leg_month.get(code) or {}
+                a, b = mm.get(m0), mm.get(m1)
+                if not a or not b or b[1] <= 0:
+                    continue
+                pnl += sign * notl * (a[0] / b[1] - 1.0)
+                active += 1
+            if active == 0:
+                continue
+            cum += pnl
+            out_months.append(m1)
+            mon_ser.append(round(pnl, 0))
+            cum_ser.append(round(cum, 0))
+        return {"months": out_months, "cumPnlUsd": cum_ser, "monthlyPnlUsd": mon_ser,
+                "legs": leg_out,
+                "note": ("per-leg excess return F(1M,t)/S(t+1M)−1 (USD leg cancels — no "
+                         "historical USD rate assumed) · today's signed notionals held "
+                         "constant → additive cumulative P&L, not compounded NAV · "
+                         "month-end sampling, composite 1M points only · a leg enters "
+                         "when its history begins (see coverage)")}
 
     def _covariance(self, codes: List[str], window: int) -> Tuple[List[str], List[List[float]], Dict[str, List[float]]]:
         """Sample covariance of daily appreciation returns over the common last-`window`

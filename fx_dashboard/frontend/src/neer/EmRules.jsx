@@ -146,6 +146,7 @@ export default function EmRules() {
               <th style={th} title="R8: 1M FX appreciation vs USD; up-days of 21">R8 MOM</th>
               <th style={th} title="R11: |daily ret|>1σ days in trailing 100d. >30 = stressed (emergency-hike precondition).">R11 σ</th>
               <th style={th}>CDS</th>
+              <th style={th} title="HOUSE composite (not from the book): unweighted rule votes — R1 RECEIVE +2 / PAY −2 · R2 peaked +1, rising −1 · R3 rank top-3 +1 / bottom-3 −1 · R4 z>1 +1 · R11 stressed −1. Positive = receive bias, negative = pay bias.">SCORE</th>
             </tr>
           </thead>
           <tbody>
@@ -157,7 +158,7 @@ export default function EmRules() {
               return (
                 <React.Fragment key={r.cc}>
                   {newRegion && (
-                    <tr><td colSpan={14} style={{ padding: "5px 8px 2px", fontSize: 9, fontWeight: 800, letterSpacing: ".14em", color: C.cyan, background: C.bg, position: "sticky", left: 0 }}>{r.region.toUpperCase()}</td></tr>
+                    <tr><td colSpan={15} style={{ padding: "5px 8px 2px", fontSize: 9, fontWeight: 800, letterSpacing: ".14em", color: C.cyan, background: C.bg, position: "sticky", left: 0 }}>{r.region.toUpperCase()}</td></tr>
                   )}
                   <tr style={{ borderTop: `1px solid ${C.border}` }}>
                     <td style={{ ...td, textAlign: "left", position: "sticky", left: 0, background: C.panel, zIndex: 1 }}>
@@ -188,6 +189,12 @@ export default function EmRules() {
                     </td>
                     <td style={td}>{r11 ? <Chip text={String(r11.sigmaMoves100d)} tone={r11.stressed ? "down" : undefined} /> : "—"}</td>
                     <td style={{ ...td, color: C.sub }}>{F(r.cds, 0)}</td>
+                    <td style={td} title={r.score ? Object.entries(r.score.parts).map(([k, v]) => `${k} ${v > 0 ? "+" : ""}${v}`).join(" · ") : "no rules computed"}>
+                      {r.score
+                        ? <Chip text={`${r.score.total > 0 ? "+" : ""}${r.score.total}${r.score.total >= 2 ? " REC" : r.score.total <= -2 ? " PAY" : ""}`}
+                                tone={r.score.total >= 2 ? "up" : r.score.total <= -2 ? "down" : undefined} />
+                        : "—"}
+                    </td>
                   </tr>
                 </React.Fragment>
               );

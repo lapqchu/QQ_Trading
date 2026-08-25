@@ -32,6 +32,16 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
 _session = requests.Session()
 _session.headers.update({"User-Agent": UA, "Accept": "application/json, text/plain, */*"})
 
+# Corporate networks often route HTTPS through a browser-configured (PAC) proxy that
+# Python never sees — symptoms: the browser reaches tablebuilder.singstat.gov.sg /
+# data.gov.sg fine while every fetch here times out. Set EXT_DATA_PROXY (e.g.
+# "http://proxy.corp:8080") to route ONLY these external fetches through it; the
+# standard HTTPS_PROXY/HTTP_PROXY env vars are honored by requests as usual.
+_proxy = os.environ.get("EXT_DATA_PROXY")
+if _proxy:
+    _session.proxies.update({"http": _proxy, "https": _proxy})
+    log.info("ext_data: routing via EXT_DATA_PROXY=%s", _proxy)
+
 
 def _cache_path(key: str) -> str:
     safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in key)

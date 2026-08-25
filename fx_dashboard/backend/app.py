@@ -299,6 +299,10 @@ class _BasketReq(BaseModel):
     window: int = 20
 
 
+class _BasketHistReq(_BasketReq):
+    years: int = 20
+
+
 @app.get("/api/carry/rank")
 def carry_rank(force: bool = Query(False)) -> Dict[str, Any]:
     """1M forward-implied yield rank across all EM (pricer) + G10 currencies."""
@@ -321,6 +325,34 @@ def carry_vols(codes: str = Query(...), window: int = Query(20)) -> Dict[str, An
         return {"window": window, "vols": carry.vols(code_list, window)}
     except Exception as e:
         log.exception("carry_vols failed")
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/carry/betas")
+def carry_betas(window: int = Query(60)) -> Dict[str, Any]:
+    """Rolling β of each currency's appreciation returns vs an equal-weight EM FX basket."""
+    if not lseg or not lseg.is_open():
+        raise HTTPException(503, "LSEG session not open — check Workspace app & APP_KEY")
+    try:
+        return carry.betas(window)
+    except Exception as e:
+        log.exception("carry_betas failed")
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/carry/basket_history")
+def carry_basket_history(req: _BasketHistReq) -> Dict[str, Any]:
+    """~20y monthly excess-return history of the currently sized basket (on demand —
+    pulls multi-year daily histories per leg; cached 24h)."""
+    if not lseg or not lseg.is_open():
+        raise HTTPException(503, "LSEG session not open — check Workspace app & APP_KEY")
+    try:
+        longs = [{"code": l.code.upper(), "notionalUsd": l.notionalUsd} for l in req.longs]
+        shorts = [c.upper() for c in req.shorts]
+        return carry.basket_history(longs, shorts, req.sizingMode, req.weighting,
+                                    req.window, req.years)
+    except Exception as e:
+        log.exception("carry_basket_history failed")
         raise HTTPException(500, str(e))
 
 

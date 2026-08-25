@@ -73,6 +73,21 @@ function Lines({ id, series, height = 190, ytitle = "%", yzero = true, shapes = 
   );
 }
 
+// A blocked/unavailable data slot: flagged loudly, never proxied. Corporate
+// networks often block SingStat/data.gov.sg for Python while the browser gets
+// through — EXT_DATA_PROXY routes the backend's external fetches via the proxy.
+function Missing({ what, err, height = 150 }) {
+  return (
+    <div style={{ minHeight: height, display: "flex", flexDirection: "column", justifyContent: "center",
+                  textAlign: "center", color: C.dim, fontSize: 10.5, lineHeight: 1.6, padding: "8px 14px" }}>
+      <div><span style={{ color: C.amber, fontWeight: 700 }}>{what} unavailable</span>{err ? ` — ${String(err).slice(0, 90)}` : ""}</div>
+      <div style={{ fontSize: 9.5, marginTop: 4 }}>
+        nothing proxied · if this network blocks the source, set EXT_DATA_PROXY to the corporate proxy and restart the backend
+      </div>
+    </div>
+  );
+}
+
 // ── header stat chip ──
 function Stat({ label, value, sub, color }) {
   return (
@@ -125,8 +140,9 @@ function MonitorView({ data, err, busy, load }) {
   const coeLatest = drv.coe?.latest || {};
 
   const staleSrc = Object.entries(data.sources || {}).filter(([, v]) => v?.stale).map(([k]) => k);
+  const srcErr = (key) => (data.sources || {})[key]?.error || null;
   const today = new Date().toISOString().slice(0, 10);
-  const upcoming = (data.calendar || []).filter((c) => c.date >= today).slice(0, 6);
+  const upcoming = (data.calendar || []).filter((c) => c.date >= today);   // backend caps at ~6 months
 
   return (
     <div style={{ padding: 14, maxWidth: 1500, margin: "0 auto" }}>
@@ -159,24 +175,28 @@ function MonitorView({ data, err, busy, load }) {
           ]} />
         </Panel>
         <Panel title="CONTRIBUTIONS TO HEADLINE Y/Y" note={`${contrib.asOf || ""} · cyan=in core, amber=excluded`}>
-          <Plot data={[contribTrace]}
-            layout={chartLayout("sgf-contrib", {
-              height: 230, margin: { l: 128, r: 12, t: 8, b: 24 },
-              xaxis: { title: { text: "pp", font: { size: 8 } }, zeroline: true },
-              yaxis: { tickfont: { size: 8 } },
-            })}
-            config={PCFG} style={{ width: "100%" }} useResizeHandler />
-          <div style={{ fontSize: 9, color: C.sub, fontFamily: C.mono, marginTop: 2 }}>
-            Σ core {FP(contrib.coreContrib, 2)}pp · Σ excluded {FP(contrib.nonCoreContrib, 2)}pp → headline {F(contrib.headlineYoY, 2)}%
-          </div>
+          {crows.length ? (<>
+            <Plot data={[contribTrace]}
+              layout={chartLayout("sgf-contrib", {
+                height: 230, margin: { l: 128, r: 12, t: 8, b: 24 },
+                xaxis: { title: { text: "pp", font: { size: 8 } }, zeroline: true },
+                yaxis: { tickfont: { size: 8 } },
+              })}
+              config={PCFG} style={{ width: "100%" }} useResizeHandler />
+            <div style={{ fontSize: 9, color: C.sub, fontFamily: C.mono, marginTop: 2 }}>
+              Σ core {FP(contrib.coreContrib, 2)}pp · Σ excluded {FP(contrib.nonCoreContrib, 2)}pp → headline {F(contrib.headlineYoY, 2)}%
+            </div>
+          </>) : <Missing what="CPI component detail (SingStat M213751)" err={srcErr("cpiGroups")} height={230} />}
         </Panel>
         <Panel title="CORE GROUPS" note="official MAS groupings, y/y %">
-          <Lines id="sgf-coregrp" height={230} series={[
-            line(inf.coreGroupsYoY?.coreYoYOfficial, "MAS Core (official)", C.cyan),
-            line(inf.coreGroupsYoY?.["Services"], "Services", C.blue),
-            line(inf.coreGroupsYoY?.["Retail & other goods"], "Retail & other goods", C.violet),
-            line(inf.coreGroupsYoY?.["Electricity & gas"], "Electricity & gas", C.amber),
-          ]} />
+          {inf.coreGroupsYoY?.coreYoYOfficial?.dates?.length ? (
+            <Lines id="sgf-coregrp" height={230} series={[
+              line(inf.coreGroupsYoY?.coreYoYOfficial, "MAS Core (official)", C.cyan),
+              line(inf.coreGroupsYoY?.["Services"], "Services", C.blue),
+              line(inf.coreGroupsYoY?.["Retail & other goods"], "Retail & other goods", C.violet),
+              line(inf.coreGroupsYoY?.["Electricity & gas"], "Electricity & gas", C.amber),
+            ]} />
+          ) : <Missing what="MAS core groupings (SingStat M213891)" err={srcErr("coreGroups")} height={230} />}
         </Panel>
       </div>
 
@@ -196,10 +216,22 @@ function MonitorView({ data, err, busy, load }) {
             A {coeLatest["Category A"] ? Math.round(coeLatest["Category A"].premium / 1000) + "k" : "—"} ·
             B {coeLatest["Category B"] ? Math.round(coeLatest["Category B"].premium / 1000) + "k" : "—"}
           </span>}>
-          <Lines id="sgf-coe" height={180} ytitle="S$" yzero={false} series={coeTraces} />
+          {coeTraces.length ? (
+            <Lines id="sgf-coe" height={180} ytitle="S$" yzero={false} series={coeTraces} />
+          ) : (drv.coeMonthly?.small?.dates?.length ? (<>
+            <Lines id="sgf-coepqp" height={158} ytitle="S$" yzero={false} series={[
+              line(drv.coeMonthly.small, "PQP ≤1600cc (Cat A-type)", C.cyan),
+              line(drv.coeMonthly.large, "PQP >1600cc (Cat B-type)", C.blue),
+            ]} />
+            <div style={{ fontSize: 9, color: C.amber, marginTop: 2, lineHeight: 1.4 }}>
+              bidding results (data.gov.sg) unreachable — showing LSEG COE PQP instead: the official Prevailing Quota Premium, a SMOOTHED MONTHLY AVERAGE, not per-exercise premiums
+            </div>
+          </>) : <Missing what="COE bidding results (data.gov.sg)" err={drv.coe?.error} height={180} />)}
         </Panel>
         <Panel title="RENTS & TARIFF" note="URA private rental index y/y (accommodation feeds CPI with ~4–8q lag)">
-          <Lines id="sgf-rent" height={150} series={[line(drv.uraRent?.yoy, "URA rental y/y", C.cyan)]} />
+          {drv.uraRent?.yoy?.dates?.length
+            ? <Lines id="sgf-rent" height={150} series={[line(drv.uraRent?.yoy, "URA rental y/y", C.cyan)]} />
+            : <Missing what="URA rental index (SingStat M212311)" err={srcErr("uraRent")} height={150} />}
           <div style={{ fontSize: 9.5, color: C.amber, marginTop: 4, lineHeight: 1.4 }}>⚡ {drv.tariff?.note}</div>
         </Panel>
       </div>
@@ -265,17 +297,19 @@ function MonitorView({ data, err, busy, load }) {
             SPF Jun-26 medians: CPI {pol.spf.cpi2026}% · core {pol.spf.core2026}% · GDP {pol.spf.gdp2026}% · USD/SGD {pol.spf.usdsgdEnd2026} · SORA {pol.spf.soraAvg2026}%
           </div>
         </Panel>
-        <Panel title="RELEASE CALENDAR" note="upcoming (MAS/DOS advance calendar)">
-          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 10.5 }}>
-            <tbody>
-              {upcoming.map((c) => (
-                <tr key={c.date + c.event} style={{ borderBottom: `1px solid ${C.border}` }}>
-                  <td style={{ fontFamily: C.mono, color: c.date <= today ? C.amber : C.dim, padding: "4px 6px", whiteSpace: "nowrap" }}>{c.date}</td>
-                  <td style={{ color: C.sub, padding: "4px 6px" }}>{c.event}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+        <Panel title="RELEASE CALENDAR" note="next ~6 months · confirmed (polls + verified one-offs) + ~ = estimated from habitual release day">
+          <div style={{ maxHeight: 200, overflowY: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 10.5 }}>
+              <tbody>
+                {upcoming.map((c) => (
+                  <tr key={c.date + c.event} style={{ borderBottom: `1px solid ${C.border}` }}>
+                    <td style={{ fontFamily: C.mono, color: c.date <= today ? C.amber : c.est ? C.dim : C.sub, padding: "4px 6px", whiteSpace: "nowrap" }}>{c.date}</td>
+                    <td style={{ color: c.est ? C.dim : C.sub, padding: "4px 6px" }}>{c.event}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
           <div style={{ fontSize: 9, color: C.dim, marginTop: 6 }}>
             Consensus rows (Reuters polls): {(con.rows || []).map((r) => `${r.label} ${r.mean != null ? F(r.mean, 1) : "—"}`).join(" · ")}
           </div>
@@ -310,6 +344,25 @@ function ModelView({ consensus }) {
 
   if (err) return <div style={{ padding: 30, color: C.down, fontFamily: C.mono, fontSize: 12 }}>Model failed: {err}</div>;
   if (!data) return <div style={{ padding: 30, color: C.dim, fontSize: 12 }}>Building inflation model… (first build fits the component models + backtest, ~10s)</div>;
+
+  // Total input failure (e.g. SingStat blocked by a corporate firewall): the backend
+  // returns {error, sources} instead of a model — flag it, never render defaults.
+  const srcIssues = Object.entries(data.sources || {})
+    .filter(([, v]) => v).map(([k, v]) => `${k}: ${String(v).slice(0, 70)}`);
+  if (data.error) {
+    return (
+      <div style={{ padding: 30, maxWidth: 900, margin: "0 auto" }}>
+        <div style={{ padding: "12px 16px", borderRadius: 8, background: "rgba(251,191,36,0.10)", border: `1px solid ${C.amber}55`, color: C.amber, fontSize: 11.5, lineHeight: 1.7 }}>
+          <b>M1/M2 unavailable — {data.error}.</b><br />
+          {srcIssues.length > 0 && <>Blocked sources: {srcIssues.join(" · ")}.<br /></>}
+          The model needs the SingStat CPI component tables; corporate networks often block
+          tablebuilder.singstat.gov.sg for Python while the browser gets through. Fix: set
+          EXT_DATA_PROXY to the corporate proxy (e.g. http://proxy.corp:8080) and restart the
+          backend. Nothing is proxied or defaulted in the meantime.
+        </div>
+      </div>
+    );
+  }
 
   const nc = data.nowcast || {};
   const bt = data.backtest || {};
@@ -374,6 +427,12 @@ function ModelView({ consensus }) {
           </div>
         </div>
       </div>
+
+      {srcIssues.length > 0 && (
+        <div style={{ marginBottom: 10, padding: "7px 11px", borderRadius: 6, background: "rgba(251,191,36,0.10)", border: `1px solid ${C.amber}55`, color: C.amber, fontSize: 10, fontWeight: 600 }}>
+          partial inputs — {srcIssues.join(" · ")} (affected components fall back to labelled seasonal; nothing proxied — see EXT_DATA_PROXY in the ⓘ manual if this network blocks SingStat)
+        </div>
+      )}
 
       <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr", gap: 10, marginBottom: 10 }}>
         {/* component table */}
@@ -610,15 +669,21 @@ function NowcastView() {
           <div style={{ fontSize: 9.5, color: C.sub, marginTop: 4 }}>{t.note}</div>
         </Panel>
         <Panel title="COE PREMIUMS" note="per bidding exercise · data.gov.sg, same-day">
-          <Lines id="sgn-coe" height={250} ytitle="S$" yzero={false} series={coeTraces} />
+          {coeTraces.length
+            ? <Lines id="sgn-coe" height={250} ytitle="S$" yzero={false} series={coeTraces} />
+            : <Missing what="COE bidding results (data.gov.sg)" err={data.coe?.error} height={250} />}
         </Panel>
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginBottom: 10 }}>
         <Panel title="FAO FOOD PRICE INDEX" note="y/y % · 0.63 LR pass-through to food import prices; →CPI ~half within 4q (MR Apr-17 Box B)">
-          <Lines id="sgn-fao" height={190} series={[line(data.fao?.yoy, "FAO food y/y", C.cyan)]} />
+          {data.fao?.yoy?.values?.length
+            ? <Lines id="sgn-fao" height={190} series={[line(data.fao?.yoy, "FAO food y/y", C.cyan)]} />
+            : <Missing what="FAO food price index (fao.org)" err={data.fao?.error} height={190} />}
         </Panel>
         <Panel title="HDB RENTS" note="avg of town median 4-room rents, quarterly → accommodation CPI with 4–8q lag">
-          <Lines id="sgn-hdb" height={190} ytitle="S$/mo" yzero={false} series={[line(data.hdbRent?.avgMedian4rm, "Avg median 4rm", C.cyan)]} />
+          {data.hdbRent?.avgMedian4rm?.values?.length
+            ? <Lines id="sgn-hdb" height={190} ytitle="S$/mo" yzero={false} series={[line(data.hdbRent?.avgMedian4rm, "Avg median 4rm", C.cyan)]} />
+            : <Missing what="HDB median rents (data.gov.sg)" err={data.hdbRent?.error} height={190} />}
         </Panel>
         <Panel title="JET FUEL (SGP FOB SWAP)" note="drives airfares / travel services">
           {data.jetFuel

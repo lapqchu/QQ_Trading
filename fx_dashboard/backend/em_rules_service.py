@@ -401,6 +401,32 @@ class EmRulesService:
             for i, r in enumerate(ranked):
                 r["r3"]["rank"] = i + 1
 
+            # ── House RATES-direction score (NOT from the book): unweighted vote
+            # over the rates rules. Positive = receive bias, negative = pay bias.
+            #   R1 RECEIVE +2 / PAY −2 · R2 peaked +1, rising −1 ·
+            #   R3 rank top-3 +1 / bottom-3 −1 · R4 z>1 +1 · R11 stressed −1.
+            # Missing rules contribute nothing (parts lists what actually voted);
+            # score is None when no rule computed — never a defaulted zero.
+            n_ranked = len(ranked)
+            for r in rows:
+                parts: Dict[str, int] = {}
+                r1s, r2s, r3s = r.get("r1"), r.get("r2"), r.get("r3") or {}
+                r4s, r11s = r.get("r4"), r.get("r11")
+                if r1s:
+                    parts["r1"] = (2 if r1s.get("state") == "RECEIVE"
+                                   else -2 if r1s.get("state") == "PAY" else 0)
+                if r2s is not None:
+                    parts["r2"] = 1 if r2s.get("peaked") else -1
+                if r3s.get("rank") is not None and n_ranked >= 6:
+                    parts["r3"] = (1 if r3s["rank"] <= 3
+                                   else -1 if r3s["rank"] > n_ranked - 3 else 0)
+                if r4s and r4s.get("z3m") is not None:
+                    parts["r4"] = 1 if r4s["z3m"] > 1 else 0
+                if r11s and r11s.get("stressed"):
+                    parts["r11"] = -1
+                r["score"] = ({"total": int(sum(parts.values())), "parts": parts}
+                              if parts else None)
+
             payload = {
                 "asOf": dt.datetime.now().isoformat(timespec="seconds"),
                 "global": global_block,
@@ -412,6 +438,7 @@ class EmRulesService:
                     "R1 'since' is approximate (1Y swap history vs CURRENT policy level).",
                     "Frontier names without swap curves show FX/inflation rules only.",
                     "R7 carry/vol comes from the Carry Basket service (frontend reads /api/carry/rank).",
+                    "SCORE is a HOUSE composite (unweighted votes: R1 ±2 · R2 ±1 · R3 ±1 · R4 +1 · R11 −1) — not from the book.",
                 ],
             }
             self._cache = payload
