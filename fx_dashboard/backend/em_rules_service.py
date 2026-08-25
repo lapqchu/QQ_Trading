@@ -86,6 +86,33 @@ _CNH_PIP = 10000.0
 # R12 event table (date, cc, type) — maintained by hand; structure for v1
 EVENTS: List[Dict[str, str]] = []
 
+# ── REER series — verified live on this Workspace 2026-08-26 (10y monthly history
+# confirmed per RIC). Primary: BIS Real Broad EER index a{CC}BISRXBR; fallback where
+# BIS is absent: the IMF-style CPI-based REER a{CC}IRECE/C (2010=100).
+# NOT FOUND (flagged, never proxied): KZ QA EG MU BW.
+REER_RICS: Dict[str, str] = {
+    "BR": "aBRBISRXBR", "MX": "aMXBISRXBR", "CL": "aCLBISRXBR", "CO": "aCOBISRXBR",
+    "CZ": "aCZBISRXBR", "PL": "aPLBISRXBR", "HU": "aHUBISRXBR", "RO": "aROBISRXBR",
+    "ZA": "aZABISRXBR", "TR": "aTRBISRXBR", "IL": "aILBISRXBR", "RU": "aRUBISRXBR",
+    "IN": "aINBISRXBR", "ID": "aIDBISRXBR", "KR": "aKRBISRXBR", "TH": "aTHBISRXBR",
+    "MY": "aMYBISRXBR", "PH": "aPHBISRXBR", "CN": "aCNBISRXBR", "TW": "aTWBISRXBR",
+    "SG": "aSGBISRXBR", "HK": "aHKBISRXBR", "AE": "aAEBISRXBR", "SA": "aSABISRXBR",
+    "NG": "aNGIRECE/C", "MA": "aMAIRECE/C", "TN": "aTNIRECE/C", "UG": "aUGIRECE/C",
+}
+
+# ── Core-CPI y/y econ series for countries without a core poll RIC — verified live
+# 2026-08-26 (a{CC}CCORYF "Core CPI, Standardized, Chg Y/Y" family + Colombia's
+# aCOCPCORF). Chile publishes its core (CPIEFE, ex food & energy) only as an INDEX
+# level here — y/y is derived from the level, like the SG service does.
+# NOT FOUND (flagged, never proxied): IN (only WPI core exists — a producer-price
+# measure, not CPI core) MY HK AE SA QA MA TN MU BW.
+CORE_SERIES: Dict[str, str] = {
+    "CN": "aCNCCORYF", "CZ": "aCZCCORYF", "IL": "aILCCORYF", "KR": "aKRCCORYF",
+    "KZ": "aKZCCORYF", "NG": "aNGCCORYF", "RO": "aROCCORYF", "RU": "aRUCCORYF",
+    "TW": "aTWCCORYF", "UG": "aUGCCORYF", "CO": "aCOCPCORF",
+}
+CORE_INDEX_SERIES: Dict[str, str] = {"CL": "aCLCPIEFEF/C"}   # index level → y/y derived
+
 
 def _z(series: List[float], window: int) -> Optional[float]:
     xs = [x for x in series[-window:] if x is not None]
@@ -217,6 +244,10 @@ class EmRulesService:
                                   fields=["BID", "ASK", "TRDPRC_1"])
             us10 = self._daily_hist([_GLOBAL["us10y"]], fields=["MID_YLD_1", "B_YLD_1"])
             mh = self._monthly_hist(sorted(set(cpi_hist_rics + policy_hist_rics)))
+            # REER (10y for the vs-10y-average valuation) + core-CPI econ series
+            rh = self._monthly_hist(sorted(set(REER_RICS.values())), years=11)
+            ch = self._monthly_hist(sorted(set(list(CORE_SERIES.values())
+                                               + list(CORE_INDEX_SERIES.values()))), years=3)
 
             def dvals(ric: str) -> List[float]:
                 out = []
@@ -314,6 +345,14 @@ class EmRulesService:
                 cpi_now = srow["cpiYoY"]
                 srow["core"] = self._num(snap.get(cfg.get("core")), "ECON_ACT", "ECON_PRIOR") \
                     if cfg.get("core") else None
+                if srow["core"] is None and cc in CORE_SERIES:
+                    cv = self._vals(ch.get(CORE_SERIES[cc], []))
+                    srow["core"] = round(cv[-1], 2) if cv else None
+                if srow["core"] is None and cc in CORE_INDEX_SERIES:
+                    # index level → y/y (Chile CPIEFE): last vs the value ~12 months back
+                    cv = self._vals(ch.get(CORE_INDEX_SERIES[cc], []))
+                    if len(cv) >= 13 and cv[-13] > 0:
+                        srow["core"] = round((cv[-1] / cv[-13] - 1.0) * 100.0, 2)
                 # swaps
                 curve = {t: self._num(snap.get(self._swap_ric(cfg, t) or ""), "BID", "PRIMACT_1", "CF_LAST")
                          for t in _TENORS}
@@ -395,6 +434,24 @@ class EmRulesService:
                                    "stressed": bool(nsig is not None and nsig > 30)}
                 else:
                     srow["r11"] = None
+                # REER vs its 10y average — completes R11's second precondition
+                # (currency must be CHEAP on REER for a defensive hike to work) and
+                # doubles as a standalone valuation column. LIVE BIS/IMF-style series;
+                # None where no series exists (KZ QA EG MU BW) — never proxied.
+                srow["reer"] = None
+                rr = REER_RICS.get(cc)
+                if rr:
+                    rv = self._vals(rh.get(rr, []))
+                    if len(rv) >= 60:
+                        avg = float(np.mean(rv[-120:]))
+                        if avg > 0:
+                            srow["reer"] = {"vs10yPct": round((rv[-1] / avg - 1.0) * 100.0, 1),
+                                            "cheap": bool(rv[-1] < avg)}
+                if srow["r11"] is not None:
+                    srow["r11"]["reerCheap"] = (srow["reer"]["cheap"] if srow["reer"] else None)
+                    srow["r11"]["preconditionMet"] = (
+                        bool(srow["r11"]["stressed"] and srow["reer"]["cheap"])
+                        if (srow["reer"] and srow["r11"]["sigmaMoves100d"] is not None) else None)
                 rows.append(srow)
 
             # R3 ranks (vs target where defined, else vs CPI)
@@ -444,6 +501,8 @@ class EmRulesService:
                     "Screener only — the book supplies the backtested evidence; verify before trading.",
                     "R1 'since' is approximate (1Y swap history vs CURRENT policy level).",
                     "Frontier names without swap curves show FX/inflation rules only.",
+                    "REER = BIS real broad (IMF-style for NG/MA/TN/UG) vs 10y avg; none exists for KZ/QA/EG/MU/BW.",
+                    "Core: polls + verified econ series; none published/found for IN/MY/HK/AE/SA/QA/MA/TN/MU/BW.",
                     "R7 carry/vol comes from the Carry Basket service (frontend reads /api/carry/rank).",
                     "SCORE is a HOUSE composite (votes: R1 ±2 · R2 peaked +1 / rising −1 / flat 0 · R3 ±1 · R4 +1 · R11 −1) — not from the book; R11's vote uses only the σ-count half of the book's precondition.",
                 ],

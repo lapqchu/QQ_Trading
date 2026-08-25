@@ -150,7 +150,16 @@ function MonitorView({ data, err, busy, load }) {
       <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "stretch", marginBottom: 12 }}>
         <Stat label="HEADLINE CPI Y/Y" value={`${F(inf.latest.headline, 2)}%`} sub={`as of ${inf.latest.month || "—"}`} color={C.cyan} />
         <Stat label="MAS CORE Y/Y" value={`${F(inf.latest.core, 1)}%`} sub="ex accommodation & private transport" color={C.cyan} />
-        <Stat label="NEXT PRINT" value={cpiRow.releaseDate || "—"} sub={`cons ${F(cpiRow.mean, 2)}% hl / ${F(coreRow.mean, 1)}% core`} color={C.amber} />
+        {(() => {   // roll forward: the vendor keeps VALUE_DT1 on the LAST release for days
+          const relDate = String(cpiRow.releaseDate || "").slice(0, 10);
+          if (relDate && relDate >= today) {
+            return <Stat label="NEXT PRINT" value={relDate} sub={`cons ${F(cpiRow.mean, 2)}% hl / ${F(coreRow.mean, 1)}% core`} color={C.amber} />;
+          }
+          const nextCpi = upcoming.find((c) => /CPI/i.test(c.event));
+          return <Stat label="NEXT PRINT" value={nextCpi ? `${nextCpi.date}${nextCpi.est ? " ~" : ""}` : "—"}
+            sub={relDate ? `last (${relDate.slice(5)}): ${F(cpiRow.actual, 2)}% hl / ${F(coreRow.actual, 1)}% core · new poll pending` : "—"}
+            color={C.amber} />;
+        })()}
         <Stat label="MAS 2026 RANGE" value={`${range.low}–${range.high}%`} sub={`core & headline · as of ${range.asOf}`} />
         <Stat label="OUTPUT GAP 2026" value={FP(act.outputGap2026, 1) + "%"} sub="of potential · MR Jul-26" />
         <Stat label="MTI GDP 2026" value={`${act.mtiGdpRange2026.low}–${act.mtiGdpRange2026.high}%`} sub={`upgraded ${act.mtiGdpRange2026.asOf}`} />

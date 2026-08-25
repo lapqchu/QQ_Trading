@@ -129,7 +129,7 @@ export default function EmRules() {
 
       {/* the matrix */}
       <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 8, overflow: "auto", maxHeight: "72vh" }}>
-        <table style={{ borderCollapse: "collapse", width: "100%", minWidth: 1250 }}>
+        <table style={{ borderCollapse: "collapse", width: "100%", minWidth: 1320 }}>
           <thead>
             <tr>
               <th style={{ ...th, textAlign: "left", left: 0, zIndex: 3, position: "sticky", background: C.panel2 }}>COUNTRY</th>
@@ -144,7 +144,8 @@ export default function EmRules() {
               <th style={th} title="R5: curve slope bp + 3m change. Steepeners work before first cut.">R5 CURVE</th>
               <th style={th} title="R7: 1M fwd-implied yield − SOFR (Carry Basket service)">CARRY</th>
               <th style={th} title="R8: 1M FX appreciation vs USD; up-days of 21">R8 MOM</th>
-              <th style={th} title="R11: |daily ret|>1σ days in trailing 100d. >30 = stressed (emergency-hike precondition).">R11 σ</th>
+              <th style={th} title="R11: |daily ret|>1σ days in trailing 100d. >30 = stressed. Emergency-hike precondition = stressed AND cheap on REER (next column) — a defensive hike only rescues a stressed AND cheap currency.">R11 σ</th>
+              <th style={th} title="Real effective exchange rate vs its 10y average (BIS real broad index; IMF-style for NG/MA/TN/UG). Negative (green) = cheap — competitiveness tailwind and R11's second precondition; positive (red) = rich. None exists for KZ/QA/EG/MU/BW.">REER</th>
               <th style={th}>CDS</th>
               <th style={th} title="HOUSE composite (not from the book): rule votes — R1 RECEIVE +2 / PAY −2 · R2 peaked +1 / rising −1 / flat 0 · R3 rank top-3 +1 / bottom-3 −1 · R4 z>1 +1 · R11 stressed −1 (σ-count half only — the REER precondition is unbuilt). Positive = receive bias, negative = pay bias.">SCORE</th>
             </tr>
@@ -158,7 +159,7 @@ export default function EmRules() {
               return (
                 <React.Fragment key={r.cc}>
                   {newRegion && (
-                    <tr><td colSpan={15} style={{ padding: "5px 8px 2px", fontSize: 9, fontWeight: 800, letterSpacing: ".14em", color: C.cyan, background: C.bg, position: "sticky", left: 0 }}>{r.region.toUpperCase()}</td></tr>
+                    <tr><td colSpan={16} style={{ padding: "5px 8px 2px", fontSize: 9, fontWeight: 800, letterSpacing: ".14em", color: C.cyan, background: C.bg, position: "sticky", left: 0 }}>{r.region.toUpperCase()}</td></tr>
                   )}
                   <tr style={{ borderTop: `1px solid ${C.border}` }}>
                     <td style={{ ...td, textAlign: "left", position: "sticky", left: 0, background: C.panel, zIndex: 1 }}>
@@ -187,7 +188,12 @@ export default function EmRules() {
                     <td style={{ ...td, color: (r8?.mom1m ?? 0) >= 0 ? C.up : C.down }}>
                       {r8 ? `${FP(r8.mom1m, 1)}% · ${r8.upDays21}/21` : "—"}
                     </td>
-                    <td style={td}>{r11 ? <Chip text={String(r11.sigmaMoves100d)} tone={r11.stressed ? "down" : undefined} /> : "—"}</td>
+                    <td style={td} title={r11?.preconditionMet != null ? `emergency-hike precondition ${r11.preconditionMet ? "MET (stressed + cheap REER)" : "not met"}` : undefined}>
+                      {r11 ? <Chip text={String(r11.sigmaMoves100d)} tone={r11.preconditionMet ? "down" : r11.stressed ? "warn" : undefined} /> : "—"}
+                    </td>
+                    <td style={{ ...td, color: r.reer ? (r.reer.cheap ? C.up : C.down) : C.dim }}>
+                      {r.reer ? `${FP(r.reer.vs10yPct, 0)}%` : "—"}
+                    </td>
                     <td style={{ ...td, color: C.sub }}>{F(r.cds, 0)}</td>
                     <td style={td} title={r.score ? Object.entries(r.score.parts).map(([k, v]) => `${k} ${v > 0 ? "+" : ""}${v}`).join(" · ") : "no rules computed"}>
                       {r.score
