@@ -60,16 +60,36 @@ const line = (s, name, color, extra = {}) => ({
 const lastVal = (s) => (s?.values?.length ? s.values[s.values.length - 1] : null);
 const lastDate = (s) => (s?.dates?.length ? s.dates[s.dates.length - 1] : null);
 
-function Lines({ id, series, height = 190, ytitle = "%", yzero = true, shapes = [], yover = {} }) {
+// COE exercise key "YYYY-MM-<bid#>" → display label. The data.gov.sg dataset
+// carries month + exercise number only (NO auction dates) — these must be
+// plotted on a CATEGORY axis; a date axis would parse "2026-08-2" as Aug 2nd.
+const exLabel = (e) => `${String(e).slice(0, 7)} #${String(e).slice(8)}`;
+const COE_XAXIS = { type: "category", categoryorder: "category ascending", nticks: 8 };
+
+function Lines({ id, series, height = 190, ytitle = "%", yzero = true, shapes = [], yover = {}, xover = {} }) {
   return (
     <Plot
       data={series}
       layout={chartLayout(id, {
         height, shapes,
+        xaxis: xover,
         yaxis: { title: { text: ytitle, font: { size: 8 } }, zeroline: yzero, ...yover },
       })}
       config={PCFG} style={{ width: "100%" }} useResizeHandler
     />
+  );
+}
+
+// Provenance chip for nowcast panels: does this series feed M1, or is it
+// situational awareness only? (The question every panel must answer.)
+function Chip({ on, children }) {
+  return (
+    <span style={{ fontSize: 8, fontWeight: 800, letterSpacing: ".07em", padding: "2px 6px",
+                   borderRadius: 4, whiteSpace: "nowrap",
+                   border: `1px solid ${on ? C.cyan + "88" : C.border}`,
+                   color: on ? C.cyan : C.dim }}>
+      {children}
+    </span>
   );
 }
 
@@ -128,12 +148,12 @@ function MonitorView({ data, err, busy, load }) {
     textposition: "none", hovertemplate: "%{y}: %{x:.2f}pp — %{text}<extra></extra>",
   };
 
-  // COE per-exercise history (Cat A/B/E)
+  // COE per-exercise history (Cat A/B/E) — category axis: see exLabel
   const coeH = drv.coe?.history || {};
   const coeTraces = [["Category A", C.cyan], ["Category B", C.blue], ["Category E", C.violet]]
     .filter(([k]) => coeH[k])
     .map(([k, col]) => ({
-      x: coeH[k].exercises, y: coeH[k].premiums, name: k.replace("Category", "Cat"),
+      x: coeH[k].exercises.map(exLabel), y: coeH[k].premiums, name: k.replace("Category", "Cat"),
       type: "scatter", mode: "lines+markers", line: { color: col, width: 1.4 },
       marker: { size: 3 },
     }));
@@ -220,13 +240,13 @@ function MonitorView({ data, err, busy, load }) {
         <Panel title="S$NEER Y/Y" note="official weekly series, monthly avg — appreciation dampens imported inflation">
           <Lines id="sgf-neer" height={180} series={[line(drv.neerYoY, "S$NEER y/y", C.cyan)]} />
         </Panel>
-        <Panel title="COE PREMIUMS" note="per bidding exercise (data.gov.sg, same-day)"
+        <Panel title="COE PREMIUMS" note="per bidding exercise #1/#2 (~2wks apart; dataset carries month + exercise no., not auction dates)"
           right={<span style={{ fontFamily: C.mono, fontSize: 9, color: C.sub }}>
             A {coeLatest["Category A"] ? Math.round(coeLatest["Category A"].premium / 1000) + "k" : "—"} ·
             B {coeLatest["Category B"] ? Math.round(coeLatest["Category B"].premium / 1000) + "k" : "—"}
           </span>}>
           {coeTraces.length ? (
-            <Lines id="sgf-coe" height={180} ytitle="S$" yzero={false} series={coeTraces} />
+            <Lines id="sgf-coe" height={180} ytitle="S$" yzero={false} series={coeTraces} xover={COE_XAXIS} />
           ) : (drv.coeMonthly?.small?.dates?.length ? (<>
             <Lines id="sgf-coepqp" height={158} ytitle="S$" yzero={false} series={[
               line(drv.coeMonthly.small, "PQP ≤1600cc (Cat A-type)", C.cyan),
@@ -472,7 +492,14 @@ function ModelView({ consensus }) {
               </tbody>
             </table>
           </div>
-          <div style={{ fontSize: 9, color: C.dim, marginTop: 5 }}>✕ = excluded from MAS core. Methods: seasonal = median m/m of that calendar month (6y, ex-2020); driver models refit on data before each target (no lookahead).</div>
+          <div style={{ fontSize: 9, color: C.dim, marginTop: 5, lineHeight: 1.5 }}>
+            ✕ = excluded from MAS core. Methods: “seasonal” = median m/m of that calendar month (6y, ex-2020) — no driver.
+            Driver overlays exist for utilities (SP tariff step: announced → realised → Brent-window est), private transport (COE),
+            accommodation (URA rents) and food ex-FBS (FAO index); each is refit on data before its target (no lookahead) and
+            r²-gated — a failed fit falls back to LABELLED seasonal rather than a noise model. A one-month-ahead y/y is ~11/12
+            already-published base effects, so the M/M column is the only new information; the backtest-vs-naive RMSE is the
+            evidence the overlays + seasonals together beat carrying last month forward.
+          </div>
         </Panel>
         {/* backtest chart */}
         <Panel title="BACKTEST — HEADLINE Y/Y" note="expanding-window one-step-ahead, last 36 prints">
@@ -539,7 +566,7 @@ function ModelView({ consensus }) {
 
       <div style={{ fontSize: 8.5, color: C.dim, fontFamily: C.mono, paddingBottom: 20 }}>
         M1 = Laspeyres aggregation, DOS 2024 weights (headline = Σ wᵢIᵢ/10000; core = Σ_core wᵢIᵢ/Σ_core wᵢ; reconstruction check {data.reconstruction ? `${data.reconstruction.diffPct}% vs official` : "—"}) ·
-        drivers: SP tariff step × estimated pass-through, COE bidding premiums (data.gov.sg), URA rent lags 3–6q ·
+        drivers: SP tariff step (announced → realised → Brent-window est) × estimated pass-through, COE bidding premiums (data.gov.sg), URA rent lags 3–6q, FAO food lags 4–9m ·
         M2 per BIS Papers 142 (MAS EPG) · cached 6h
       </div>
     </div>
@@ -643,7 +670,7 @@ function NowcastView() {
   const coeLatest = data.coe?.latest || {};
   const coeTraces = [["Category A", C.cyan], ["Category B", C.blue], ["Category E", C.violet]]
     .filter(([k]) => coeH[k])
-    .map(([k, col]) => ({ x: coeH[k].exercises, y: coeH[k].premiums, name: k.replace("Category", "Cat"),
+    .map(([k, col]) => ({ x: coeH[k].exercises.map(exLabel), y: coeH[k].premiums, name: k.replace("Category", "Cat"),
       type: "scatter", mode: "lines+markers", line: { color: col, width: 1.4 }, marker: { size: 3 } }));
   const winShapes = [
     { type: "rect", xref: "x", yref: "paper", x0: t.windowForCurrent?.from, x1: t.windowForCurrent?.to, y0: 0, y1: 1, fillcolor: "rgba(148,163,184,0.10)", line: { width: 0 } },
@@ -658,7 +685,7 @@ function NowcastView() {
         <Stat label="BRENT" value={data.brent?.values?.length ? F(data.brent.values[data.brent.values.length - 1], 2) : "—"} sub="LCOc1 · drives tariff + imported energy" />
         <Stat label="FAO FOOD Y/Y" value={data.fao?.yoy?.values?.length ? `${FP(data.fao.yoy.values[data.fao.yoy.values.length - 1], 1)}%` : "—"} sub={`index ${data.fao?.index?.values?.length ? F(data.fao.index.values[data.fao.index.values.length - 1], 1) : "—"} · feeds food CPI via import prices`} />
         <Stat label="HDB 4RM RENT Y/Y" value={data.hdbRent?.yoy?.values?.length ? `${FP(data.hdbRent.yoy.values[data.hdbRent.yoy.values.length - 1], 1)}%` : "—"} sub="avg of town medians · leads accommodation 4–8q" />
-        <Stat label="COE CAT A" value={coeLatest["Category A"] ? `${Math.round(coeLatest["Category A"].premium / 1000)}k` : "—"} sub={`latest exercise ${coeLatest["Category A"]?.exercise || ""}`} />
+        <Stat label="COE CAT A" value={coeLatest["Category A"] ? `${Math.round(coeLatest["Category A"].premium / 1000)}k` : "—"} sub={`latest ${coeLatest["Category A"] ? exLabel(coeLatest["Category A"].exercise) : "—"}`} />
         <div style={{ flex: 1 }} />
         <div style={{ display: "flex", flexDirection: "column", justifyContent: "center", gap: 4, alignItems: "flex-end" }}>
           <button onClick={() => load(true)} disabled={busy}
@@ -672,29 +699,34 @@ function NowcastView() {
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "1.3fr 1fr", gap: 10, marginBottom: 10 }}>
-        <Panel title="BRENT & THE TARIFF-SETTING WINDOWS" note="grey = window that SET the current tariff · cyan = window forming the NEXT one">
+        <Panel title="BRENT & THE TARIFF-SETTING WINDOWS" note="grey = window that SET the current tariff · cyan = window forming the NEXT one"
+          right={<Chip on>M1 INPUT · utilities — est until SP announces</Chip>}>
           <Lines id="sgn-brent" height={230} ytitle="$/bbl" yzero={false} shapes={winShapes}
             series={[line(data.brent, "Brent (LCOc1)", C.amber)]} />
           <div style={{ fontSize: 9.5, color: C.sub, marginTop: 4 }}>{t.note}</div>
         </Panel>
-        <Panel title="COE PREMIUMS" note="per bidding exercise · data.gov.sg, same-day">
+        <Panel title="COE PREMIUMS" note="per bidding exercise #1/#2 (dataset: month + exercise no., not auction dates)"
+          right={<Chip on>M1 INPUT · private transport</Chip>}>
           {coeTraces.length
-            ? <Lines id="sgn-coe" height={250} ytitle="S$" yzero={false} series={coeTraces} />
+            ? <Lines id="sgn-coe" height={250} ytitle="S$" yzero={false} series={coeTraces} xover={COE_XAXIS} />
             : <Missing what="COE bidding results (data.gov.sg)" err={data.coe?.error} height={250} />}
         </Panel>
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginBottom: 10 }}>
-        <Panel title="FAO FOOD PRICE INDEX" note="y/y % · 0.63 LR pass-through to food import prices; →CPI ~half within 4q (MR Apr-17 Box B)">
+        <Panel title="FAO FOOD PRICE INDEX" note="y/y % · 0.63 LR pass-through to food import prices; →CPI ~half within 4q (MR Apr-17 Box B)"
+          right={<Chip on>M1 INPUT · food (r²-gated)</Chip>}>
           {data.fao?.yoy?.values?.length
             ? <Lines id="sgn-fao" height={190} series={[line(data.fao?.yoy, "FAO food y/y", C.cyan)]} />
             : <Missing what="FAO food price index (fao.org)" err={data.fao?.error} height={190} />}
         </Panel>
-        <Panel title="HDB RENTS" note="avg of town median 4-room rents, quarterly → accommodation CPI with 4–8q lag">
+        <Panel title="HDB RENTS" note="avg of town median 4-room rents, quarterly → accommodation CPI with 4–8q lag"
+          right={<Chip>MONITOR ONLY · M1 uses URA index</Chip>}>
           {data.hdbRent?.avgMedian4rm?.values?.length
             ? <Lines id="sgn-hdb" height={190} ytitle="S$/mo" yzero={false} series={[line(data.hdbRent?.avgMedian4rm, "Avg median 4rm", C.cyan)]} />
             : <Missing what="HDB median rents (data.gov.sg)" err={data.hdbRent?.error} height={190} />}
         </Panel>
-        <Panel title="JET FUEL (SGP FOB SWAP)" note="drives airfares / travel services">
+        <Panel title="JET FUEL (SGP FOB SWAP)" note="drives airfares / travel services"
+          right={<Chip>MONITOR ONLY</Chip>}>
           {data.jetFuel
             ? <Lines id="sgn-jet" height={190} ytitle="$/bbl" yzero={false} series={[line(data.jetFuel, "Jet fuel M1 swap", C.violet)]} />
             : <div style={{ padding: 24, color: C.dim, fontSize: 11 }}>JETSGSWMc1 history not entitled on this Workspace — showing nothing rather than a proxy.</div>}

@@ -101,6 +101,98 @@ COE_DATASET = "d_69b3380ad7e51aff3a7dcc84eba52b8a"
 # data.gov.sg HDB median rents by town & flat type (quarterly)
 HDB_RENT_DATASET = "d_23000a00c52996c55106084ed0339566"
 
+# ── SP Group regulated tariff — hand-updated each quarterly announcement ──
+TARIFF_NOW_CENTS = 31.91      # ¢/kWh ex-GST, current quarter
+TARIFF_ENERGY_CENTS = 25.50   # energy (fuel) component of the above
+TARIFF_ASOF = "Q3-2026 (SP Group)"
+
+
+def _q_window_avg(brent: Dict[str, List], qs: dt.date, upto: Optional[dt.date] = None):
+    """Avg over the first 2.5 months of the quarter starting `qs` (optionally
+    truncated at `upto` for the still-forming window)."""
+    a, b = qs, qs + dt.timedelta(days=75)
+    if upto is not None:
+        b = min(b, upto)
+    vs = [v for d, v in zip(brent["dates"], brent["values"])
+          if a.isoformat() <= d <= b.isoformat()]
+    return (round(float(np.mean(vs)), 2), len(vs)) if vs else (None, 0)
+
+
+def fit_tariff_slope(brent: Dict[str, List], tariff_pts: Dict[str, float]) -> Optional[Dict[str, Any]]:
+    """OLS of realised quarterly tariff steps (SingStat M890991, quarter-start
+    m/m %) on the Brent window Δ% (window Q-1 vs window Q-2), 2011→. Live
+    validation 2026-08-26 (57 steps): Brent r²0.85 BEATS the textbook HSFO 180
+    indexation FO180-SIN (r²0.63) and JKM LNG JKMc1 (r²0.10) — SG gas contracts
+    have migrated to Brent-slope — and the fitted slope ≈0.33 is far below the
+    naive 80% energy share (fixed network costs + contract slopes dilute it)."""
+    pts = {k[:7]: v for k, v in tariff_pts.items() if v is not None}
+    rows = []
+    for y in range(2011, dt.date.today().year + 1):
+        for m in (1, 4, 7, 10):
+            qs = dt.date(y, m, 1)
+            mk, prev = qs.isoformat()[:7], (qs - dt.timedelta(days=1)).isoformat()[:7]
+            if pts.get(mk) is None or pts.get(prev) is None:
+                continue
+            q1 = dt.date(qs.year if qs.month > 3 else qs.year - 1, (qs.month - 4) % 12 + 1, 1)
+            q2 = dt.date(q1.year if q1.month > 3 else q1.year - 1, (q1.month - 4) % 12 + 1, 1)
+            (w1, n1), (w2, n2) = _q_window_avg(brent, q1), _q_window_avg(brent, q2)
+            if w1 and w2 and min(n1, n2) >= 30:
+                rows.append(((pts[mk] / pts[prev] - 1) * 100.0, (w1 / w2 - 1) * 100.0))
+    if len(rows) < 12:
+        return None
+    y = np.array([r[0] for r in rows]); x = np.array([r[1] for r in rows])
+    X = np.column_stack([np.ones(len(x)), x])
+    beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+    resid = y - X @ beta
+    r2 = 1.0 - float(resid @ resid) / (float((y - y.mean()) @ (y - y.mean())) or 1e-12)
+    return {"slope": round(float(beta[1]), 3), "intercept": round(float(beta[0]), 2),
+            "r2": round(r2, 3), "n": len(rows)}
+
+
+def tariff_window_est(brent: Dict[str, List], today: dt.date,
+                      slope_fit: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """SP tariff-window arithmetic: quarter Q's tariff = avg oil-indexed gas
+    (Brent — live-validated as the BEST observable proxy, see fit_tariff_slope)
+    over the first 2.5 months of quarter Q-1. Returns both windows, the
+    estimated % step for the NEXT quarter and the month that step lands in
+    (nextStepMonth). Shared by the NOWCAST panel and by M1's utilities driver,
+    where it fills the gap until SP announces the step (KNOWN_TARIFF_STEPS in
+    sg_inflation_model then overrides it). With `slope_fit` the estimate uses
+    the FITTED slope of realised steps on window Δ%; without it, the assumed
+    80% energy share (labelled as such)."""
+    q = (today.month - 1) // 3 + 1
+    cur_q_start = dt.date(today.year, 3 * q - 2, 1)
+    prev_q_start = (cur_q_start - dt.timedelta(days=1)).replace(day=1)
+    prev_q_start = dt.date(prev_q_start.year, 3 * ((prev_q_start.month - 1) // 3) + 1, 1)
+    next_q_start = (cur_q_start + dt.timedelta(days=93)).replace(day=1)
+    nw_a, nw_b = cur_q_start, cur_q_start + dt.timedelta(days=75)
+    cw_a, cw_b = prev_q_start, prev_q_start + dt.timedelta(days=75)
+    next_avg, n_next = _q_window_avg(brent, cur_q_start, upto=today)
+    cur_avg, _ = _q_window_avg(brent, prev_q_start)
+    if slope_fit:
+        slope = slope_fit["slope"]
+        basis = (f"fitted slope {slope:.2f} (OLS of realised steps on window Δ%, "
+                 f"r²{slope_fit['r2']}, n{slope_fit['n']} quarterly steps 2011→, refit each build)")
+    else:
+        slope = TARIFF_ENERGY_CENTS / TARIFF_NOW_CENTS
+        basis = f"assumed energy share {slope:.0%} (slope fit unavailable)"
+    return {
+        "currentTariffCents": TARIFF_NOW_CENTS,
+        "energyComponentCents": TARIFF_ENERGY_CENTS,
+        "asOf": TARIFF_ASOF,
+        "windowForNext": {"from": nw_a.isoformat(), "to": nw_b.isoformat(),
+                          "brentAvgSoFar": next_avg, "daysIn": n_next},
+        "windowForCurrent": {"from": cw_a.isoformat(), "to": cw_b.isoformat(),
+                             "brentAvg": cur_avg},
+        "estNextStepPct": (round((next_avg / cur_avg - 1.0) * 100.0 * slope, 1)
+                           if next_avg and cur_avg else None),
+        "estBasis": {**(slope_fit or {}), "text": basis},
+        "nextStepMonth": next_q_start.isoformat()[:7],
+        "note": ("Tariff energy component = avg gas over the first 2.5 months of the prior quarter; "
+                 "Brent is the PROXY for the oil-indexed gas price — live-validated best single input "
+                 "(r²0.85 on 57 realised steps vs HSFO-180 0.63, JKM 0.10). Estimate = window Δ% × " + basis + "."),
+    }
+
 # ───────────────────────── Policy tables (verified 2026-08-23) ─────────────────────────
 MPS_DECISIONS = [  # (date, action) — slope/width/centre wording condensed
     ("2016-04-14", "Slope to 0% (neutral)"),
@@ -518,37 +610,19 @@ class SgFundamentalsService:
                         vs.append(float(v))
                 return {"dates": ds, "values": vs}
 
-            brent = _daily("LCOc1", 400)
+            brent_full = _daily("LCOc1", 6200)   # 2010→ (one request; slope fit needs the history)
+            cut = (today - dt.timedelta(days=400)).isoformat()
+            brent = {"dates": [d for d in brent_full["dates"] if d >= cut],
+                     "values": [v for d, v in zip(brent_full["dates"], brent_full["values"]) if d >= cut]}
             jet = _daily("JETSGSWMc1", 200)   # Jet Fuel FOB Spore swap (may be unentitled)
 
-            # Tariff-setting window: quarter Q's tariff = avg gas (oil-indexed)
-            # over the FIRST 2.5 MONTHS of quarter Q-1. Track the window forming
-            # for the NEXT quarter vs the one that set the CURRENT tariff.
-            def _window_avg(s, a: dt.date, b: dt.date):
-                vs = [v for d, v in zip(s["dates"], s["values"]) if a.isoformat() <= d <= b.isoformat()]
-                return (round(float(np.mean(vs)), 2), len(vs)) if vs else (None, 0)
-
-            q = (today.month - 1) // 3 + 1
-            cur_q_start = dt.date(today.year, 3 * q - 2, 1)
-            prev_q_start = (cur_q_start - dt.timedelta(days=1)).replace(day=1)
-            prev_q_start = dt.date(prev_q_start.year, 3 * ((prev_q_start.month - 1) // 3) + 1, 1)
-            def _win(qs: dt.date):
-                return qs, (qs + dt.timedelta(days=75))
-            nw_a, nw_b = _win(cur_q_start)          # sets NEXT quarter's tariff
-            cw_a, cw_b = _win(prev_q_start)         # set the CURRENT tariff
-            next_avg, n_next = _window_avg(brent, nw_a, min(nw_b, today))
-            cur_avg, _ = _window_avg(brent, cw_a, cw_b)
-            tariff = {
-                "currentTariffCents": 31.91, "energyComponentCents": 25.50,
-                "asOf": "Q3-2026 (SP Group)",
-                "windowForNext": {"from": nw_a.isoformat(), "to": nw_b.isoformat(),
-                                  "brentAvgSoFar": next_avg, "daysIn": n_next},
-                "windowForCurrent": {"from": cw_a.isoformat(), "to": cw_b.isoformat(),
-                                     "brentAvg": cur_avg},
-                "estNextStepPct": (round((next_avg / cur_avg - 1.0) * 100.0 * (25.50 / 31.91), 1)
-                                   if next_avg and cur_avg else None),
-                "note": "Tariff energy component = avg gas over the first 2.5 months of the prior quarter; Brent is a PROXY for the oil-indexed gas price. Estimate = window Δ% × energy share (80%).",
-            }
+            # Tariff-setting window (shared arithmetic — also feeds M1's
+            # utilities driver during the announcement gap). Slope of realised
+            # steps on window Δ% is refit from history each build.
+            tariff_tbl = ext_data.singstat_table("M890991", series=["1"], start_year=2010)
+            slope_fit = fit_tariff_slope(brent_full,
+                                         (tariff_tbl["series"].get("1") or {}).get("points", {}))
+            tariff = tariff_window_est(brent_full, today, slope_fit)
 
             fao_raw = ext_data.fao_food_index()
             fao_sr = _pts_to_series({k + "-01": v for k, v in (fao_raw.get("points") or {}).items()})

@@ -6,11 +6,17 @@ Two models, per SG_FUNDAMENTALS_PLAN.md §1.2, both honest v1s:
 M1 — bottom-up component nowcast (the MAS communication structure):
   For the next unpublished CPI month, forecast each of the 14 components' m/m as
   seasonal median m/m (that calendar month, last 6 yrs, 2020 excluded) plus a
-  driver overlay where we genuinely know something:
-    · Utilities         — the SP regulated tariff step (known ~2wks before the
-                          quarter) × an estimated CPI pass-through
+  driver overlay where we genuinely know something (all r²-gated ≥0.15 — a
+  failed fit falls back to labelled seasonal):
+    · Utilities         — the SP regulated tariff step × an estimated CPI
+                          pass-through. Step source, in priority order: the
+                          announced step (KNOWN_TARIFF_STEPS) → the realised
+                          tariff-series m/m → the Brent tariff-window estimate
+                          (shared with the NOWCAST tab) until SP announces
     · Private transport — OLS on COE premium m/m (lags 0,1)
     · Accommodation     — OLS of component y/y on URA rental y/y (avg lag 3–6q)
+    · Food ex-FBS       — OLS of component y/y on FAO food-index y/y (avg lag
+                          4–9 months; MR Apr-17 Box B channel)
   Aggregate with 2024 CPI weights (Laspeyres: All-Items = Σ wᵢIᵢ/10000 exactly,
   MAS Core = Σ_core wᵢIᵢ / Σ_core wᵢ) → headline & core y/y nowcasts.
   Validated by reconstructing the latest PUBLISHED month from components.
@@ -36,7 +42,8 @@ import numpy as np
 
 import ext_data
 from sg_fundamentals_service import (CPI_COMPONENTS, _CPI_ALL_SERIES, COE_DATASET,
-                                     load_vintages, save_vintage)
+                                     fit_tariff_slope, load_vintages, save_vintage,
+                                     tariff_window_est)
 
 log = logging.getLogger("sg_model")
 
@@ -56,6 +63,10 @@ _UTIL_W = {"elec": 179.0, "gas": 19.0, "water": 66.0, "other": 18.0}
 
 # GST step dummies for M2 (12 months of y/y level shift after each hike)
 _GST_HIKES = ["2023-01", "2024-01"]
+
+# FAO food-index lags feeding the food-ex-FBS driver (months). MR Apr-17 Box B:
+# global food → import prices → food CPI, ~half the pass-through within 4q.
+_FAO_LAGS = range(4, 10)
 
 SPF_NEXT_MEETING = {  # SPF Jun-2026 Table 4 — respondents' expectations for Oct-26 MPS
     "meeting": "Oct 2026 (NLT 14 Oct)",
@@ -149,6 +160,24 @@ class SgInflationModel:
                          for r in recs
                          if isinstance(r.get("VALUE", r.get(ric)), (int, float))})
 
+    def _lseg_daily(self, ric: str, days: int) -> Dict[str, List]:
+        fields = ("TRDPRC_1", "SETTLE", "BID")
+        try:
+            h = self.lseg.get_history([ric], fields=list(fields), interval="daily",
+                                      start=(dt.date.today() - dt.timedelta(days=days)).isoformat(),
+                                      end=dt.date.today().isoformat())
+        except Exception as e:
+            log.warning("daily %s failed: %s", ric, e)
+            return {"dates": [], "values": []}
+        recs = h.get(ric) or h.get("default") or []
+        ds, vs = [], []
+        for r in recs:
+            v = next((r[f] for f in fields if isinstance(r.get(f), (int, float))), None)
+            if v is not None:
+                ds.append(str(r.get("Date", ""))[:10])
+                vs.append(float(v))
+        return {"dates": ds, "values": vs}
+
     def _load(self) -> Dict[str, Any]:
         # CPI components + All Items (full history; 16 rows ≈ 26y under the cell cap)
         cpi_tbl = ext_data.singstat_table(
@@ -177,13 +206,25 @@ class SgInflationModel:
         imp = self._lseg_monthly("aSGIMPP")
         neer = self._lseg_monthly("aSGDEOP")
         ip = self._lseg_monthly("aSGIP/C")
+        # FAO food price index (global, monthly) — food-ex-FBS driver
+        fao_raw = ext_data.fao_food_index()
+        fao = _Monthly(fao_raw.get("points") or {})
+        # Brent daily → SP tariff-window step estimate: fills the utilities
+        # driver during the announcement gap (KNOWN_TARIFF_STEPS overrides).
+        # Slope of realised steps on window Δ% refit from 2010→ history.
+        brent = self._lseg_daily("LCOc1", 6200)
+        tariff_est = None
+        if brent["values"]:
+            slope_fit = fit_tariff_slope(brent, (tariff_tbl["series"].get("1") or {}).get("points", {}))
+            tariff_est = tariff_window_est(brent, dt.date.today(), slope_fit)
         return {"comp": comp, "all": allitems, "coreOff": core_official,
-                "tariff": tariff, "rentQ": rent_q,
+                "tariff": tariff, "rentQ": rent_q, "fao": fao,
+                "tariffEst": tariff_est,
                 "coeBid": coe_bid, "coeA": coe_a, "coeB": coe_b,
                 "imp": imp, "neer": neer, "ip": ip,
                 "srcErr": {k: t.get("error") for k, t in
                            [("cpi", cpi_tbl), ("core", core_tbl), ("tariff", tariff_tbl),
-                            ("rent", rent_tbl)] if t.get("error")}}
+                            ("rent", rent_tbl), ("fao", fao_raw)] if t.get("error")}}
 
     def _coe_bidding_monthly(self) -> _Monthly:
         """Monthly avg Cat A/B bidding premium from data.gov.sg (2010→)."""
@@ -245,6 +286,38 @@ class SgInflationModel:
         beta, r2 = _ols(y, X)
         return {"a": float(beta[0]), "b": float(beta[1]), "r2": round(r2, 3), "n": len(rows)}
 
+    def _fit_food(self, comp: _Monthly, fao: _Monthly, asof: str):
+        """food-ex-FBS y/y ~ a + b · avg(FAO food-index y/y over lags 4–9m)."""
+        rows = []
+        for m in comp.months():
+            if m >= asof or m < _FIT_START:
+                continue
+            yv = comp.yoy(m)
+            lags = [fao.yoy(_shift_month(m, -k)) for k in _FAO_LAGS]
+            lags = [x for x in lags if x is not None]
+            if yv is not None and len(lags) >= 4:
+                rows.append((yv, float(np.mean(lags))))
+        if len(rows) < 36:
+            return None
+        y = np.array([r[0] for r in rows]); x = np.array([r[1] for r in rows])
+        X = np.column_stack([np.ones(len(x)), x])
+        beta, r2 = _ols(y, X)
+        return {"a": float(beta[0]), "b": float(beta[1]), "r2": round(r2, 3), "n": len(rows)}
+
+    def _crawl_plus_seasonal(self, s: _Monthly, yoy_hat: float,
+                             seas_mm: Optional[float], asof: str) -> float:
+        """Turn a fitted y/y into this month's m/m: trend from the driver,
+        month-pattern from history. Crawl = geometric monthly pace of the
+        fitted y/y (never force the level — a level target dumps any y/y gap
+        into one month's m/m, which blew up 2023 backtests by +9pp);
+        + seasonal FACTOR (this month's median m/m minus the all-months mean)
+        to keep calendar effects like the S&CC-rebate months."""
+        crawl = ((1.0 + yoy_hat / 100.0) ** (1.0 / 12.0) - 1.0) * 100.0
+        seas_all = [self._seasonal_mm(s, f"2000-{mo:02d}", asof) for mo in range(1, 13)]
+        seas_all = [x for x in seas_all if x is not None]
+        return crawl + ((seas_mm if seas_mm is not None else 0.0)
+                        - (float(np.mean(seas_all)) if seas_all else 0.0))
+
     def _fit_privtrans(self, comp: _Monthly, coe: _Monthly, asof: str):
         """private-transport m/m ~ a + b0·coe_mm + b1·coe_mm₋₁."""
         rows = []
@@ -303,15 +376,22 @@ class SgInflationModel:
             mm = self._seasonal_mm(s, target, asof)
             method = "seasonal"
             if c["key"] == "utilities":
-                step = KNOWN_TARIFF_STEPS.get(target)
+                # Step source, in priority order: announced → realised → Brent-window est
+                step, src = KNOWN_TARIFF_STEPS.get(target), "announced"
                 if step is None and data["tariff"].mm(target) is not None and abs(data["tariff"].mm(target)) > 2.0:
-                    step = {"elec": data["tariff"].mm(target), "gas": 0.0}
+                    step, src = {"elec": data["tariff"].mm(target), "gas": 0.0}, "realised"
+                if step is None:
+                    te = data.get("tariffEst")
+                    if (te and te.get("estNextStepPct") is not None
+                            and te.get("nextStepMonth") == target
+                            and abs(te["estNextStepPct"]) > 2.0):
+                        step, src = {"elec": te["estNextStepPct"], "gas": 0.0}, "Brent-window est"
                 if step:
                     est = self._est_tariff_pass(s, data["tariff"], asof)
                     tw = sum(_UTIL_W.values())
                     mm = est["pass"] * (_UTIL_W["elec"] * step["elec"]
                                         + _UTIL_W["gas"] * step.get("gas", 0.0)) / tw
-                    method = f"tariff step ×{est['pass']:.2f} pass ({est['nEvents']} events)"
+                    method = f"{src} tariff step ×{est['pass']:.2f} pass ({est['nEvents']} events)"
             elif c["key"] == "privTrans":
                 fit = self._fit_privtrans(s, coe_avg, asof)
                 x0, x1 = coe_avg.mm(target), coe_avg.mm(prev)
@@ -327,23 +407,21 @@ class SgInflationModel:
                         for q in (3, 4, 5, 6)]
                 lags = [x for x in lags if x is not None]
                 if fit and fit["r2"] >= 0.15 and lags:
-                    # Trend from rents, month-pattern from history:
-                    #   crawl = geometric monthly pace of the fitted y/y (never
-                    #   force the level — a level target dumps any y/y gap into
-                    #   one month's m/m, which blew up 2023 backtests by +9pp);
-                    #   + seasonal FACTOR (this month's median m/m minus the
-                    #   all-months mean) to keep the S&CC-rebate calendar.
                     yoy_hat = fit["a"] + fit["b"] * float(np.mean(lags))
-                    crawl = ((1.0 + yoy_hat / 100.0) ** (1.0 / 12.0) - 1.0) * 100.0
-                    seas_all = [self._seasonal_mm(s, f"2000-{mo:02d}", asof)
-                                for mo in range(1, 13)]
-                    seas_all = [x for x in seas_all if x is not None]
-                    seas_factor = ((mm if mm is not None else 0.0)
-                                   - (float(np.mean(seas_all)) if seas_all else 0.0))
-                    mm = crawl + seas_factor
+                    mm = self._crawl_plus_seasonal(s, yoy_hat, mm, asof)
                     method = f"rent-lag OLS r²{fit['r2']} → crawl + seas"
                 elif fit:
                     method = f"seasonal (rent fit r²{fit['r2']} < gate)"
+            elif c["key"] == "foodExFbs":
+                fit = self._fit_food(s, data["fao"], asof)
+                lags = [data["fao"].yoy(_shift_month(target, -k)) for k in _FAO_LAGS]
+                lags = [x for x in lags if x is not None]
+                if fit and fit["r2"] >= 0.15 and len(lags) >= 4:
+                    yoy_hat = fit["a"] + fit["b"] * float(np.mean(lags))
+                    mm = self._crawl_plus_seasonal(s, yoy_hat, mm, asof)
+                    method = f"FAO-lag OLS r²{fit['r2']} → crawl + seas"
+                elif fit:
+                    method = f"seasonal (FAO fit r²{fit['r2']} < gate)"
             if mm is None:
                 mm = 0.0
                 method = "flat (no seasonal history)"
