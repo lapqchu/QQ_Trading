@@ -40,6 +40,7 @@ from sg_fundamentals_service import SgFundamentalsService
 from sg_inflation_model import SgInflationModel
 from em_rules_service import EmRulesService
 from client_flow_service import ClientFlowService, ParseError
+from imm_roll_service import ImmRollService
 from ric_config import CURRENCIES, NDF_CURRENCIES, DELIVERABLE_CURRENCIES, get_spread_pack, get_spread_packs, FUNDING_TENORS, iy_basis
 
 load_dotenv()
@@ -59,6 +60,7 @@ fund: SgFundamentalsService | None = None
 fund_model: SgInflationModel | None = None
 rules: EmRulesService | None = None
 flow: ClientFlowService | None = None
+immroll: ImmRollService | None = None
 
 
 def _flow_spot_fetcher(pair: str) -> Dict[str, Any]:
@@ -98,7 +100,7 @@ def _flow_spot_fetcher(pair: str) -> Dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global lseg, market, neer, risk, carry, fund, fund_model, rules, flow
+    global lseg, market, neer, risk, carry, fund, fund_model, rules, flow, immroll
     lseg = LsegClient(app_key=os.environ.get("LSEG_APP_KEY"))
     try:
         lseg.open()
@@ -115,6 +117,7 @@ async def lifespan(app: FastAPI):
     rules = EmRulesService(lseg)         # EM Rules screener (Willer/Chandran/Lam), tab 5
     flow = ClientFlowService()           # Client Flow tab — LSEG-independent ingest/analytics
     flow.set_spot_fetcher(_flow_spot_fetcher)
+    immroll = ImmRollService(lseg)       # IMM Roll seasonality study (tab 7)
     log.info("FX dashboard backend ready")
     yield
     log.info("Shutting down")
@@ -641,6 +644,31 @@ def flow_analytics(panel: str, pair: str | None = Query(None),
         raise
     except Exception as e:
         log.exception("flow analytics %s failed", panel)
+        raise HTTPException(500, str(e))
+
+
+# ─────────────────────────── IMM Roll study (deep-dive tab 7) ───────────────────────────
+@app.get("/api/immroll/universe")
+def immroll_universe() -> Dict[str, Any]:
+    """Which currencies support the IMM roll study (audit exclusions surfaced)."""
+    return immroll.universe()
+
+
+@app.get("/api/immroll/study")
+def immroll_study(ccy: str = Query(...), pair: str = Query("SEP_DEC")) -> Dict[str, Any]:
+    """Reconstructed IMM fwd-fwd roll seasonality for one currency × roll pair.
+    First call per (ccy, pair, day) pulls ~7-10 daily histories (cached 24h)."""
+    if not lseg or not lseg.is_open():
+        raise HTTPException(503, "LSEG session not open — check Workspace app & APP_KEY")
+    try:
+        res = immroll.study(ccy.upper(), pair.upper())
+        if res.get("error"):
+            raise HTTPException(422, res["error"])
+        return res
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("immroll study failed")
         raise HTTPException(500, str(e))
 
 

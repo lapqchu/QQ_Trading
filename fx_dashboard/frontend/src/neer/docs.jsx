@@ -79,6 +79,53 @@ export const DOCS = {
     ],
   },
 
+  // ═══════════════════════ IMM ROLLS ═══════════════════════
+  immroll: {
+    title: "IMM ROLLS — quarterly roll seasonality study",
+    tagline: "Did pre-positioning into the IMM roll pay, year by year? Event-time evidence, honest about its tiny n.",
+    why: [
+      "Interbank FX forward risk warehouses at the quarterly IMM dates (3rd Wednesday of Mar/Jun/Sep/Dec) — in NDF markets especially, that is where the stock of positions sits. Into each roll, one side must pay to move its book from the front IMM date to the next, and that one-sided flow can push the near/far forward-forward spread in a repeatable direction during the run-up. The tradeable version: enter the roll (e.g. long Sep→Dec) about a month before the September IMM date and exit when the near leg stops trading as a forward. This tab shows what that did, every year, per currency.",
+      "The series is RECONSTRUCTED: for each historical day, the anchor forward outrights (spot + composite points) plus that day's SOFR OIS curve rebuild the currency's discount-factor curve — the pricer's own engine, applied backwards — and the fwd-fwd yield between the two fixed IMM dates is read off the interval DF. Because the IMM dates are FIXED per event, the change in that yield through the window is already the fair-game measure (a forward rate has no mechanical roll-down to strip): drift from entry to exit IS the seasonal edge, if any.",
+      "n IS SMALL AND THE TAB SAYS SO. USD OIS history starts Jun-2018, so each roll pair has at most ~8 completed cycles. Everything is therefore shown as per-year paths and one dot per year, with a bootstrap CI that will usually span zero — a 75% hit rate over 8 years is suggestive, not proof. Currencies whose points history cannot support the study (MYR's post-2016 composite gaps, NGN, EGP) are excluded with the audit reason shown, never averaged over.",
+      "Dec-containing pairs (Sep→Dec, Dec→Mar) embed the YEAR-END TURN premium, which this v1 does not strip — the amber banner appears on those pairs. The turn moves the level of the far leg; read the direction and dispersion of those pairs with suspicion until turn-stripping is wired in (the Clean-vs-Dirty machinery exists for exactly this).",
+    ],
+    howLabel: "PANEL BY PANEL",
+    how: [
+      { name: "STATS STRIP",
+        what: "Mean and median Δ (entry ≈ bd −21 → exit ≈ bd −5) in bp of fwd-fwd yield, hit rate of Δ>0, the year-resampled bootstrap 95% CI, the number of completed cycles, and where THIS year's cycle sits vs the seasonal norm at the same distance from the IMM date (z of the current Δ vs history at that bd).",
+        read: "Positive Δ = the far leg richened vs the near = long-roll P&L in yield terms (before costs). Trust the median and hit rate over the mean at this n; the CI containing zero is the honest statement that 8 years cannot prove a seasonal. The z chip is the actionable line: |z| ≥ 1.5 says this year's roll is moving unusually vs its own seasonal path.",
+        why: "One number per year is all the data there is — the strip refuses to manufacture more." },
+      { name: "EVENT-TIME CHART",
+        what: "Every year's fwd-fwd path in business days to the near IMM date, re-anchored to zero at the entry (~bd −21): grey = completed years, cyan = cross-year mean (drawn only where ≥4 years observed), amber = the current cycle. Days lacking a full curve (missing points or SOFR) are dropped and counted — never interpolated over.",
+        read: "A genuine roll seasonal looks like grey lines drifting the same way into the right edge with the cyan mean pulling away from zero. Wide grey dispersion around a small mean = no edge, whatever the mean says. The exit is ~bd −5 because for T+2 settlement the spot date overtakes the IMM date ~2-3 business days out — after that the near leg is no longer a forward and the roll is done.",
+        why: "Event-time overlay is the only honest way to pool 8 observations without smoothing them into a story." },
+      { name: "Δ PER YEAR (dots)",
+        what: "One dot per completed cycle: the entry→exit Δ in bp, green/red by sign, dotted line at the mean.",
+        read: "This is the underlying sample, undressed. If the dots don't convince you, the mean shouldn't either. Check WHICH years drove the mean — a seasonal carried by 2020 and 2022 is a crisis story, not a calendar story.",
+        why: "The same standard as the Client Flow month-of-year panel: at single-digit n, dots are the statistics." },
+      { name: "IMM COUNTDOWN (header chips)",
+        what: "The next four IMM dates with business-day countdowns; amber when within the ~21bd entry window.",
+        read: "An amber chip on the pair you trade = the study window for THIS cycle is open now — compare the amber path against the cyan mean before positioning.",
+        why: "The whole tab exists to answer 'should I pre-position for the roll that is coming up'." },
+    ],
+    overlaps: [
+      "Live IMM fwd-fwd levels (today's curve) are on the pricer's Spreads & Rolls tab — same DF engine, same IMM date math. This tab is the HISTORY of those numbers in event time.",
+      "Year-end turn premia in Dec spreads are measured on the Clean vs Dirty tab; until that machinery is wired in here, Dec-containing pairs carry the contamination banner.",
+      "The Client Flow tab can condition on days-to-IMM (do clients pre-position into rolls?) — the two tabs are designed to be read together.",
+    ],
+    integrity: [
+      { cls: "live", item: "Daily histories", note: "spot, composite forward points, and SOFR OIS from LSEG (cached 24h); the reconstruction uses only observed quotes." },
+      { cls: "model", item: "Everything derived", note: "the DF reconstruction, event-time paths, Δ stats, bootstrap CIs and the seasonal z are all computed — pricing-grade for the curve math, but value dates use weekday arithmetic (no holiday calendars), a stated 1-2 day approximation acceptable for a Δ-study only." },
+      { cls: "gap", item: "MYR / NGN / EGP · pre-2018 · incomplete-curve days", note: "excluded with reasons (data audit), window pinned by USD OIS history (no fed-funds OIS fallback entitled on this Workspace), dropped days counted — nothing filled in." },
+    ],
+    refs: [
+      { label: "Futures roll congestion / calendar-spread pressure literature", note: "the equity/rates analogue of the mechanism: predictable roll flow moves calendar spreads into expiry.",
+        search: ["futures roll congestion calendar spread pressure", "index futures roll cost predictable flow"] },
+      { label: "NDF market structure — IMM date concentration", note: "why the warehousing story is strongest in KRW/TWD/INR/CNH NDFs.",
+        search: ["NDF interbank IMM dates market structure", "non-deliverable forward roll flow"] },
+    ],
+  },
+
   // ═══════════════════════ EM RULES ═══════════════════════
   rules: {
     title: "EM RULES — Willer/Chandran/Lam screener",
