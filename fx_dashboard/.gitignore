@@ -1,6 +1,10 @@
 __pycache__/
 # .fund_cache is DELIBERATELY tracked: it is the snapshot-sync layer for machines
 # whose network blocks the external statistics hosts (see OFFICE_SETUP.md).
+# .flow_data is the OPPOSITE: it holds uploaded client-flow data (sensitive) and is
+# explicitly excluded from snapshot-sync FOREVER — the backend's git-safety canary
+# refuses all ingest if this entry is ever removed or the dir becomes tracked.
+backend/.flow_data/
 frontend/dist/
 backend/venv/
 backend/.venv*/

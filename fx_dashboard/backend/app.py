@@ -26,7 +26,7 @@ import time
 from contextlib import asynccontextmanager
 from typing import Dict, Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -39,6 +39,7 @@ from carry_basket_service import CarryBasketService
 from sg_fundamentals_service import SgFundamentalsService
 from sg_inflation_model import SgInflationModel
 from em_rules_service import EmRulesService
+from client_flow_service import ClientFlowService, ParseError
 from ric_config import CURRENCIES, NDF_CURRENCIES, DELIVERABLE_CURRENCIES, get_spread_pack, get_spread_packs, FUNDING_TENORS
 
 load_dotenv()
@@ -57,11 +58,47 @@ carry: CarryBasketService | None = None
 fund: SgFundamentalsService | None = None
 fund_model: SgInflationModel | None = None
 rules: EmRulesService | None = None
+flow: ClientFlowService | None = None
+
+
+def _flow_spot_fetcher(pair: str) -> Dict[str, Any]:
+    """Daily spot mids for the Client Flow tape overlay. Degrades visibly:
+    no LSEG session or unknown pair → {'available': False, reason} — never proxied."""
+    if not lseg or not lseg.is_open():
+        return {"available": False, "reason": "LSEG session not open — open Workspace",
+                "dates": [], "mid": []}
+    code = next((c for c, cfg in CURRENCIES.items() if cfg.pair == pair), None)
+    if code is None:
+        return {"available": False, "reason": f"no spot series configured for {pair}",
+                "dates": [], "mid": []}
+    ric = CURRENCIES[code].spot_ric
+    try:
+        h = lseg.get_history([ric], fields=["BID", "ASK"], interval="daily",
+                             start=(__import__("datetime").date.today()
+                                    - __import__("datetime").timedelta(days=4 * 365)).isoformat())
+        dates, mids = [], []
+        for bar in (h or {}).get(ric) or []:
+            dt = (bar.get("Date") or "")[:10]
+            b, a = bar.get("BID"), bar.get("ASK")
+            try:
+                b = float(b) if b is not None else None
+                a = float(a) if a is not None else None
+            except (TypeError, ValueError):
+                b = a = None
+            m = (b + a) / 2.0 if (b is not None and a is not None) else (b if b is not None else a)
+            if dt and m is not None:
+                dates.append(dt)
+                mids.append(m)
+        if not dates:
+            return {"available": False, "reason": "no spot history returned", "dates": [], "mid": []}
+        return {"available": True, "ric": ric, "dates": dates, "mid": mids}
+    except Exception as e:
+        return {"available": False, "reason": f"spot fetch failed: {e}", "dates": [], "mid": []}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global lseg, market, neer, risk, carry, fund, fund_model, rules
+    global lseg, market, neer, risk, carry, fund, fund_model, rules, flow
     lseg = LsegClient(app_key=os.environ.get("LSEG_APP_KEY"))
     try:
         lseg.open()
@@ -76,6 +113,8 @@ async def lifespan(app: FastAPI):
     fund = SgFundamentalsService(lseg)  # SG Fundamentals country monitor (deep-dive tab 4)
     fund_model = SgInflationModel(lseg)  # SG inflation nowcast + Phillips curve (MODEL sub-tab)
     rules = EmRulesService(lseg)         # EM Rules screener (Willer/Chandran/Lam), tab 5
+    flow = ClientFlowService()           # Client Flow tab — LSEG-independent ingest/analytics
+    flow.set_spot_fetcher(_flow_spot_fetcher)
     log.info("FX dashboard backend ready")
     yield
     log.info("Shutting down")
@@ -484,6 +523,124 @@ def neer_sgd_calibration() -> Dict[str, Any]:
         return neer.calibration()
     except Exception as e:
         log.exception("neer_sgd_calibration failed")
+        raise HTTPException(500, str(e))
+
+
+# ─────────────────────────── Client Flow (deep-dive tab 6) ───────────────────────────
+# LSEG-independent: ingest + analytics run on the local sqlite store. Only the
+# tape's spot overlay touches LSEG, and it degrades visibly when the session is
+# closed. No polling — the frontend refetches on storeVersion change.
+class _FlowCommitReq(BaseModel):
+    sha: str
+
+
+class _FlowRevertReq(BaseModel):
+    uploadId: int
+
+
+@app.post("/api/flow/upload/preview")
+async def flow_upload_preview(request: Request, filename: str = Query("upload.csv"),
+                              pair: str | None = Query(None)) -> Dict[str, Any]:
+    """Phase 1: parse + QC + diff vs store + rebase/restatement verdict. Writes nothing."""
+    data = await request.body()
+    if not data:
+        raise HTTPException(422, "empty upload body")
+    try:
+        return flow.preview(data, filename, pair)
+    except ParseError as e:
+        raise HTTPException(422, str(e))
+    except Exception as e:
+        log.exception("flow preview failed")
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/flow/upload/commit")
+def flow_upload_commit(req: _FlowCommitReq) -> Dict[str, Any]:
+    try:
+        return flow.commit(req.sha)
+    except ParseError as e:
+        raise HTTPException(422, str(e))
+    except Exception as e:
+        log.exception("flow commit failed")
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/flow/upload/revert")
+def flow_upload_revert(req: _FlowRevertReq) -> Dict[str, Any]:
+    try:
+        return flow.revert(req.uploadId)
+    except ParseError as e:
+        raise HTTPException(422, str(e))
+    except Exception as e:
+        log.exception("flow revert failed")
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/flow/status")
+def flow_status() -> Dict[str, Any]:
+    try:
+        return flow.status()
+    except Exception as e:
+        log.exception("flow status failed")
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/flow/config")
+def flow_get_config() -> Dict[str, Any]:
+    return flow.get_config()
+
+
+@app.post("/api/flow/config")
+def flow_set_config(patch: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        return flow.set_config(patch)
+    except ParseError as e:
+        raise HTTPException(422, str(e))
+
+
+@app.get("/api/flow/analytics/{panel}")
+def flow_analytics(panel: str, pair: str | None = Query(None),
+                   clientType: str = Query("all client types"),
+                   weeks: int = Query(26),
+                   anchorDays: int = Query(183),
+                   exMonthEnd: bool = Query(False),
+                   includeHolidays: bool = Query(False),
+                   excludeHolidayWeeks: bool = Query(True)) -> Dict[str, Any]:
+    """Panel-keyed analytics on the canonical derived frame (cached per storeVersion)."""
+    ck = clientType.strip().lower()
+    try:
+        if panel == "monitor":
+            return flow.panel_monitor()
+        if panel == "heatmap":
+            return flow.panel_heatmap()
+        if panel == "anomaly":
+            return flow.panel_anomaly()
+        if panel == "positioning":
+            return flow.panel_positioning(pair, ck)
+        if not pair:
+            raise HTTPException(422, f"panel '{panel}' needs a pair")
+        if panel == "typicalweek":
+            return flow.panel_typicalweek(pair, ck, exclude_holiday_weeks=excludeHolidayWeeks)
+        if panel == "tape":
+            return flow.panel_tape(pair, ck, anchor_days=anchorDays)
+        if panel == "intraday":
+            return flow.panel_intraday(pair, ck, weeks=weeks)
+        if panel == "dow":
+            return flow.panel_dow(pair, ck, weeks=weeks, ex_month_end=exMonthEnd,
+                                  include_holidays=includeHolidays)
+        if panel == "tom":
+            return flow.panel_tom(pair, ck)
+        if panel == "moy":
+            return flow.panel_moy(pair, ck)
+        if panel == "holiday_us":
+            return flow.panel_holiday(pair, ck, "us")
+        if panel == "holiday_local":
+            return flow.panel_holiday(pair, ck, "local")
+        raise HTTPException(404, f"unknown panel '{panel}'")
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("flow analytics %s failed", panel)
         raise HTTPException(500, str(e))
 
 

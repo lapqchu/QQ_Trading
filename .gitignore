@@ -5,3 +5,7 @@ __pycache__/
 *.pyc
 .DS_Store
 *.log
+# local working files — never push to the public repo (PUSH_TO_GITHUB.sh uses git add -A)
+.claude/
+Hyperliquid_Project_Setup/
+task_plan.md

@@ -36,6 +36,9 @@ _CCY_CAL: Dict[str, str] = {
     "CZK": "CZ", "ILS": "IL", "RON": "RO", "PLN": "PL", "HUF": "HU", "KZT": "KZ",
     "RUB": "RU", "UGX": "UG", "MUR": "MU", "BWP": "BW", "SAR": "SA", "AED": "AE",
     "MAD": "MA", "TND": "TN", "QAR": "QA",
+    # LatAm/Asia names present in client-flow exports but outside the pricer universe
+    # (Client Flow tab holiday panels; harmless here — the pricer never asks for them).
+    "BRL": "BR", "PEN": "PE", "ARS": "AR", "VND": "VN",
     "GBP": "GB", "AUD": "AU", "NZD": "NZ", "JPY": "JP", "CHF": "CH", "CAD": "CA",
     "NOK": "NO", "SEK": "SE",
 }

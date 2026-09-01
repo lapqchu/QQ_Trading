@@ -9,6 +9,7 @@ import RiskUnits from "./RiskUnits.jsx";
 import CarryBasket from "./CarryBasket.jsx";
 import SgFundamentals from "./SgFundamentals.jsx";
 import EmRules from "./EmRules.jsx";
+import ClientFlow from "./ClientFlow.jsx";
 
 // ── Dark theme (mirrors NeerApp / the pricer) ──
 const C = {
@@ -19,7 +20,7 @@ const C = {
   mono: "'JetBrains Mono','Fira Code',monospace",
 };
 
-const TABS = [["neer", "SGD NEER"], ["risk", "RISK UNITS"], ["carry", "CARRY BASKET"], ["fund", "SG FUNDAMENTALS"], ["rules", "EM RULES"]];
+const TABS = [["neer", "SGD NEER"], ["risk", "RISK UNITS"], ["carry", "CARRY BASKET"], ["fund", "SG FUNDAMENTALS"], ["rules", "EM RULES"], ["flow", "CLIENT FLOW"]];
 
 export default function DeepDive() {
   const [tab, setTab] = useState("neer");
@@ -56,7 +57,8 @@ export default function DeepDive() {
 
       {/* ── Active tool ── */}
       {tab === "neer" ? <NeerApp /> : tab === "risk" ? <RiskUnits /> :
-       tab === "carry" ? <CarryBasket /> : tab === "fund" ? <SgFundamentals /> : <EmRules />}
+       tab === "carry" ? <CarryBasket /> : tab === "fund" ? <SgFundamentals /> :
+       tab === "rules" ? <EmRules /> : <ClientFlow />}
     </div>
   );
 }
