@@ -53,7 +53,7 @@ try:
 except Exception:                                    # pragma: no cover
     _holidays = None
 
-from daycount import _CCY_CAL                        # ccy → ISO country (shared with pricer)
+from daycount import _CCY_CAL, _FRI_SAT_WEEKEND      # shared ccy→calendar map + weekend conventions
 
 log = logging.getLogger("clientflow")
 
@@ -318,8 +318,11 @@ class ClientFlowService:
         return self._local_cals[ccy]
 
     def _good_day(self, d: date, ccy: Optional[str]) -> bool:
-        """Union-calendar good business day: weekday ∧ not US ∧ not local holiday."""
+        """Union-calendar good business day: local business weekday (Fri-Sat
+        weekend markets handled) ∧ not US Sat/Sun ∧ not US/local holiday."""
         if d.weekday() >= 5:
+            return False
+        if ccy in _FRI_SAT_WEEKEND and d.weekday() == 4:
             return False
         us = self._us()
         if us is not None and d in us:

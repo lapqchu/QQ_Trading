@@ -4,7 +4,7 @@ import Plot from "react-plotly.js";
 import { getCurrencies, getHistory, getHistoryCustom, getSnapshot, liveStart, liveStop, openChannel, getIpaForward, t1Backfill } from "./api.js";
 import { buildAllData, calcCustom, mergeT1, sourceQuality } from "./dataTransform.js";
 import { bootstrapCleanCurve, spreadRichness } from "./cleanCurve.js";
-import { F, FP, CC, HB, cS, tS, sS, mid, implYld, fwdFwdIy, mcI, calcSMA, calcEMA, calcRSI, calcBB, calcMACD, calcStats, calcZDev, backtest, STRAT_DESCS } from "./calc.js";
+import { F, FP, CC, HB, cS, tS, sS, mid, implYld, fwdFwdIy, mcI, iyBasis, calcSMA, calcEMA, calcRSI, calcBB, calcMACD, calcStats, calcZDev, backtest, STRAT_DESCS } from "./calc.js";
 import { fD, daysBtwn, buildIMMDates, computeSpotDate, addMon, bizBefore, dateFromSpot } from "./dates.js";
 
 // ── NDF / Deliverable spread templates ──
@@ -1267,7 +1267,7 @@ function ToolsPanel({ad,onDbl,ccy}){
     const nr=resolveLeg(scN,scNDt),fr=resolveLeg(scF,scFDt);
     if(!nr||!fr)return null;const ds=fr.dT-nr.dT;if(ds<=0)return null;
     if(scMode==="pips"){const newFarMid=ad.sMT+((nr.spM+v)/PF);const newFarIy=implYld(newFarMid,ad.sMT,fr.sofT,fr.dT);const newFwdIy=newFarIy!=null?fwdFwdIy(nr.iyM,nr.dT,newFarIy,fr.dT):null;return{label:`${nr._lbl}×${fr._lbl} @ ${v} pips`,impl:newFwdIy,pips:v,days:ds};}
-    else{const nearFac=1+(nr.iyM/100)*nr.dT/360;const farFac=nearFac*(1+(v/100)*ds/360);const farIy=(farFac-1)*360/fr.dT*100;const farNDF=ad.sMT*(farIy/100*fr.dT/360+1)/(1+fr.sofT/100*fr.dT/360);const sprPips=(farNDF-ad.sMT)*PF-nr.spM;return{label:`${nr._lbl}×${fr._lbl} @ ${v}% impl`,impl:v,pips:sprPips,days:ds};}
+    else{const B=iyBasis();const nearFac=1+(nr.iyM/100)*nr.dT/B;const farFac=nearFac*(1+(v/100)*ds/B);const farIy=(farFac-1)*B/fr.dT*100;const farNDF=ad.sMT*(farIy/100*fr.dT/B+1)/(1+fr.sofT/100*fr.dT/360);const sprPips=(farNDF-ad.sMT)*PF-nr.spM;return{label:`${nr._lbl}×${fr._lbl} @ ${v}% impl`,impl:v,pips:sprPips,days:ds};}
   },[scIn,scMode,scN,scF,scNDt,scFDt,scTenorMode,ad,PF]);
   const maxT=ad.maxT||24;
   // Build enhanced tenor options: Spot, ON/TN/SN, 1W/2W/3W, then monthly with interleaved IMM dates
@@ -2002,7 +2002,7 @@ export default function Dashboard(){
       {tab==="broker"&&<BrokerMon ad={ad} liveOn={liveOn}/>}
 
       <div style={{marginTop:4,fontSize:6.5,color:"#334155",display:"flex",justifyContent:"space-between",flexWrap:"wrap",gap:2}}>
-        <div>* = Calculated: ImplYld=((F/S)(1+SOFR×d/360)-1)×360/d · FwdFwd Impl=compounded from outrights · Spread bid=far_bid−near_ask · Weekly tenors interpolated (Fritsch-Carlson monotone cubic)</div>
+        <div>* = Calculated: ImplYld=((F/S)(1+SOFR×d/360)-1)×basis/d — basis={iyBasis()} for this ccy (Act/365 MM markets: SGD/HKD/THB/MYR/TWD/KRW/INR/PHP/ZAR/PLN/ILS/RUB; else Act/360; SOFR leg always /360) · FwdFwd Impl=compounded from outrights · Spread bid=far_bid−near_ask · Weekly tenors interpolated (Fritsch-Carlson monotone cubic)</div>
         <div>IMM=3rd Wed Mar/Jun/Sep/Dec · Fix=T-2 biz</div>
       </div>
     </div>);

@@ -206,6 +206,23 @@ SOFR_RICS = {
 }
 SOFR_FIELDS = ["BID", "ASK", "PRIMACT_1", "SEC_ACT_1", "TRDPRC_1", "HST_CLOSE", "GEN_VAL1", "TIMACT"]
 
+# ── Displayed-yield day-count basis (official DF methodology) ─────────────
+# The FX-implied local DF is exact; the DISPLAYED yield must be annualised on
+# the local market's money-market convention, not a universal Act/360.
+# Act/365-FIXED money markets (standard published MM conventions). Anything
+# not listed displays Act/360 and is labelled as such in the UI. The USD/SOFR
+# discount leg is genuinely Act/360 and never uses this.
+# (Conversion is exact: iy_365 = iy_360 × 365/360 — the DF solve is basis-free.)
+IY_BASIS_365 = {
+    "SGD", "HKD", "THB", "MYR", "TWD", "KRW", "INR", "PHP", "ZAR", "PLN",
+    "ILS", "RUB", "GBP", "AUD", "NZD", "CAD",
+}
+
+
+def iy_basis(code: str) -> int:
+    """Money-market basis (365 or 360) for a currency's displayed implied yield."""
+    return 365 if code in IY_BASIS_365 else 360
+
 
 # ─────────────────────────────────────────────────────────────
 # TENOR CODE HELPERS

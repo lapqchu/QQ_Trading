@@ -29,7 +29,7 @@ import statistics as st
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from ric_config import CURRENCIES, SOFR_RICS, NDF_CURRENCIES, DELIVERABLE_CURRENCIES
+from ric_config import CURRENCIES, SOFR_RICS, NDF_CURRENCIES, DELIVERABLE_CURRENCIES, iy_basis
 from discount_curve import DiscountCurve, fwd_fwd_yield
 
 log = logging.getLogger("risk")
@@ -169,7 +169,7 @@ class RiskService:
             fo = s + (far_pts[dt] / pf if cfg.value_mode == "pips" else far_pts[dt])
             if no <= 0 or fo <= 0:
                 continue
-            iy = fwd_fwd_yield(no, dn, fo, df, s, usd)
+            iy = fwd_fwd_yield(no, dn, fo, df, s, usd, basis=iy_basis(cfg.code))
             if iy is not None:
                 out.append((dt, iy))
         return out

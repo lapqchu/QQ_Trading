@@ -40,7 +40,7 @@ from sg_fundamentals_service import SgFundamentalsService
 from sg_inflation_model import SgInflationModel
 from em_rules_service import EmRulesService
 from client_flow_service import ClientFlowService, ParseError
-from ric_config import CURRENCIES, NDF_CURRENCIES, DELIVERABLE_CURRENCIES, get_spread_pack, get_spread_packs, FUNDING_TENORS
+from ric_config import CURRENCIES, NDF_CURRENCIES, DELIVERABLE_CURRENCIES, get_spread_pack, get_spread_packs, FUNDING_TENORS, iy_basis
 
 load_dotenv()
 logging.basicConfig(
@@ -145,7 +145,7 @@ def list_currencies() -> Dict[str, Any]:
                 "pair": cfg.pair, "kind": cfg.kind,
                 "pipFactor": cfg.pip_factor, "outrightDp": cfg.outright_dp,
                 "pipDp": cfg.pip_dp, "tenorsM": cfg.anchor_tenors_m, "maxDisplayM": cfg.max_display_m,
-                "spreadPack": cfg.spread_pack,
+                "spreadPack": cfg.spread_pack, "iyBasis": iy_basis(code),
             } for code, cfg in CURRENCIES.items()
         },
     }

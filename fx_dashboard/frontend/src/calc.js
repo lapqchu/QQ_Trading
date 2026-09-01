@@ -23,23 +23,36 @@ export function mcI(xs, ys) {
 
 export const mid = (b, a) => (b != null && a != null ? (b + a) / 2 : null);
 
+// ── Displayed-yield day-count basis (official DF methodology) ──
+// Local implied yields are annualised on the currency's MM basis (365 for
+// Act/365 markets like SGD/THB/INR — served per-ccy by the backend as
+// snap.iyBasis / meta.iyBasis; dataTransform sets it before transforming).
+// The SOFR/USD discount leg is ALWAYS Act/360 — never scaled by this.
+let IY_BASIS = 360;
+export function setIyBasis(b) { IY_BASIS = b === 365 ? 365 : 360; }
+export function iyBasis() { return IY_BASIS; }
+
 export function implYld(fwd, spot, sofr, days) {
   if (fwd == null || spot == null || sofr == null || !days) return null;
-  const sofrDisc = 1 + (sofr / 100) * days / 360;
-  return ((fwd / spot) * sofrDisc - 1) * 360 / days * 100;
+  const sofrDisc = 1 + (sofr / 100) * days / 360;          // USD leg: Act/360 always
+  return ((fwd / spot) * sofrDisc - 1) * IY_BASIS / days * 100;
 }
 
 export function fwdFwdIy(iyN, dN, iyF, dF) {
+  // iy inputs are IY_BASIS-based rates, so growth factors must compound on the
+  // SAME basis — the DF ratio (and hence the result) is basis-exact.
   if (iyN == null || iyF == null || !dN || !dF || dF <= dN) return null;
-  return ((1 + (iyF / 100) * dF / 360) / (1 + (iyN / 100) * dN / 360) - 1) * 360 / (dF - dN) * 100;
+  return ((1 + (iyF / 100) * dF / IY_BASIS) / (1 + (iyN / 100) * dN / IY_BASIS) - 1) * IY_BASIS / (dF - dN) * 100;
 }
 
 // ── Discount-factor curve (log-linear in days) — mirrors backend discount_curve.py ──
 // Arbitrage-free, monotone DF interpolation (the market-standard choice). Used to
 // compute DF-consistent implied yields at off-node day counts (IMM rolls, custom
 // dates) instead of linearly interpolating the zero rate.
-export function dfCurve(nodes) {
+export function dfCurve(nodes, basis = 360) {
   // nodes: [[days, df], ...], days>0, df in (0,1]. Sorted + deduped.
+  // `basis` scales the .zero() reading only (360 for the USD curve; the ccy
+  // curve builder passes the display basis).
   const pts = (nodes || []).filter(p => p && p[0] > 0 && p[1] > 0).sort((a, b) => a[0] - b[0]);
   const days = [], ln = [];
   for (const [d, v] of pts) {
@@ -59,13 +72,30 @@ export function dfCurve(nodes) {
     const w = (d - days[i - 1]) / (days[i] - days[i - 1]);
     return Math.exp(ln[i - 1] + w * (ln[i] - ln[i - 1]));
   };
-  return { df, zero: (d) => (d > 0 ? (1 / df(d) - 1) * 360 / d * 100 : 0), n };
+  return { df, zero: (d) => (d > 0 ? (1 / df(d) - 1) * basis / d * 100 : 0), n };
 }
 
-// USD DF curve from SOFR par rates: sofrByDays = [[days, ratePct], ...] (simple-interest DF nodes).
+// USD DF curve from SOFR par rates: sofrByDays = [[days, ratePct], ...].
+// Nodes ≤ ~1Y: simple-interest Act/360 DF (SOFR OIS is single-payment — exact).
+// Beyond (18M/2Y): the quoted par rate pays ANNUAL Act/360 coupons — bootstrap
+// the DF from the par equation on the shorter nodes (mirrors backend
+// discount_curve.from_ois; treating the quote as a simple zero understates the
+// 2Y zero by ~8bp at 4% rates).
 export function usdCurveFromSofr(sofrByDays) {
-  const nodes = (sofrByDays || []).filter(p => p && p[0] > 0 && p[1] != null)
-    .map(([d, r]) => [d, 1 / (1 + (r / 100) * d / 360)]);
+  const items = (sofrByDays || []).filter(p => p && p[0] > 0 && p[1] != null).sort((a, b) => a[0] - b[0]);
+  const nodes = items.filter(([d]) => d <= 370).map(([d, r]) => [d, 1 / (1 + (r / 100) * d / 360)]);
+  const longs = items.filter(([d]) => d > 370);
+  if (longs.length && !nodes.length)
+    return dfCurve(longs.map(([d, r]) => [d, 1 / (1 + (r / 100) * d / 360)]));   // no short anchors — degrade to simple
+  for (const [d, r] of longs) {
+    const partial = dfCurve(nodes);
+    const rr = r / 100;
+    const coupons = []; let t = 365;
+    while (t < d - 30) { coupons.push(t); t += 365; }
+    let pv = 0, tp = 0;
+    for (const tc of coupons) { pv += rr * ((tc - tp) / 360) * partial.df(tc); tp = tc; }
+    nodes.push([d, (1 - pv) / (1 + rr * ((d - tp) / 360))]);
+  }
   return dfCurve(nodes);
 }
 
@@ -74,7 +104,7 @@ export function ccyCurveFromForwards(fwdNodes, spot, usd) {
   if (!usd || !spot || spot <= 0) return null;
   const nodes = (fwdNodes || []).filter(p => p && p[0] > 0 && p[1] > 0)
     .map(([d, f]) => [d, usd.df(d) * spot / f]);
-  return dfCurve(nodes);
+  return dfCurve(nodes, IY_BASIS);
 }
 
 // Forward-forward ccy zero (percent) over [dN, dF] from a ccy DF curve.
@@ -82,7 +112,7 @@ export function fwdFwdIyDf(ccy, dN, dF) {
   if (!ccy || !dN || !dF || dF <= dN) return null;
   const a = ccy.df(dN), b = ccy.df(dF);
   if (!a || !b || b <= 0) return null;
-  return (a / b - 1) * 360 / (dF - dN) * 100;
+  return (a / b - 1) * IY_BASIS / (dF - dN) * 100;
 }
 
 // ── Formatting ──

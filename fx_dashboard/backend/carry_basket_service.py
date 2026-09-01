@@ -53,7 +53,7 @@ import time as _t
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from ric_config import CURRENCIES, SOFR_RICS
+from ric_config import CURRENCIES, SOFR_RICS, iy_basis
 from discount_curve import DiscountCurve, implied_yield
 from daycount import day_count as _day_count   # shared holiday-adjusted day count (on par w/ pricer)
 
@@ -336,13 +336,17 @@ class CarryBasketService:
                         fwd_fx = f
                         src = "composite" if i == 0 else "broker"
                         break
-            iy = implied_yield(fwd_fx, spot_fx, usd_curve(d1m), d1m) if (spot_fx and fwd_fx) else None
+            # displayed yield in the ccy's own MM basis (official DF methodology);
+            # carry = iy − SOFR converted to the SAME basis so the spread is coherent
+            b = iy_basis(u["code"])
+            iy = (implied_yield(fwd_fx, spot_fx, usd_curve(d1m), d1m, basis=b)
+                  if (spot_fx and fwd_fx) else None)
             rows.append({
                 "code": u["code"], "pair": u["pair"], "group": u["group"], "ndf": u["ndf"],
                 "spot": round(spot_fx, 6) if spot_fx else None,
-                "days1m": d1m, "src": src,
+                "days1m": d1m, "src": src, "iyBasis": b,
                 "impliedYield": round(iy, 4) if iy is not None else None,
-                "carry": round(iy - sofr, 4) if iy is not None else None,
+                "carry": round(iy - sofr * b / 360.0, 4) if iy is not None else None,
                 "hasData": iy is not None,
             })
         ranked = sorted(rows, key=lambda r: (r["impliedYield"] is None, -(r["impliedYield"] or -1e9)))
@@ -635,6 +639,7 @@ class CarryBasketService:
                 "histDown95Pct": dn(code, "histDown95Pct"), "histDown99Pct": dn(code, "histDown99Pct"),
                 "impliedYield": (ymap.get(code) or {}).get("impliedYield"),
                 "carry": (ymap.get(code) or {}).get("carry"),
+                "iyBasis": (ymap.get(code) or {}).get("iyBasis"),
                 "rank": (ymap.get(code) or {}).get("rank"),
             })
 
@@ -685,6 +690,7 @@ class CarryBasketService:
                 "histDown95Pct": dn(c, "histDown95Pct"), "histDown99Pct": dn(c, "histDown99Pct"),
                 "impliedYield": (ymap.get(c) or {}).get("impliedYield"),
                 "carry": (ymap.get(c) or {}).get("carry"),
+                "iyBasis": (ymap.get(c) or {}).get("iyBasis"),
                 "rank": (ymap.get(c) or {}).get("rank"),
             })
 
@@ -711,13 +717,17 @@ class CarryBasketService:
                     diversification = round(1.0 - book_dvol / gross_dvol, 3)
 
         # ── carry: net annual $ carry of the forward book ──
+        # carry% is quoted on each ccy's MM basis (360 or 365); scale by 365/basis
+        # so every leg's $ figure is per CALENDAR year (simple interest: rate on
+        # basis b earns rate×365/b over 365 days — exact, not an approximation)
         net_carry_usd = 0.0
         for lg in legs_all:
             c = lg["carry"]
             if c is None:
                 continue
             sign = 1.0 if lg["side"] == "long" else -1.0
-            net_carry_usd += sign * (lg["notionalUsd"] or 0.0) * (c / 100.0)
+            b = float(lg.get("iyBasis") or 360)
+            net_carry_usd += sign * (lg["notionalUsd"] or 0.0) * (c / 100.0) * (365.0 / b)
 
         ann_book_vol = book_dvol * ANNUALIZE if book_dvol else None
         carry_to_vol = (net_carry_usd / ann_book_vol) if (ann_book_vol and ann_book_vol > 0) else None

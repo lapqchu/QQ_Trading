@@ -35,7 +35,7 @@ from discount_curve import DiscountCurve, implied_yield
 from daycount import day_count_map
 from ric_config import (
     CURRENCIES, SOFR_RICS, FUNDING_TENORS, BROKER_META,
-    CurrencyConfig,
+    CurrencyConfig, iy_basis,
     all_swap_points_rics, all_outright_rics, all_broker_rics, all_funding_rics,
     all_extended_rics, all_weekly_rics,
 )
@@ -465,6 +465,7 @@ class MarketService:
             "extendedTenorsM": cfg.extended_tenors_m,
             "weekly": weekly,
             "maxDisplayM": cfg.max_display_m,
+            "iyBasis": iy_basis(cfg.code),
             "spreadPack": cfg.spread_pack,
             "weeklyTenors": [0.25, 0.5, 0.75],
             "displayTenors": cfg.display_tenors,
@@ -570,7 +571,8 @@ class MarketService:
                 outright = spot_mid + pts_mid / PF
             if not outright or outright <= 0:
                 continue
-            iy = implied_yield(outright, spot_mid, usd_curve, float(days))
+            iy = implied_yield(outright, spot_mid, usd_curve, float(days),
+                               basis=iy_basis(cfg.code))
             if iy is not None:
                 bundle["iyDf"] = round(iy, 4)
                 bundle["iyMethod"] = "df"

@@ -8,23 +8,29 @@ clean/dirty all read off ONE object: a discount-factor curve.
 
 Convention (matches the rest of the app):
   Pair quoted as X = QUOTE-ccy per 1 USD (e.g. USDINR = INR per USD).
-  Money-market simple interest, Act/360, rates in percent.
+  Money-market simple interest, rates in percent. The USD/SOFR leg is ALWAYS
+  Act/360 (SOFR's actual quote basis). The DISPLAYED local yield is annualised
+  on the currency's configured money-market basis (`basis` param — 365 for
+  Act/365-fixed markets like SGD/THB/INR, else 360; see ric_config.iy_basis).
+  The DF solve itself is basis-free; basis only scales the displayed rate
+  (exact identity: iy_b = iy_360 * b/360).
 
 CIP:                F / S = DF_usd(d) / DF_ccy(d)
   => DF_ccy(d)  = DF_usd(d) * S / F(d)
-  => ccy implied zero:  i_ccy(d) = (1/DF_ccy(d) - 1) * 360/d * 100
-  => USD DF from OIS:    DF_usd(d) = 1 / (1 + sofr(d)/100 * d/360)
+  => ccy implied zero:  i_ccy(d) = (1/DF_ccy(d) - 1) * basis/d * 100
+  => USD DF from OIS:    DF_usd(d) = 1 / (1 + sofr(d)/100 * d/360)   [d <= ~1Y]
+     Beyond ~1Y (18M/2Y) the quoted par OIS rate pays ANNUAL Act/360 coupons:
+     DF is bootstrapped from 1 = r*sum(delta_i*DF(t_i)) + (1+r*delta_n)*DF(t_n)
+     using the already-built shorter nodes (treating the par rate as a simple
+     zero there understates the 2Y zero by ~8bp at 4% rates).
 
 Forward-forward ccy zero over [d_n, d_f] (near->far value dates):
-  i_ff = ( DF_ccy(d_n)/DF_ccy(d_f) - 1 ) * 360/(d_f - d_n) * 100
+  i_ff = ( DF_ccy(d_n)/DF_ccy(d_f) - 1 ) * basis/(d_f - d_n) * 100
 
 v1 scope + honest limits:
-  - USD leg uses the OIS curve INTERPOLATED to the exact day count (an
-    improvement over picking one SOFR tenor), with a simple-interest DF per
-    tenor. For tenors <= ~1Y this is essentially exact; at 18M/2Y it ignores
-    OIS annual compounding (a few bp) — flagged, to be refined when the curve
-    is wired end-to-end. DF interpolation is LOG-LINEAR in days (arb-free,
-    monotone), the market-standard choice.
+  - USD leg uses the OIS curve INTERPOLATED to the exact day count. DF
+    interpolation is LOG-LINEAR in days (arb-free, monotone), the
+    market-standard choice.
   - No turn/meeting-date jumps yet; those layer on as dated DF steps (see
     turn_methodology_memo). This module is intentionally pure + dependency-free
     so it can be unit-tested and reused by market_service without side effects.
@@ -60,9 +66,35 @@ class DiscountCurve:
     @classmethod
     def from_ois(cls, rate_by_days: Dict[float, float]) -> "DiscountCurve":
         """Build from OIS/SOFR par rates (percent) keyed by day count.
-        v1: simple-interest DF per node (exact <=1Y; ignores compounding at 2Y)."""
-        nodes = [(d, _simple_df(r, d)) for d, r in rate_by_days.items()
-                 if d and d > 0 and r is not None]
+        Nodes <= ~1Y: simple-interest DF (SOFR OIS is single-payment there —
+        exact). Longer nodes (18M/2Y): the quoted par rate pays ANNUAL Act/360
+        coupons, so DF is bootstrapped from the par equation using the shorter
+        nodes already built."""
+        items = sorted((float(d), float(r)) for d, r in rate_by_days.items()
+                       if d and d > 0 and r is not None)
+        nodes = [(d, _simple_df(r, d)) for d, r in items if d <= 370.0]
+        long_nodes = [(d, r) for d, r in items if d > 370.0]
+        if long_nodes and not nodes:
+            # no short anchors to discount coupons against — degrade to simple
+            # rather than fabricating a coupon curve (flagged by construction:
+            # a single-node long curve is already an approximation)
+            return cls([(d, _simple_df(r, d)) for d, r in long_nodes])
+        for d, r in long_nodes:
+            partial = cls(nodes)
+            rr = r / 100.0
+            # annual coupon dates 365, 730, ... ; a stub < ~1M folds into the
+            # final period (matches how a 13M-style tail is quoted)
+            coupons: List[float] = []
+            t = 365.0
+            while t < d - 30.0:
+                coupons.append(t)
+                t += 365.0
+            pv, t_prev = 0.0, 0.0
+            for tc in coupons:
+                pv += rr * ((tc - t_prev) / 360.0) * partial.df(tc)
+                t_prev = tc
+            df_d = (1.0 - pv) / (1.0 + rr * ((d - t_prev) / 360.0))
+            nodes.append((d, df_d))
         return cls(nodes)
 
     def df(self, days: float) -> float:
@@ -87,12 +119,13 @@ class DiscountCurve:
         w = (days - d0) / (d1 - d0)
         return math.exp(l0 + w * (l1 - l0))
 
-    def zero(self, days: float) -> float:
-        """Simple-interest zero rate (percent, Act/360) implied by DF(days)."""
+    def zero(self, days: float, basis: float = 360.0) -> float:
+        """Simple-interest zero rate (percent) implied by DF(days), annualised
+        on `basis` (360 default; pass the ccy's MM basis for displayed yields)."""
         d = float(days)
         if d <= 0:
             return 0.0
-        return (1.0 / self.df(d) - 1.0) * 360.0 / d * 100.0
+        return (1.0 / self.df(d) - 1.0) * basis / d * 100.0
 
 
 def ccy_df(fwd_outright: float, spot: float, usd_df: float) -> Optional[float]:
@@ -103,21 +136,23 @@ def ccy_df(fwd_outright: float, spot: float, usd_df: float) -> Optional[float]:
 
 
 def implied_yield(fwd_outright: float, spot: float, usd_curve: DiscountCurve,
-                  days: float) -> Optional[float]:
-    """Spot-start ccy implied zero (percent) from the forward and the USD DF curve."""
+                  days: float, basis: float = 360.0) -> Optional[float]:
+    """Spot-start ccy implied zero (percent) from the forward and the USD DF
+    curve, annualised on the ccy's MM `basis` (365 for Act/365 markets)."""
     if days is None or days <= 0 or not spot or not fwd_outright:
         return None
     dfc = ccy_df(fwd_outright, spot, usd_curve.df(days))
     if not dfc or dfc <= 0:
         return None
-    return (1.0 / dfc - 1.0) * 360.0 / days * 100.0
+    return (1.0 / dfc - 1.0) * basis / days * 100.0
 
 
 def fwd_fwd_yield(fwd_near: float, days_near: float,
                   fwd_far: float, days_far: float,
-                  spot: float, usd_curve: DiscountCurve) -> Optional[float]:
+                  spot: float, usd_curve: DiscountCurve,
+                  basis: float = 360.0) -> Optional[float]:
     """Forward-forward ccy zero (percent) over [days_near, days_far] from two
-    forward outrights + the USD DF curve. i_ff = (DFn/DFf - 1)*360/(df-dn)*100."""
+    forward outrights + the USD DF curve. i_ff = (DFn/DFf - 1)*basis/(df-dn)*100."""
     if None in (fwd_near, fwd_far, days_near, days_far, spot):
         return None
     if days_far <= days_near:
@@ -126,7 +161,7 @@ def fwd_fwd_yield(fwd_near: float, days_near: float,
     dff = ccy_df(fwd_far, spot, usd_curve.df(days_far))
     if not dfn or not dff or dff <= 0:
         return None
-    return (dfn / dff - 1.0) * 360.0 / (days_far - days_near) * 100.0
+    return (dfn / dff - 1.0) * basis / (days_far - days_near) * 100.0
 
 
 # ─────────────────────────────────────────────────────────────
@@ -170,6 +205,24 @@ def _selftest() -> None:
     expected_ff = (dfc_n / dfc_f - 1.0) * 360.0 / (df_ - dn) * 100.0
     chk("fwd_fwd == analytic DF-ratio forward",
         fwd_fwd_yield(Fn, dn, Ff, df_, spot, curve), expected_ff, 1e-9)
+
+    # Basis conversion is an exact scaling: iy(365) == iy(360) * 365/360.
+    iy360 = implied_yield(F, spot, curve, d)
+    iy365 = implied_yield(F, spot, curve, d, basis=365.0)
+    chk("basis 365 = basis 360 × 365/360", iy365, iy360 * 365.0 / 360.0, 1e-9)
+
+    # Annual-compounding bootstrap beyond 1Y: on a flat 4% par curve the 2Y
+    # zero must sit ABOVE the simple-interest reading (~8bp at 4%), and the
+    # bootstrapped DF must reprice the par swap to 1 exactly.
+    curve2 = DiscountCurve.from_ois({92: 4.0, 184: 4.0, 366: 4.0, 548: 4.0, 730: 4.0})
+    z2y = curve2.zero(730)
+    good2 = 4.04 < z2y < 4.12
+    print(f"  [{'PASS' if good2 else 'FAIL'}] 2Y zero reflects annual compounding: {z2y:.4f}% (simple would be 4.00)")
+    ok = ok and good2
+    rr = 0.04
+    par = rr * (365.0 / 360.0) * curve2.df(365) + (1.0 + rr * (365.0 / 360.0)) * curve2.df(730)
+    chk("2Y par OIS reprices to 1", par, 1.0, 1e-9)
+    chk("<=1Y nodes stay simple-exact", curve2.zero(184), 4.0, 1e-6)
 
     # Monotonic DF (no-arb): df must strictly decrease with days.
     mono = all(curve.df(d) > curve.df(d + 10) for d in (10, 100, 300, 700))

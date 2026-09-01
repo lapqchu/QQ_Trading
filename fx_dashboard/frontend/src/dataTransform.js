@@ -9,7 +9,7 @@
  * NGN sources have sourceKind="outright_derived" with source.outright.{bid,ask,mid};
  *   outrightFromSource returns those directly.
  */
-import { mcI, mid, implYld, fwdFwdIy, usdCurveFromSofr, ccyCurveFromForwards, fwdFwdIyDf } from "./calc.js";
+import { mcI, mid, implYld, fwdFwdIy, usdCurveFromSofr, ccyCurveFromForwards, fwdFwdIyDf, setIyBasis } from "./calc.js";
 import { buildIMMDates, buildTenorDates, computeSpotDate, bizBefore, dateFromSpot, daysBtwn, fD } from "./dates.js";
 
 // ── Curve-days policy ───────────────────────────────────────────────────
@@ -230,6 +230,9 @@ export function buildAllData(snap, liveQuotes = {}, selection = null) {
   const knownM = [...anchorM, ...extendedM].sort((a, b) => a - b);
   const maxT = snap.maxDisplayM || anchorM[anchorM.length - 1] || 24;
   const ccyCode = snap.ccy;
+  // displayed-yield basis for THIS currency (backend-served; Act/365 markets 365).
+  // Must be set before any implYld/fwdFwd call below — calc.js is module-scoped.
+  setIyBasis(snap.iyBasis || 360);
   const isNDF = snap.kind === "NDF";
   const deriveFromOutrights = !!snap.deriveFromOutrights;
 

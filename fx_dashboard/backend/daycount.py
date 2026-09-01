@@ -9,8 +9,9 @@ date" for a given currency AS OF a given date. Used by:
     spot→VD window straddles a holiday (e.g. SGD around the Aug National Day).
 
 Convention (matches IPA / the DF engine): spot = T+`lag` GOOD business days (good =
-weekday and not a holiday in the USD calendar NOR the currency's local calendar);
-value date = spot + N months, then modified-following to the next good business day.
+local business weekday — Fri-Sat weekend markets handled — and not a holiday in the
+USD calendar NOR the currency's local calendar); value date = spot + N months, then
+TRUE modified-following (forward, else backward if the roll leaves the month).
 `lag` = 2 (T+2) except the T+1 names (CAD/TRY/RUB/PHP), verified vs IPA startDate.
 
 Requires the `holidays` package; without it, falls back to a fixed weekend-ish count
@@ -44,6 +45,12 @@ _CCY_CAL: Dict[str, str] = {
 }
 # T+1 settlement vs USD (verified against the pricer's IPA startDate). Others T+2.
 _SPOT_LAG: Dict[str, int] = {"CAD": 1, "TRY": 1, "RUB": 1, "PHP": 1}
+
+# Markets whose LOCAL weekend is Friday-Saturday. A good settlement day for the
+# USD cross must be a business day in BOTH calendars, so these effectively
+# settle Mon-Thu (local Fri ∪ US Sat/Sun all excluded). AED moved to a
+# Sat-Sun-style weekend in 2022 and stays on the default.
+_FRI_SAT_WEEKEND = {"SAR", "QAR", "EGP", "ILS"}
 
 # Weekend-ish fallback (calendar-days) when the holidays package is unavailable.
 _FALLBACK: Dict[int, int] = {1: 31, 2: 61, 3: 92, 6: 183, 9: 273, 12: 365, 18: 548, 24: 730}
@@ -100,9 +107,11 @@ def day_count(code: str, months, as_of: date) -> int:
         return _fallback(months if months else 1)
     months = int(months)
     us, loc = _us(), _local(code)
+    wk_local = (4, 5) if code in _FRI_SAT_WEEKEND else (5, 6)
 
     def good(d: date) -> bool:
-        if d.weekday() >= 5:
+        # union calendar: local weekend ∪ US Sat/Sun ∪ both holiday lists
+        if d.weekday() in wk_local or d.weekday() >= 5:
             return False
         if us is not None and d in us:
             return False
@@ -118,9 +127,17 @@ def day_count(code: str, months, as_of: date) -> int:
         return d
 
     def mod_foll(d: date) -> date:
-        while not good(d):
-            d += timedelta(days=1)
-        return d
+        # TRUE modified-following: roll forward; if that leaves the month,
+        # roll BACKWARD from the original date instead (previously this was
+        # plain following, overshooting month-end value dates by 1-3 days).
+        rolled = d
+        while not good(rolled):
+            rolled += timedelta(days=1)
+        if rolled.month != d.month or rolled.year != d.year:
+            rolled = d
+            while not good(rolled):
+                rolled -= timedelta(days=1)
+        return rolled
 
     try:
         spot = add_biz(as_of, _SPOT_LAG.get(code, 2))
