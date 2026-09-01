@@ -33,6 +33,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import threading
@@ -148,6 +149,20 @@ class ParseError(Exception):
     """User-facing 422: the file cannot be ingested as-is (with the reason)."""
 
 
+def _find_repo_root(start: str) -> Optional[str]:
+    """Walk up from `start` looking for a .git dir/file (worktrees have a file).
+    Pure-filesystem, so it works even when the git executable is not on the
+    backend process's PATH (the office/Windows case)."""
+    p = os.path.abspath(start)
+    while True:
+        if os.path.exists(os.path.join(p, ".git")):
+            return p
+        parent = os.path.dirname(p)
+        if parent == p:
+            return None
+        p = parent
+
+
 # ─────────────────────────────────────────────────────────────
 # the service
 # ─────────────────────────────────────────────────────────────
@@ -221,26 +236,59 @@ class ClientFlowService:
 
     # ── git safety canary ────────────────────────────────────
     def git_safety(self) -> Dict[str, Any]:
-        """The data dir MUST be gitignored and untracked, else ingest is refused."""
+        """The canary protects one thing: .flow_data must never be committable.
+        Decision table (office deployments are often a plain folder copy, and the
+        backend process may not have git on ITS PATH even when a shell does):
+          no enclosing .git anywhere        → OK (no repository to leak into)
+          repo exists, gitignored+untracked → OK
+          repo exists, not ignored/tracked  → REFUSE (the real danger)
+          repo exists, cannot verify        → REFUSE with the specific reason
+        """
         if not self.check_git:
             return {"ok": True, "reason": "custom db path — canary not applicable"}
         now = _time.time()
         if self._git_safety_cache and now - self._git_safety_cache[0] < 60:
             return self._git_safety_cache[1]
-        result: Dict[str, Any]
-        try:
-            ign = subprocess.run(["git", "check-ignore", "-q", DATA_DIR],
-                                 cwd=_DIR, capture_output=True, timeout=10)
-            tracked = subprocess.run(["git", "ls-files", "--", DATA_DIR],
-                                     cwd=_DIR, capture_output=True, timeout=10, text=True)
-            if ign.returncode != 0:
-                result = {"ok": False, "reason": ".flow_data is NOT gitignored — add it to .gitignore before uploading"}
-            elif tracked.returncode == 0 and tracked.stdout.strip():
-                result = {"ok": False, "reason": ".flow_data has TRACKED files — untrack them before uploading"}
+
+        repo_root = _find_repo_root(_DIR)
+        if repo_root is None:
+            result: Dict[str, Any] = {
+                "ok": True,
+                "reason": "not inside a git checkout — no repository to leak into"}
+        else:
+            git = shutil.which("git") or shutil.which("git.exe")
+            if git is None:
+                result = {"ok": False,
+                          "reason": (f"a git checkout exists at {repo_root} but the git executable "
+                                     "is not on the backend's PATH — cannot verify .flow_data is "
+                                     "ignored. Fix the service PATH, or run the app from a folder "
+                                     "outside any git checkout")}
             else:
-                result = {"ok": True}
-        except Exception as e:
-            result = {"ok": False, "reason": f"git safety check failed ({e}) — refusing ingest, verify by hand"}
+                try:
+                    # probe a hypothetical file INSIDE the dir: a `backend/.flow_data/`
+                    # gitignore pattern (trailing slash) does not match the bare,
+                    # possibly not-yet-created directory path itself
+                    probe = os.path.join(DATA_DIR, "client_flow.db")
+                    ign = subprocess.run([git, "-C", _DIR, "check-ignore", "-q", probe],
+                                         capture_output=True, timeout=10)
+                    tracked = subprocess.run([git, "-C", _DIR, "ls-files", "--", DATA_DIR],
+                                             capture_output=True, timeout=10, text=True)
+                    if ign.returncode == 0 and not (tracked.returncode == 0 and tracked.stdout.strip()):
+                        result = {"ok": True}
+                    elif ign.returncode == 1:
+                        result = {"ok": False,
+                                  "reason": ".flow_data is NOT gitignored — add `backend/.flow_data/` "
+                                            "to .gitignore before uploading"}
+                    elif tracked.returncode == 0 and tracked.stdout.strip():
+                        result = {"ok": False,
+                                  "reason": ".flow_data has TRACKED files — untrack them before uploading"}
+                    else:
+                        err = (ign.stderr or b"").decode(errors="replace").strip()
+                        result = {"ok": False,
+                                  "reason": f"git could not verify .flow_data ignore status ({err or 'rc ' + str(ign.returncode)}) — refusing ingest, verify by hand"}
+                except Exception as e:
+                    result = {"ok": False,
+                              "reason": f"git safety check failed ({e}) — a checkout exists at {repo_root}, refusing ingest until verified"}
         self._git_safety_cache = (now, result)
         return result
 
@@ -1591,6 +1639,13 @@ def _selftest() -> None:            # pragma: no cover
     # duplicate upload short-circuit
     pv3 = svc.preview(data, "same.tsv")
     chk("duplicate detected", pv3["verdict"] == "duplicate")
+
+    # git safety canary decision table (filesystem walk works without git on PATH)
+    chk("canary: temp dir has no enclosing repo", _find_repo_root(tmp) is None)
+    chk("canary: backend dir is inside the checkout here", _find_repo_root(_DIR) is not None)
+    real = ClientFlowService(db_path=os.path.join(tmp, "canary.db"), check_git=True)
+    gs = real.git_safety()
+    chk("canary: OK on this checkout (ignored + untracked)", gs.get("ok") is True)
 
     # revert restores
     before = svc.derived("USDTWD", "real money")["obs"][:5]
